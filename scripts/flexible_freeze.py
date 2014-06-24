@@ -7,7 +7,9 @@ This script is designed for doing VACUUM FREEZE or VACUUM ANALYZE runs
 on your database during known slow traffic periods.  If doing both
 vacuum freezes and vacuum analyzes, do the freezes first.
 
-Takes a timeout so that it won't overrun your slow traffic period.  Note that this is the time to START a vacuum, so a large table may still overrun the vacuum period.
+Takes a timeout so that it won't overrun your slow traffic period.
+Note that this is the time to START a vacuum, so a large table
+may still overrun the vacuum period.
 '''
 
 import time
@@ -117,7 +119,7 @@ for db in dblist:
         dbcount += 1
     conn = dbconnect(db, args.dbuser, args.dbhost, args.dbport, args.dbpass)
     cur = conn.cursor()
-    cur.execute("SET vacuum_cost_delay = '{0} ms".format(args.costdelay))
+    cur.execute("SET vacuum_cost_delay = {0}".format(args.costdelay))
     cur.execute("SET vacuum_cost_limit = {0}".format(args.costlimit))
     
 # if vacuuming, get list of top tables to vacuum
@@ -140,7 +142,7 @@ for db in dblist:
     # if freezing, get list of top tables to freeze
         tabquery = """WITH tabfreeze AS (
                 SELECT pg_class.oid::regclass AS full_table_name,
-                age(relfrozenxid)as freeze_age,
+                age(relfrozenxid) as freeze_age,
                 pg_relation_size(pg_class.oid)
             FROM pg_class JOIN pg_namespace ON relnamespace = pg_namespace.oid
             WHERE nspname not in ('pg_catalog', 'information_schema')
