@@ -92,7 +92,7 @@ halt_time = time.time() + ( args.run_min * 60 )
 if args.dblist is None:
     conn = dbconnect("postgres", args.dbuser, args.dbhost, args.dbport, args.dbpass)
     cur = conn.cursor()
-    cur.execute("""SELECT datname FROM pg_database WHERE dataname NOT IN ('postgres','template1','template0') ORDER BY random()""")
+    cur.execute("""SELECT datname FROM pg_database WHERE datname NOT IN ('postgres','template1','template0') ORDER BY random()""")
     dblist = []
     for dbname in cur:
         dblist.append(dbname[0])
