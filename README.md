@@ -17,7 +17,7 @@ vacuum freezes and vacuum analyzes, do the freezes first.
 Takes a timeout so that it won't overrun your slow traffic period.  
 Note that this is the time to START a vacuum, so a large table may still overrun the vacuum period.
 
-Requires: psycopg2
+Requires: psycopg2; argparse (which comes preinstalled with Python 2.7 and up)
 
 Usage example:
 

@@ -92,7 +92,7 @@ halt_time = time.time() + ( args.run_min * 60 )
 if args.dblist is None:
     conn = dbconnect("postgres", args.dbuser, args.dbhost, args.dbport, args.dbpass)
     cur = conn.cursor()
-    cur.execute("""SELECT datname FROM pg_database WHERE dataname NOT IN ('postgres','template1','template0') ORDER BY random()""")
+    cur.execute("""SELECT datname FROM pg_database WHERE datname NOT IN ('postgres','template1','template0') ORDER BY random()""")
     dblist = []
     for dbname in cur:
         dblist.append(dbname[0])
@@ -114,7 +114,7 @@ tabcount = 0
 dbcount = 0
 
 for db in dblist:
-    verbose_print("working on database {}".format(db))
+    verbose_print("working on database {0}".format(db))
     if time_exit:
         break
     else:
