@@ -105,6 +105,7 @@ if args.dblist is None:
 else:
     dblist = args.dblist.split(',')
 
+verbose_print("Flexible Freeze run starting")
 verbose_print("list of databases is %s" % (','.join(dblist)))
 
 # connect to each database
@@ -113,6 +114,7 @@ tabcount = 0
 dbcount = 0
 
 for db in dblist:
+    verbose_print("working on database {}".format(db))
     if time_exit:
         break
     else:
@@ -122,7 +124,7 @@ for db in dblist:
     cur.execute("SET vacuum_cost_delay = {0}".format(args.costdelay))
     cur.execute("SET vacuum_cost_limit = {0}".format(args.costlimit))
     
-# if vacuuming, get list of top tables to vacuum
+    # if vacuuming, get list of top tables to vacuum
     if args.vacuum:
         tabquery = """WITH deadrow_tables AS (
                 SELECT relid::regclass as full_table_name,
@@ -162,7 +164,7 @@ for db in dblist:
     for table in tablist:
     # check time; if overtime, exit
         if time.time() >= halt_time:
-            verbose_print("Reached time limit.  Exiting.")
+            verbose_print("reached time limit; exiting.")
             time_exit = True
             break
         else:
