@@ -172,7 +172,7 @@ for db in dblist:
     cur.execute(tabquery)
     verbose_print("getting list of tables")
     tablist = cur.fetchall()
-    verbose_print("\n".join(tablist))
+    verbose_print(','.join(map(lambda(row): row[0], tablist)))
     # for each table in list
     for table in tablist:
     # check time; if overtime, exit
