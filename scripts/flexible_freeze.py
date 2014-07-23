@@ -40,7 +40,7 @@ parser.add_argument("--costdelay", dest="costdelay",
 parser.add_argument("--costlimit", dest="costlimit",
                     type=int, default = 2000,
                     help="vacuum_cost_limit setting.  Default 2000")
-parser.add_argument("-t", "--print_timestamps", action="store_true",
+parser.add_argument("-t", "--print-timestamps", action="store_true",
                     dest="print_timestamps")
 parser.add_argument("-v", "--verbose", action="store_true",
                     dest="verbose")
@@ -57,12 +57,12 @@ args = parser.parse_args()
 
 def verbose_print(some_message):
     if args.verbose:
-        return _print(some_messsage)
+        return _print(some_message)
 
 def _print(some_message):
     if args.print_timestamps:
         print "{timestamp}: {some_message}".format(timestamp=timestamp(), some_message=some_message)
-    else
+    else:
         print some_message
     return True
 
@@ -172,7 +172,7 @@ for db in dblist:
     cur.execute(tabquery)
     verbose_print("getting list of tables")
     tablist = cur.fetchall()
-    verbose_print(','.join(map(lambda(row): row[0], tablist)))
+    verbose_print("list of tables: {l}".format(l=','.join(map(lambda(row): row[0], tablist))))
     # for each table in list
     for table in tablist:
     # check time; if overtime, exit
