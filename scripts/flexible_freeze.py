@@ -17,6 +17,10 @@ import sys
 import argparse
 import psycopg2
 
+def timestamp():
+    now = time.time()
+    return time.strftime("%Y-%m-%d %H:%M:%S %Z")
+
 parser = argparse.ArgumentParser()
 parser.add_argument("-m", "--minutes", dest="run_min",
                     type=int, default=120,
@@ -36,6 +40,8 @@ parser.add_argument("--costdelay", dest="costdelay",
 parser.add_argument("--costlimit", dest="costlimit",
                     type=int, default = 2000,
                     help="vacuum_cost_limit setting.  Default 2000")
+parser.add_argument("-t", "--print_timestamps", action="store_true",
+                    dest="print_timestamps")
 parser.add_argument("-v", "--verbose", action="store_true",
                     dest="verbose")
 parser.add_argument("-U", "--user", dest="dbuser",
@@ -45,7 +51,8 @@ parser.add_argument("-H", "--host", dest="dbhost",
 parser.add_argument("-p", "--port", dest="dbport",
                   help="database port")
 parser.add_argument("-w", "--password", dest="dbpass",
-                  help="database password")
+                    help="database password")
+
 args = parser.parse_args()
 
 def dbconnect(dbname, dbuser, dbhost, dbport, dbpass):
@@ -79,7 +86,9 @@ def dbconnect(dbname, dbuser, dbhost, dbport, dbpass):
     return conn
 
 def verbose_print(some_message):
-    if args.verbose:
+    if args.print_timestamps:
+        print "{timestamp}: {message}".format(timestamp=timestamp(), message=some_message)
+    else
         print some_message
 
     return True
@@ -160,6 +169,7 @@ for db in dblist:
     cur.execute(tabquery)
     verbose_print("getting list of tables")
     tablist = cur.fetchall()
+    verbose_print("\n".join(tablist))
     # for each table in list
     for table in tablist:
     # check time; if overtime, exit
@@ -181,7 +191,7 @@ for db in dblist:
         try:
             excur.execute(exquery)
         except Exception as ex:
-            print "VACUUMING %s failed." % table[0]
+            print "VACUUMing %s failed." % table[0]
             print str(ex)
             sys.exit(1)
 
@@ -192,15 +202,11 @@ conn.close()
 # did we get through all tables?
 # exit, report results
 if not time_exit:
-    print "All tables vacuumed."
+    print "all tables vacuumed."
     verbose_print("%d tables in %d databases" % (tabcount, dbcount))
 else:
-    print "Vacuuming halted due to timeout"
+    print "vacuuming halted due to timeout"
     verbose_print("after vacuuming %d tables in %d databases" % (tabcount, dbcount,))
 
 verbose_print("Flexible Freeze run complete")
 sys.exit(0)
-
-
-
-
