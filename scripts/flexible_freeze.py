@@ -1,4 +1,4 @@
-'''Flexible Freeze script for PostgreSQL databases
+"""Flexible Freeze script for PostgreSQL databases
 Version 0.3
 (c) 2014 PostgreSQL Experts Inc.
 Licensed under The PostgreSQL License
@@ -10,7 +10,7 @@ vacuum freezes and vacuum analyzes, do the freezes first.
 Takes a timeout so that it won't overrun your slow traffic period.
 Note that this is the time to START a vacuum, so a large table
 may still overrun the vacuum period.
-'''
+"""
 
 import time
 import sys
@@ -40,7 +40,7 @@ parser.add_argument("--costdelay", dest="costdelay",
 parser.add_argument("--costlimit", dest="costlimit",
                     type=int, default = 2000,
                     help="vacuum_cost_limit setting.  Default 2000")
-parser.add_argument("-t", "--print_timestamps", action="store_true",
+parser.add_argument("-t", "--print-timestamps", action="store_true",
                     dest="print_timestamps")
 parser.add_argument("-v", "--verbose", action="store_true",
                     dest="verbose")
@@ -57,12 +57,12 @@ args = parser.parse_args()
 
 def verbose_print(some_message):
     if args.verbose:
-        return _print(some_messsage)
+        return _print(some_message)
 
 def _print(some_message):
     if args.print_timestamps:
         print "{timestamp}: {some_message}".format(timestamp=timestamp(), some_message=some_message)
-    else
+    else:
         print some_message
     return True
 
@@ -118,7 +118,7 @@ else:
     dblist = args.dblist.split(',')
 
 verbose_print("Flexible Freeze run starting")
-verbose_print("list of databases is %s" % (','.join(dblist)))
+verbose_print("list of databases is %s" % (', '.join(dblist)))
 
 # connect to each database
 time_exit = False
@@ -171,10 +171,12 @@ for db in dblist:
 
     cur.execute(tabquery)
     verbose_print("getting list of tables")
-    tablist = cur.fetchall()
-    verbose_print(','.join(map(lambda(row): row[0], tablist)))
+    table_resultset = cur.fetchall()
+    tables = map(lambda(row): row[0], table_resultset)
+    verbose_print("list of tables: {l}".format(l=', '.join(tables)))
     # for each table in list
-    for table in tablist:
+    for table in tables:
+        verbose_print("processing table {t}".format(t=table))
     # check time; if overtime, exit
         if time.time() >= halt_time:
             verbose_print("reached time limit; exiting.")
@@ -184,17 +186,17 @@ for db in dblist:
             tabcount += 1
     # if not, vacuum or freeze
         if args.vacuum:
-            exquery = """VACUUM ANALYZE %s""" % table[0]
+            exquery = """VACUUM ANALYZE %s""" % table
         else:
-            exquery = """VACUUM FREEZE ANALYZE %s""" % table[0]
+            exquery = """VACUUM FREEZE ANALYZE %s""" % table
 
-        verbose_print("vacuuming table %s in database %s" % (table[0], db,))
+        verbose_print("vacuuming table %s in database %s" % (table, db,))
         excur = conn.cursor()
 
         try:
             excur.execute(exquery)
         except Exception as ex:
-            _print("VACUUMing %s failed." % table[0])
+            _print("VACUUMing %s failed." % table)
             _print(str(ex))
             sys.exit(1)
 
@@ -206,7 +208,7 @@ conn.close()
 # exit, report results
 if not time_exit:
     _print("all tables vacuumed.")
-    verbose_print("%d tables in %d databases" % (tabcount, dbcount))
+    verbose_print("(%d tables in %d databases)" % (tabcount, dbcount))
 else:
     _print("vacuuming halted due to timeout")
     verbose_print("after vacuuming %d tables in %d databases" % (tabcount, dbcount,))
