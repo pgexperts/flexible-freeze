@@ -171,9 +171,11 @@ for db in dblist:
 
     cur.execute(tabquery)
     verbose_print("getting list of tables")
+
     table_resultset = cur.fetchall()
     tables = map(lambda(row): row[0], table_resultset)
     verbose_print("list of tables: {l}".format(l=', '.join(tables)))
+
     # for each table in list
     for table in tables:
         verbose_print("processing table {t}".format(t=table))
