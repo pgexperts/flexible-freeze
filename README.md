@@ -31,6 +31,7 @@ Arguments:
 * --costdelay : vacuum_cost_delay in ms (20)
 * --costlimit : vacuum_cost_limit (2000)
 * --enforce-time : enforce ending time through statement_timeout
+* -l, --log : log file for all output (optional)
 * -v, --verbose
 * -U, --user : database user
 * -H, --host : database host
@@ -42,5 +43,9 @@ Notes:
 The minutes time limit is normally only enforced at the start of vacuuming each table, allowing vacuums to continue past the end of the time window.  If you set --enforce-time, however, it uses statement_timeout to terminate a running vacuum at the end of the time window (plus 30 seconds grace period).
 
 Normally flexible_freeze.py does VACUUM FREEZE, starting with the tables with the oldest transaction IDs.  If you set --vacuum, though, it will instead do VACUUM ANALYZE, starting with the tables with the most dead rows.  If you are doing both, do the FREEZE first.
+
+The database user supplied is expected to have permissions on all tables (e.g. a superuser).  If they do not, flexible freeze will error out.
+
+Currently, flexible_freeze will not respond to a CTRL-C until the current vacuum is done.
 
 
