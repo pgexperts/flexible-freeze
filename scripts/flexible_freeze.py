@@ -1,5 +1,5 @@
 '''Flexible Freeze script for PostgreSQL databases
-Version 0.3
+Version 0.4
 (c) 2014 PostgreSQL Experts Inc.
 Licensed under The PostgreSQL License
 
@@ -9,13 +9,15 @@ vacuum freezes and vacuum analyzes, do the freezes first.
 
 Takes a timeout so that it won't overrun your slow traffic period.
 Note that this is the time to START a vacuum, so a large table
-may still overrun the vacuum period.
+may still overrun the vacuum period, unless you use the --enforce-time switch.
 '''
 
 import time
 import sys
+import signal
 import argparse
 import psycopg2
+import datetime
 
 parser = argparse.ArgumentParser()
 parser.add_argument("-m", "--minutes", dest="run_min",
@@ -29,13 +31,16 @@ parser.add_argument("--pause", dest="pause_time", default=10,
                     help="seconds to pause between vacuums.  Default is 10.")
 parser.add_argument("--freezeage", dest="freezeage",
                     type=int, default=10000000,
-                    help="minimum age for freezing.  Default 10m")
+                    help="minimum age for freezing.  Default 10m XIDs")
 parser.add_argument("--costdelay", dest="costdelay", 
                     type=int, default = 20,
                     help="vacuum_cost_delay setting in ms.  Default 20")
 parser.add_argument("--costlimit", dest="costlimit",
                     type=int, default = 2000,
                     help="vacuum_cost_limit setting.  Default 2000")
+parser.add_argument("--enforce-time", dest="enforcetime", action="store_true",
+                    help="enforce time limit by terminating vacuum")
+parser.add_argument("-l", "--log", dest="logfile")
 parser.add_argument("-v", "--verbose", action="store_true",
                     dest="verbose")
 parser.add_argument("-U", "--user", dest="dbuser",
@@ -84,15 +89,45 @@ def verbose_print(some_message):
 
     return True
 
+def signal_handler(signal, frame):
+    print('exiting due to user interrupt')
+    if conn:
+        try:
+            conn.close()
+        except:
+            verbose_print('could not clean up db connections')
+        
+    sys.exit(0)
+
 # set times
 halt_time = time.time() + ( args.run_min * 60 )
+
+# get set for user interrupt
+conn = None
+time_exit = None
+signal.signal(signal.SIGINT, signal_handler)
+
+# start logging to log file, if used
+if args.logfile:
+    try:
+        sys.stdout = open(args.logfile, 'a')
+    except Exception as ex:
+        print('could not open logfile: %s' % str(ex))
+        sys.exit(1)
+
+    print('')
+    print('='*40)
+    print('flexible freeze started %s' % str(datetime.datetime.now()))
+    verbose_print('arguments: %s' % str(args))
 
 # do we have a database list?
 # if not, connect to "postgres" database and get a list of non-system databases
 if args.dblist is None:
     conn = dbconnect("postgres", args.dbuser, args.dbhost, args.dbport, args.dbpass)
     cur = conn.cursor()
-    cur.execute("""SELECT datname FROM pg_database WHERE datname NOT IN ('postgres','template1','template0') ORDER BY random()""")
+    cur.execute("""SELECT datname FROM pg_database
+        WHERE datname NOT IN ('postgres','template1','template0')
+        ORDER BY age(datfrozenxid) DESC""")
     dblist = []
     for dbname in cur:
         dblist.append(dbname[0])
@@ -111,6 +146,7 @@ verbose_print("list of databases is %s" % (','.join(dblist)))
 time_exit = False
 tabcount = 0
 dbcount = 0
+timeout_secs = 0
 
 for db in dblist:
     if time_exit:
@@ -132,6 +168,8 @@ for db in dblist:
                 WHERE n_dead_tup > 100
                 AND ( (now() - last_autovacuum) > INTERVAL '1 hour'
                     OR last_autovacuum IS NULL )
+                AND ( (now() - last_vacuum) > INTERVAL '1 hour'
+                    OR last_vacuum IS NULL )
             )
             SELECT full_table_name
             FROM deadrow_tables
@@ -167,6 +205,11 @@ for db in dblist:
             break
         else:
             tabcount += 1
+            # figure out statement_timeout
+            if args.enforcetime:
+                timeout_secs = int(halt_time - time.time()) + 30
+                timeout_query = """SET statement_timeout = '%ss'""" % timeout_secs
+            
     # if not, vacuum or freeze
         if args.vacuum:
             exquery = """VACUUM ANALYZE %s""" % table[0]
@@ -177,10 +220,16 @@ for db in dblist:
         excur = conn.cursor()
 
         try:
+            if args.enforcetime:
+                excur.execute(timeout_query)
+                
             excur.execute(exquery)
         except Exception as ex:
-            print "VACUUMING %s failed." % table[0]
-            print str(ex)
+            if time.time() >= halt_time:
+                verbose_print("halted flexible_freeze due to enforced time limit")
+            else:
+                print "VACUUMING %s failed." % table[0]
+                print str(ex)
             sys.exit(1)
 
         time.sleep(args.pause_time)
