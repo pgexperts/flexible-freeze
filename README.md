@@ -15,6 +15,7 @@ runs on your database during known slow traffic periods. Takes a
 timeout so that it won't overrun your slow traffic period.
 
 Requires: psycopg2
+Requires: PostgreSQL 9.0 or later
 
 Usage example:
 
@@ -46,6 +47,6 @@ Normally flexible_freeze.py does VACUUM FREEZE, starting with the tables with th
 
 The database user supplied is expected to have permissions on all tables (e.g. a superuser).  If they do not, flexible freeze will error out.
 
-Currently, flexible_freeze will not respond to a CTRL-C until the current vacuum is done.
+Currently, flexible_freeze will not respond to a CTRL-C until the current vacuum is done.  If you need to halt flexible_freeze before then, we recommend using pg_cancel_backend() from the Postgres command line.  This will cause flexible_freeze to error out and exit.
 
 

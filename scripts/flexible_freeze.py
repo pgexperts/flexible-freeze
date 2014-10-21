@@ -56,7 +56,7 @@ args = parser.parse_args()
 def dbconnect(dbname, dbuser, dbhost, dbport, dbpass):
 
     if dbname:
-        connect_string ="dbname=%s " % dbname
+        connect_string ="dbname=%s application_name=flexible_freeze" % dbname
     else:
         print "ERROR: a target database is required."
         return None
