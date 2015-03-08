@@ -15,6 +15,7 @@ runs on your database during known slow traffic periods. Takes a
 timeout so that it won't overrun your slow traffic period.
 
 Requires: psycopg2
+Requires: argparse (which comes preinstalled with Python 2.7 and up)
 Requires: PostgreSQL 9.0 or later
 
 Usage example:
