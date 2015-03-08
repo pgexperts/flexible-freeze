@@ -1,5 +1,5 @@
 '''Flexible Freeze script for PostgreSQL databases
-Version 0.4
+Version 0.5
 (c) 2014 PostgreSQL Experts Inc.
 Licensed under The PostgreSQL License
 
@@ -18,6 +18,10 @@ import signal
 import argparse
 import psycopg2
 import datetime
+
+def timestamp():
+    now = time.time()
+    return time.strftime("%Y-%m-%d %H:%M:%S %Z")
 
 parser = argparse.ArgumentParser()
 parser.add_argument("-m", "--minutes", dest="run_min",
@@ -38,6 +42,8 @@ parser.add_argument("--costdelay", dest="costdelay",
 parser.add_argument("--costlimit", dest="costlimit",
                     type=int, default = 2000,
                     help="vacuum_cost_limit setting.  Default 2000")
+parser.add_argument("-t", "--print-timestamps", action="store_true",
+                    dest="print_timestamps")
 parser.add_argument("--enforce-time", dest="enforcetime", action="store_true",
                     help="enforce time limit by terminating vacuum")
 parser.add_argument("-l", "--log", dest="logfile")
@@ -51,14 +57,26 @@ parser.add_argument("-p", "--port", dest="dbport",
                   help="database port")
 parser.add_argument("-w", "--password", dest="dbpass",
                   help="database password")
+
 args = parser.parse_args()
+
+def verbose_print(some_message):
+    if args.verbose:
+        return _print(some_message)
+
+def _print(some_message):
+    if args.print_timestamps:
+        print "{timestamp}: {some_message}".format(timestamp=timestamp(), some_message=some_message)
+    else:
+        print some_message
+    return True
 
 def dbconnect(dbname, dbuser, dbhost, dbport, dbpass):
 
     if dbname:
         connect_string ="dbname=%s application_name=flexible_freeze" % dbname
     else:
-        print "ERROR: a target database is required."
+        _print("ERROR: a target database is required.")
         return None
 
     if dbhost:
@@ -77,17 +95,11 @@ def dbconnect(dbname, dbuser, dbhost, dbport, dbpass):
         conn = psycopg2.connect( connect_string )
         conn.autocommit = True
     except Exception as ex:
-        print "connection to database %s failed, aborting" % dbname
-        print str(ex)
+        _print("connection to database %s failed, aborting" % dbname)
+        _print(str(ex))
         sys.exit(1)
 
     return conn
-
-def verbose_print(some_message):
-    if args.verbose:
-        print some_message
-
-    return True
 
 def signal_handler(signal, frame):
     print('exiting due to user interrupt')
@@ -135,12 +147,13 @@ if args.dblist is None:
     conn.close()
     if not dblist:
         conn.close()
-        print "no databases to vacuum, aborting"
+        _print("no databases to vacuum, aborting")
         sys.exit(1)
 else:
     dblist = args.dblist.split(',')
 
-verbose_print("list of databases is %s" % (','.join(dblist)))
+verbose_print("Flexible Freeze run starting")
+verbose_print("list of databases is %s" % (', '.join(dblist)))
 
 # connect to each database
 time_exit = False
@@ -149,6 +162,7 @@ dbcount = 0
 timeout_secs = 0
 
 for db in dblist:
+    verbose_print("working on database {0}".format(db))
     if time_exit:
         break
     else:
@@ -195,9 +209,14 @@ for db in dblist:
 
     cur.execute(tabquery)
     verbose_print("getting list of tables")
-    tablist = cur.fetchall()
+
+    table_resultset = cur.fetchall()
+    tablist = map(lambda(row): row[0], table_resultset)
+    verbose_print("list of tables: {l}".format(l=', '.join(tables)))
+
     # for each table in list
     for table in tablist:
+        verbose_print("processing table {t}".format(t=table))
     # check time; if overtime, exit
         if time.time() >= halt_time:
             verbose_print("Reached time limit.  Exiting.")
@@ -212,11 +231,11 @@ for db in dblist:
             
     # if not, vacuum or freeze
         if args.vacuum:
-            exquery = """VACUUM ANALYZE %s""" % table[0]
+            exquery = """VACUUM ANALYZE %s""" % table
         else:
-            exquery = """VACUUM FREEZE ANALYZE %s""" % table[0]
+            exquery = """VACUUM FREEZE ANALYZE %s""" % table
 
-        verbose_print("vacuuming table %s in database %s" % (table[0], db,))
+        verbose_print("vacuuming table %s in database %s" % (table, db,))
         excur = conn.cursor()
 
         try:
@@ -225,6 +244,8 @@ for db in dblist:
                 
             excur.execute(exquery)
         except Exception as ex:
+            _print("VACUUMing %s failed." % table)
+            _print(str(ex))
             if time.time() >= halt_time:
                 verbose_print("halted flexible_freeze due to enforced time limit")
             else:
@@ -239,15 +260,11 @@ conn.close()
 # did we get through all tables?
 # exit, report results
 if not time_exit:
-    print "All tables vacuumed."
+    _print("All tables vacuumed.")
     verbose_print("%d tables in %d databases" % (tabcount, dbcount))
 else:
-    print "Vacuuming halted due to timeout"
+    _print("Vacuuming halted due to timeout")
     verbose_print("after vacuuming %d tables in %d databases" % (tabcount, dbcount,))
 
 verbose_print("Flexible Freeze run complete")
 sys.exit(0)
-
-
-
-
