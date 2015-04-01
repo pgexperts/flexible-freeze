@@ -93,7 +93,7 @@ def dbconnect(dbname, dbuser, dbhost, dbport, dbpass):
 
     try:
         conn = psycopg2.connect( connect_string )
-        conn.autocommit = True
+        conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
     except Exception as ex:
         _print("connection to database %s failed, aborting" % dbname)
         _print(str(ex))
@@ -212,7 +212,7 @@ for db in dblist:
 
     table_resultset = cur.fetchall()
     tablist = map(lambda(row): row[0], table_resultset)
-    verbose_print("list of tables: {l}".format(l=', '.join(tables)))
+    verbose_print("list of tables: {l}".format(l=', '.join(tablist)))
 
     # for each table in list
     for table in tablist:
