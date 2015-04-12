@@ -69,6 +69,7 @@ def _print(some_message):
         print "{timestamp}: {some_message}".format(timestamp=timestamp(), some_message=some_message)
     else:
         print some_message
+    sys.stdout.flush()
     return True
 
 def dbconnect(dbname, dbuser, dbhost, dbport, dbpass):
@@ -102,7 +103,7 @@ def dbconnect(dbname, dbuser, dbhost, dbport, dbpass):
     return conn
 
 def signal_handler(signal, frame):
-    print('exiting due to user interrupt')
+    _print('exiting due to user interrupt')
     if conn:
         try:
             conn.close()
@@ -124,12 +125,12 @@ if args.logfile:
     try:
         sys.stdout = open(args.logfile, 'a')
     except Exception as ex:
-        print('could not open logfile: %s' % str(ex))
+        _print('could not open logfile: %s' % str(ex))
         sys.exit(1)
 
-    print('')
-    print('='*40)
-    print('flexible freeze started %s' % str(datetime.datetime.now()))
+    _print('')
+    _print('='*40)
+    _print('flexible freeze started %s' % str(datetime.datetime.now()))
     verbose_print('arguments: %s' % str(args))
 
 # do we have a database list?
@@ -249,8 +250,8 @@ for db in dblist:
             if time.time() >= halt_time:
                 verbose_print("halted flexible_freeze due to enforced time limit")
             else:
-                print "VACUUMING %s failed." % table[0]
-                print str(ex)
+                _print("VACUUMING %s failed." % table[0])
+                _print(str(ex))
             sys.exit(1)
 
         time.sleep(args.pause_time)
