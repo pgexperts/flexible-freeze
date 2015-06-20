@@ -21,7 +21,7 @@ Requires: PostgreSQL 9.0 or later
 Usage example:
 
 ::
-    flexible_freeze.py -m 120 --dblist="prod,queue" --pause 5 -U postgres
+    python flexible_freeze.py -m 120 --dblist="prod,queue" --pause 5 -U postgres
 
 Arguments:
 
