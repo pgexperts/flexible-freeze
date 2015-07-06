@@ -193,14 +193,17 @@ for db in dblist:
             ORDER BY dead_pct DESC, table_bytes DESC;"""
     else:
     # if freezing, get list of top tables to freeze
+    # includes TOAST tables in case the toast table has older rows
         tabquery = """WITH tabfreeze AS (
                 SELECT pg_class.oid::regclass AS full_table_name,
-                age(relfrozenxid) as freeze_age,
+                greatest(age(pg_class.relfrozenxid), age(toast.relfrozenxid)) as freeze_age,
                 pg_relation_size(pg_class.oid)
-            FROM pg_class JOIN pg_namespace ON relnamespace = pg_namespace.oid
+            FROM pg_class JOIN pg_namespace ON pg_class.relnamespace = pg_namespace.oid
+                LEFT OUTER JOIN pg_class as toast
+                    ON pg_class.reltoastrelid = toast.oid
             WHERE nspname not in ('pg_catalog', 'information_schema')
                 AND nspname NOT LIKE 'pg_temp%'
-                AND relkind = 'r'
+                AND pg_class.relkind = 'r'
             )
             SELECT full_table_name
             FROM tabfreeze
