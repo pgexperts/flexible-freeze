@@ -147,7 +147,6 @@ if args.dblist is None:
 
     conn.close()
     if not dblist:
-        conn.close()
         _print("no databases to vacuum, aborting")
         sys.exit(1)
 else:
