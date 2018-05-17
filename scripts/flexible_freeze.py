@@ -27,8 +27,10 @@ parser = argparse.ArgumentParser()
 parser.add_argument("-m", "--minutes", dest="run_min",
                     type=int, default=120,
                     help="Number of minutes to run before halting.  Defaults to 2 hours")
-parser.add_argument("-d","--databases", dest="dblist",
-                    help="List of databases to vacuum, if not all of them")
+parser.add_argument("-d", "--databases", dest="dblist",
+                    help="Comma-separated list of databases to vacuum, if not all of them")
+parser.add_argument("-T", "--exclude-table", action="append", dest="tables_to_exclude",
+                    help="Exclude any table with this name (in any database). You can pass this option multiple times to exclude multiple tables.")
 parser.add_argument("--vacuum", dest="vacuum", action="store_true",
                     help="Do regular vacuum instead of VACUUM FREEZE")
 parser.add_argument("--pause", dest="pause_time", default=10,
@@ -215,12 +217,17 @@ for db in dblist:
 
     table_resultset = cur.fetchall()
     tablist = map(lambda(row): row[0], table_resultset)
-    verbose_print("list of tables: {l}".format(l=', '.join(tablist)))
 
     # for each table in list
     for table in tablist:
-        verbose_print("processing table {t}".format(t=table))
     # check time; if overtime, exit
+        if args.tables_to_exclude and (table in args.tables_to_exclude):
+            verbose_print(
+                "skipping table {t} per --exclude-table argument".format(t=table))
+            continue
+        else:
+            verbose_print("processing table {t}".format(t=table))
+
         if time.time() >= halt_time:
             verbose_print("Reached time limit.  Exiting.")
             time_exit = True
