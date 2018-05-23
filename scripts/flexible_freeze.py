@@ -23,6 +23,10 @@ def timestamp():
     now = time.time()
     return time.strftime("%Y-%m-%d %H:%M:%S %Z")
 
+if sys.version_info[:2] != (2, 7):
+    print >>sys.stderr, "python 2.7 required; you have %s" % sys.version
+    exit(1)
+
 parser = argparse.ArgumentParser()
 parser.add_argument("-m", "--minutes", dest="run_min",
                     type=int, default=120,
@@ -51,6 +55,8 @@ parser.add_argument("--enforce-time", dest="enforcetime", action="store_true",
 parser.add_argument("-l", "--log", dest="logfile")
 parser.add_argument("-v", "--verbose", action="store_true",
                     dest="verbose")
+parser.add_argument("--debug", action="store_true",
+                    dest="debug")
 parser.add_argument("-U", "--user", dest="dbuser",
                   help="database user")
 parser.add_argument("-H", "--host", dest="dbhost",
@@ -61,6 +67,10 @@ parser.add_argument("-w", "--password", dest="dbpass",
                   help="database password")
 
 args = parser.parse_args()
+
+def debug_print(some_message):
+    if args.debug:
+        return _print('DEBUG: ' + some_message)
 
 def verbose_print(some_message):
     if args.verbose:
@@ -113,6 +123,13 @@ def signal_handler(signal, frame):
             verbose_print('could not clean up db connections')
         
     sys.exit(0)
+
+# startup debugging info
+
+debug_print("python version: %s" % sys.version)
+debug_print("psycopg2 version: %s" % psycopg2.__version__)
+debug_print("argparse version: %s" % argparse.__version__)
+debug_print("parameters: %s" % repr(args))
 
 # set times
 halt_time = time.time() + ( args.run_min * 60 )
