@@ -33,7 +33,7 @@ parser.add_argument("-T", "--exclude-table", action="append", dest="tables_to_ex
                     help="Exclude any table with this name (in any database). You can pass this option multiple times to exclude multiple tables.")
 parser.add_argument("--vacuum", dest="vacuum", action="store_true",
                     help="Do regular vacuum instead of VACUUM FREEZE")
-parser.add_argument("--pause", dest="pause_time", default=10,
+parser.add_argument("--pause", dest="pause_time", type=int, default=10,                    
                     help="seconds to pause between vacuums.  Default is 10.")
 parser.add_argument("--freezeage", dest="freezeage",
                     type=int, default=10000000,
