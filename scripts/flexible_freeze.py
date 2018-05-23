@@ -23,8 +23,8 @@ def timestamp():
     now = time.time()
     return time.strftime("%Y-%m-%d %H:%M:%S %Z")
 
-if sys.version_info[:2] != (2, 7):
-    print >>sys.stderr, "python 2.7 required; you have %s" % sys.version
+if sys.version_info[:2] not in ((2,6), (2,7),):
+    print >>sys.stderr, "python 2.6 or 2.7 required; you have %s" % sys.version
     exit(1)
 
 parser = argparse.ArgumentParser()
@@ -70,7 +70,7 @@ args = parser.parse_args()
 
 def debug_print(some_message):
     if args.debug:
-        return _print('DEBUG: ' + some_message)
+        print >>sys.stderr, ('DEBUG (%s): ' % timestamp()) + some_message
 
 def verbose_print(some_message):
     if args.verbose:
