@@ -104,13 +104,8 @@ def dbconnect(dbname, dbuser, dbhost, dbport, dbpass):
     if dbport:
         connect_string += " port=%s " % dbport
 
-    try:
-        conn = psycopg2.connect( connect_string )
-        conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
-    except Exception as ex:
-        _print("connection to database %s failed, aborting" % dbname)
-        _print(str(ex))
-        sys.exit(1)
+    conn = psycopg2.connect( connect_string )
+    conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
 
     return conn
 
@@ -155,7 +150,14 @@ if args.logfile:
 # do we have a database list?
 # if not, connect to "postgres" database and get a list of non-system databases
 if args.dblist is None:
-    conn = dbconnect("postgres", args.dbuser, args.dbhost, args.dbport, args.dbpass)
+    conn = None
+    try:
+        dbname = 'postgres'
+        conn = dbconnect(dbname, args.dbuser, args.dbhost, args.dbport, args.dbpass)
+    except Exception as ex:
+        _print("Could not list databases: connection to database {d} failed: {e}".format(d=dbname, e=str(ex)))
+        sys.exit(1)
+
     cur = conn.cursor()
     cur.execute("""SELECT datname FROM pg_database
         WHERE datname NOT IN ('postgres','template1','template0')
@@ -186,12 +188,18 @@ for db in dblist:
         break
     else:
         dbcount += 1
-    conn = dbconnect(db, args.dbuser, args.dbhost, args.dbport, args.dbpass)
+    conn = None
+    try:
+        conn = dbconnect(db, args.dbuser, args.dbhost, args.dbport, args.dbpass)
+    except Exception as err:
+        _print("skipping database {d} (couldn't connect: {e})".format(d=db, e=str(err)))
+        continue
+
     cur = conn.cursor()
     cur.execute("SET vacuum_cost_delay = {0}".format(args.costdelay))
     cur.execute("SET vacuum_cost_limit = {0}".format(args.costlimit))
     
-# if vacuuming, get list of top tables to vacuum
+    # if vacuuming, get list of top tables to vacuum
     if args.vacuum:
         tabquery = """WITH deadrow_tables AS (
                 SELECT relid::regclass as full_table_name,
