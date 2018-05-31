@@ -174,7 +174,8 @@ else:
     dblist = args.dblist.split(',')
 
 verbose_print("Flexible Freeze run starting")
-verbose_print("list of databases is %s" % (', '.join(dblist)))
+n_dbs = len(dblist)
+verbose_print("Processing {n} database{pl} (list of databases is {l})".format(n = n_dbs, l = ', '.join(dblist), pl = 's' if n_dbs > 1 else ''))
 
 # connect to each database
 time_exit = False
