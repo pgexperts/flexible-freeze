@@ -35,6 +35,8 @@ parser.add_argument("-d", "--databases", dest="dblist",
                     help="Comma-separated list of databases to vacuum, if not all of them")
 parser.add_argument("-T", "--exclude-table", action="append", dest="tables_to_exclude",
                     help="Exclude any table with this name (in any database). You can pass this option multiple times to exclude multiple tables.")
+parser.add_argument("--exclude-table-in-database", action="append", dest="exclude_table_in_database",
+                    help="Argument is of form 'DATABASENAME.TABLENAME' exclude the named table, but only when processing the named database. You can pass this option multiple times.")
 parser.add_argument("--vacuum", dest="vacuum", action="store_true",
                     help="Do regular vacuum instead of VACUUM FREEZE")
 parser.add_argument("--pause", dest="pause_time", type=int, default=10,                    
@@ -125,6 +127,25 @@ debug_print("python version: %s" % sys.version)
 debug_print("psycopg2 version: %s" % psycopg2.__version__)
 debug_print("argparse version: %s" % argparse.__version__)
 debug_print("parameters: %s" % repr(args))
+
+# process arguments that argparse can't handle completely on its own
+
+database_table_map = {}
+for elem in args.exclude_table_in_database:
+    parts = elem.split(".")
+    if len(parts) != 2:
+        print >>sys.stderr, "invalid argument '{arg}' to flag --exclude-table-in-database: argument must be of the form DATABASE.TABLE".format(arg=elem)
+        exit(2)
+    else:
+        dat = parts[0]
+        tab = parts[1]
+        if dat in database_table_map:
+            database_table_map[dat].append(tab)
+        else:
+            database_table_map[dat] = [tab]
+            exit
+
+debug_print("database_table_map: {m}".format(m=database_table_map))
 
 # set times
 halt_time = time.time() + ( args.run_min * 60 )
@@ -246,8 +267,11 @@ for db in dblist:
 
     # for each table in list
     for table in tablist:
+        if table in database_table_map[db]:
+            debug_print("skipping table {t} in database {d} per --exclude-table-in-database argument".format(t=table, d=db))
+            continue
     # check time; if overtime, exit
-        if args.tables_to_exclude and (table in args.tables_to_exclude):
+        elif args.tables_to_exclude and (table in args.tables_to_exclude):
             verbose_print(
                 "skipping table {t} per --exclude-table argument".format(t=table))
             continue
