@@ -267,7 +267,7 @@ for db in dblist:
 
     # for each table in list
     for table in tablist:
-        if table in database_table_map[db]:
+        if db in database_table_map and table in database_table_map[db]:
             debug_print("skipping table {t} in database {d} per --exclude-table-in-database argument".format(t=table, d=db))
             continue
     # check time; if overtime, exit
