@@ -131,19 +131,20 @@ debug_print("parameters: %s" % repr(args))
 # process arguments that argparse can't handle completely on its own
 
 database_table_map = {}
-for elem in args.exclude_table_in_database:
-    parts = elem.split(".")
-    if len(parts) != 2:
-        print >>sys.stderr, "invalid argument '{arg}' to flag --exclude-table-in-database: argument must be of the form DATABASE.TABLE".format(arg=elem)
-        exit(2)
-    else:
-        dat = parts[0]
-        tab = parts[1]
-        if dat in database_table_map:
-            database_table_map[dat].append(tab)
+if args.exclude_table_in_database:
+    for elem in args.exclude_table_in_database:
+        parts = elem.split(".")
+        if len(parts) != 2:
+            print >>sys.stderr, "invalid argument '{arg}' to flag --exclude-table-in-database: argument must be of the form DATABASE.TABLE".format(arg=elem)
+            exit(2)
         else:
-            database_table_map[dat] = [tab]
-            exit
+            dat = parts[0]
+            tab = parts[1]
+            if dat in database_table_map:
+                database_table_map[dat].append(tab)
+            else:
+                database_table_map[dat] = [tab]
+                exit
 
 debug_print("database_table_map: {m}".format(m=database_table_map))
 
