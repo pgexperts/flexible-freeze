@@ -294,11 +294,8 @@ for db in dblist:
 
     # for each table in list
     for table in tablist:
-        if db in database_table_map and table in database_table_map[db]:
-            debug_print("skipping table {t} in database {d} per --exclude-table-in-database argument".format(t=table, d=db))
-            continue
     # check time; if overtime, exit
-        elif args.tables_to_exclude and (table in args.tables_to_exclude):
+        if args.tables_to_exclude and (table in args.tables_to_exclude):
             verbose_print(
                 "skipping table {t} per --exclude-table argument".format(t=table))
             continue
@@ -344,6 +341,7 @@ for db in dblist:
             time.sleep(args.pause_time)
 
 conn.close()
+
 
 # did we get through all tables?
 # exit, report results
