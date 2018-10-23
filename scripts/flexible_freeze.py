@@ -67,6 +67,8 @@ parser.add_argument("-p", "--port", dest="dbport",
                   help="database port")
 parser.add_argument("-w", "--password", dest="dbpass",
                   help="database password")
+parser.add_argument("-n", "--dry-run", dest="dry_run", action="store_true",
+                  help="Don't vacuum; just print what would have been vacuumed.")
 
 args = parser.parse_args()
 
@@ -221,7 +223,27 @@ for db in dblist:
     cur = conn.cursor()
     cur.execute("SET vacuum_cost_delay = {0}".format(args.costdelay))
     cur.execute("SET vacuum_cost_limit = {0}".format(args.costlimit))
+
+    exclude_clause = None
+    tables = []
     
+    if args.tables_to_exclude:
+        tables.extend(args.tables_to_exclude)
+
+    if db in database_table_map:
+        db_tables = database_table_map[db]
+        global_tables = args.tables_to_exclude
+        tables.extend(db_tables)
+
+    debug_print('tables: {t}'.format(t=tables))
+
+    if tables:
+        quoted_table_names = map(lambda table_name: "'" + table_name + "'",
+                                 tables)
+        exclude_clause = 'AND full_table_name::text NOT IN (' + ', '.join(quoted_table_names) + ')'
+    else:
+        exclude_clause = ''
+        
     # if vacuuming, get list of top tables to vacuum
     if args.vacuum:
         tabquery = """WITH deadrow_tables AS (
@@ -239,7 +261,8 @@ for db in dblist:
             FROM deadrow_tables
             WHERE dead_pct > 0.05
             AND table_bytes > 1000000
-            ORDER BY dead_pct DESC, table_bytes DESC;"""
+            {exclude_clause}
+            ORDER BY dead_pct DESC, table_bytes DESC;""".format(exclude_clause=exclude_clause)
     else:
     # if freezing, get list of top tables to freeze
     # includes TOAST tables in case the toast table has older rows
@@ -256,10 +279,13 @@ for db in dblist:
             )
             SELECT full_table_name
             FROM tabfreeze
-            WHERE freeze_age > {0}
+            WHERE freeze_age > {freeze_age}
+            {exclude_clause}
             ORDER BY freeze_age DESC
-            LIMIT 1000;""".format(args.freezeage)
+            LIMIT 1000;""".format(freeze_age=args.freezeage,
+                                  exclude_clause=exclude_clause)
 
+    debug_print('{db} tabquery: {q}'.format(db=db, q=tabquery))
     cur.execute(tabquery)
     verbose_print("getting list of tables")
 
@@ -299,22 +325,23 @@ for db in dblist:
         verbose_print("vacuuming table %s in database %s" % (table, db,))
         excur = conn.cursor()
 
-        try:
-            if args.enforcetime:
-                excur.execute(timeout_query)
-                
-            excur.execute(exquery)
-        except Exception as ex:
-            _print("VACUUMing %s failed." % table)
-            _print(str(ex))
-            if time.time() >= halt_time:
-                verbose_print("halted flexible_freeze due to enforced time limit")
-            else:
-                _print("VACUUMING %s failed." % table[0])
+        if not args.dry_run:
+            try:
+                if args.enforcetime:
+                    excur.execute(timeout_query)
+                    
+                excur.execute(exquery)
+            except Exception as ex:
+                _print("VACUUMing %s failed." % table)
                 _print(str(ex))
-            sys.exit(1)
-
-        time.sleep(args.pause_time)
+                if time.time() >= halt_time:
+                    verbose_print("halted flexible_freeze due to enforced time limit")
+                else:
+                    _print("VACUUMING %s failed." % table[0])
+                    _print(str(ex))
+                sys.exit(1)
+    
+            time.sleep(args.pause_time)
 
 conn.close()
 
