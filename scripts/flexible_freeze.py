@@ -132,7 +132,7 @@ debug_print("parameters: %s" % repr(args))
 
 # process arguments that argparse can't handle completely on its own
 
-database_table_map = {}
+database_table_excludemap = {}
 if args.exclude_table_in_database:
     for elem in args.exclude_table_in_database:
         parts = elem.split(".")
@@ -142,13 +142,13 @@ if args.exclude_table_in_database:
         else:
             dat = parts[0]
             tab = parts[1]
-            if dat in database_table_map:
-                database_table_map[dat].append(tab)
+            if dat in database_table_excludemap:
+                database_table_excludemap[dat].append(tab)
             else:
-                database_table_map[dat] = [tab]
+                database_table_excludemap[dat] = [tab]
                 exit
 
-debug_print("database_table_map: {m}".format(m=database_table_map))
+debug_print("database_table_excludemap: {m}".format(m=database_table_excludemap))
 
 # set times
 halt_time = time.time() + ( args.run_min * 60 )
@@ -173,6 +173,7 @@ if args.logfile:
 
 # do we have a database list?
 # if not, connect to "postgres" database and get a list of non-system databases
+dblist = None
 if args.dblist is None:
     conn = None
     try:
@@ -201,24 +202,21 @@ verbose_print("Flexible Freeze run starting")
 n_dbs = len(dblist)
 verbose_print("Processing {n} database{pl} (list of databases is {l})".format(n = n_dbs, l = ', '.join(dblist), pl = 's' if n_dbs > 1 else ''))
 
+
 # connect to each database
 time_exit = False
 tabcount = 0
-dbcount = 0
 timeout_secs = 0
+dbcount = 0
 
-for db in dblist:
-    verbose_print("working on database {0}".format(db))
-    if time_exit:
-        break
-    else:
-        dbcount += 1
+def get_table_list_for_db(db):
+    verbose_print("finding tables in database {0}".format(db))
     conn = None
     try:
         conn = dbconnect(db, args.dbuser, args.dbhost, args.dbport, args.dbpass)
     except Exception as err:
         _print("skipping database {d} (couldn't connect: {e})".format(d=db, e=str(err)))
-        continue
+        return None
 
     cur = conn.cursor()
     cur.execute("SET vacuum_cost_delay = {0}".format(args.costdelay))
@@ -230,8 +228,8 @@ for db in dblist:
     if args.tables_to_exclude:
         tables.extend(args.tables_to_exclude)
 
-    if db in database_table_map:
-        db_tables = database_table_map[db]
+    if db in database_table_excludemap:
+        db_tables = database_table_excludemap[db]
         global_tables = args.tables_to_exclude
         tables.extend(db_tables)
 
@@ -292,65 +290,78 @@ for db in dblist:
     table_resultset = cur.fetchall()
     tablist = map(lambda(row): row[0], table_resultset)
 
-    # for each table in list
-    for table in tablist:
-    # check time; if overtime, exit
-        if args.tables_to_exclude and (table in args.tables_to_exclude):
-            verbose_print(
-                "skipping table {t} per --exclude-table argument".format(t=table))
-            continue
-        else:
-            verbose_print("processing table {t}".format(t=table))
-
-        if time.time() >= halt_time:
-            verbose_print("Reached time limit.  Exiting.")
-            time_exit = True
-            break
-        else:
-            tabcount += 1
-            # figure out statement_timeout
-            if args.enforcetime:
-                timeout_secs = int(halt_time - time.time()) + 30
-                timeout_query = """SET statement_timeout = '%ss'""" % timeout_secs
-            
-    # if not, vacuum or freeze
-        if args.vacuum:
-            exquery = """VACUUM ANALYZE %s""" % table
-        else:
-            exquery = """VACUUM FREEZE ANALYZE %s""" % table
-
-        verbose_print("vacuuming table %s in database %s" % (table, db,))
-        excur = conn.cursor()
-
-        if not args.dry_run:
-            try:
-                if args.enforcetime:
-                    excur.execute(timeout_query)
-                    
-                excur.execute(exquery)
-            except Exception as ex:
-                _print("VACUUMing %s failed." % table)
-                _print(str(ex))
-                if time.time() >= halt_time:
-                    verbose_print("halted flexible_freeze due to enforced time limit")
-                else:
-                    _print("VACUUMING %s failed." % table[0])
-                    _print(str(ex))
-                sys.exit(1)
+    conn.close()
+    return tablist
     
-            time.sleep(args.pause_time)
+def main():
+    database_table_vacuummap = {}
+    for db in dblist:
+        tables = get_table_list_for_db(db)
+        debug_print('looking for eligible tables in {db}... found {t}'.format(db=db, t=tables))
+        if (tables):
+            database_table_vacuummap[db] = tables
 
-conn.close()
+    debug_print('DBs and tables to vacuum: {m}'.format(m=database_table_vacuummap))
+
+main()
+
+    # # for each table in list
+    # for table in tablist:
+    # # check time; if overtime, exit
+    #     if args.tables_to_exclude and (table in args.tables_to_exclude):
+    #         verbose_print(
+    #             "skipping table {t} per --exclude-table argument".format(t=table))
+    #         continue
+    #     else:
+    #         verbose_print("processing table {t}".format(t=table))
+
+    #     if time.time() >= halt_time:
+    #         verbose_print("Reached time limit.  Exiting.")
+    #         time_exit = True
+    #         break
+    #     else:
+    #         tabcount += 1
+    #         # figure out statement_timeout
+    #         if args.enforcetime:
+    #             timeout_secs = int(halt_time - time.time()) + 30
+    #             timeout_query = """SET statement_timeout = '%ss'""" % timeout_secs
+            
+    # # if not, vacuum or freeze
+    #     if args.vacuum:
+    #         exquery = """VACUUM ANALYZE %s""" % table
+    #     else:
+    #         exquery = """VACUUM FREEZE ANALYZE %s""" % table
+
+    #     verbose_print("vacuuming table %s in database %s" % (table, db,))
+    #     excur = conn.cursor()
+
+    #     if not args.dry_run:
+    #         try:
+    #             if args.enforcetime:
+    #                 excur.execute(timeout_query)
+                    
+    #             excur.execute(exquery)
+    #         except Exception as ex:
+    #             _print("VACUUMing %s failed." % table)
+    #             _print(str(ex))
+    #             if time.time() >= halt_time:
+    #                 verbose_print("halted flexible_freeze due to enforced time limit")
+    #             else:
+    #                 _print("VACUUMING %s failed." % table[0])
+    #                 _print(str(ex))
+    #             sys.exit(1)
+    
+    #         time.sleep(args.pause_time)
 
 
 # did we get through all tables?
 # exit, report results
 if not time_exit:
     _print("All tables vacuumed.")
-    verbose_print("%d tables in %d databases" % (tabcount, dbcount))
+    # verbose_print("%d tables in %d databases" % (tabcount, dbcount))
 else:
     _print("Vacuuming halted due to timeout")
-    verbose_print("after vacuuming %d tables in %d databases" % (tabcount, dbcount,))
+    # verbose_print("after vacuuming %d tables in %d databases" % (tabcount, dbcount,))
 
 verbose_print("Flexible Freeze run complete")
 sys.exit(0)
