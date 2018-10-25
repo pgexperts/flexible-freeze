@@ -69,6 +69,8 @@ parser.add_argument("-w", "--password", dest="dbpass",
                   help="database password")
 parser.add_argument("-n", "--dry-run", dest="dry_run", action="store_true",
                   help="Don't vacuum; just print what would have been vacuumed.")
+parser.add_argument('-j', '--jobs', dest='jobs', default=1,
+                    help='number of parallel jobs to run')
 
 args = parser.parse_args()
 
@@ -321,16 +323,38 @@ def flatten(db_table_map):
 
     return pairs
 
-def split_into_queues(db_table_pairs, jobs):
-    # Next, split the pairs into to n queues.
-    queues = [None] * jobs
-    for i in range(jobs):
-        if pairs:
-            queues[i].append(pairs.pop(0))
+def split_into_queues(items, n):
+    """
+    Take a list, split it into n lists, and return those n lists as a list.
+    Example: split_into_queues(['a', 'b', 'c', 'd'], 2) returns [ [1, 3], [2, 4] ]
+    """
+
+    # Start out with a list of n empty lists, e.g. [ [], [] ]
+    n = int(n)
+    queues = [[] for x in xrange(0,n)]
+    debug_print('queues before filling: {q}'.format(q=queues))
+
+    # Then distribute the items into those lists:
+    # first item goes into queues[0], second item goes into queues[1], and so on.
+    i = 0
+    while True:
+        # If we got to the end of the list of queues,
+        # but we still have items,
+        # start again from the beginning of the list of queues.
+        if i == n:
+            i = 0
+
+        # Keep going as long as we have items.
+        if items:
+            queues[i].append(items.pop(0))
+            i += 1
         else:
+            # When we run out of items to distribute among the queues, stop.
             break
 
-    _debug_print('queues: {q}'.format(q=queues))
+    debug_print('queues after filling: {q}'.format(q=queues))
+    #debug_print('queues[0]: {q}'.format(q=queues[0]))
+    #debug_print('queues[1]: {q}'.format(q=queues[1]))
     return queues
 
 
@@ -341,7 +365,7 @@ def main():
     database_table_pairs = flatten(database_table_map)
     debug_print('database_table_pairs: {d}'.format(d=database_table_pairs))
 
-    split_into_queues(database_table_pairs, args.jobs)
+    queues = split_into_queues(items = database_table_pairs, n = args.jobs)
     
     
 main()
