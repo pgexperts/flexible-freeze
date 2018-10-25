@@ -293,7 +293,7 @@ def get_table_list_for_db(db):
     conn.close()
     return tablist
     
-def main():
+def get_candidates():
     database_table_vacuummap = {}
     for db in dblist:
         tables = get_table_list_for_db(db)
@@ -303,6 +303,47 @@ def main():
 
     debug_print('DBs and tables to vacuum: {m}'.format(m=database_table_vacuummap))
 
+    return database_table_vacuummap
+
+def flatten(db_table_map):
+    """
+    Take a dict where each key is a DB, and each values is a list of tables in that database.
+    Return a list of (db, table) pairs.
+
+    >>>flatten({ 'drupaceous': ['peach'], 'citrus': ['orange', 'lime', 'lemon'] })
+    [['drupaceous', 'peach'], ['citrus', 'orange'], ['citrus', 'lime'], ['citrus', 'lemon']]
+    """
+    
+    pairs = []
+    for db in db_table_map:
+        for table in db_table_map[db]:
+            pairs.append([db, table])
+
+    return pairs
+
+def split_into_queues(db_table_pairs, jobs):
+    # Next, split the pairs into to n queues.
+    queues = [None] * jobs
+    for i in range(jobs):
+        if pairs:
+            queues[i].append(pairs.pop(0))
+        else:
+            break
+
+    _debug_print('queues: {q}'.format(q=queues))
+    return queues
+
+
+def main():
+    database_table_map = get_candidates()
+    debug_print('database_table_map: {d}'.format(d=database_table_map))
+    
+    database_table_pairs = flatten(database_table_map)
+    debug_print('database_table_pairs: {d}'.format(d=database_table_pairs))
+
+    split_into_queues(database_table_pairs, args.jobs)
+    
+    
 main()
 
     # # for each table in list
