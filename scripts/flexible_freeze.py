@@ -18,6 +18,7 @@ import signal
 import argparse
 import psycopg2
 import datetime
+from multiprocessing import Process, Lock
 
 def timestamp():
     now = time.time()
@@ -323,40 +324,67 @@ def flatten(db_table_map):
 
     return pairs
 
-def split_into_queues(items, n):
+def split_into_lists(items, n):
     """
     Take a list, split it into n lists, and return those n lists as a list.
-    Example: split_into_queues(['a', 'b', 'c', 'd'], 2) returns [ [1, 3], [2, 4] ]
+    Example: split_into_lists(['a', 'b', 'c', 'd'], 2) returns [ [1, 3], [2, 4] ]
     """
 
     # Start out with a list of n empty lists, e.g. [ [], [] ]
     n = int(n)
-    queues = [[] for x in xrange(0,n)]
-    debug_print('queues before filling: {q}'.format(q=queues))
+    lists = []
+    for x in range(n):
+        lists.append([])
+    debug_print('lists before filling: {l}'.format(l=lists))
 
     # Then distribute the items into those lists:
-    # first item goes into queues[0], second item goes into queues[1], and so on.
+    # first item goes into lists[0], second item goes into lists[1], and so on.
     i = 0
     while True:
-        # If we got to the end of the list of queues,
+        # If we got to the end of the list of lists,
         # but we still have items,
-        # start again from the beginning of the list of queues.
+        # start again from the beginning of the list of lists.
         if i == n:
             i = 0
 
         # Keep going as long as we have items.
         if items:
-            queues[i].append(items.pop(0))
+            lists[i].append(items.pop(0))
             i += 1
         else:
-            # When we run out of items to distribute among the queues, stop.
+            # When we run out of items to distribute among the lists, stop.
             break
 
-    debug_print('queues after filling: {q}'.format(q=queues))
-    #debug_print('queues[0]: {q}'.format(q=queues[0]))
-    #debug_print('queues[1]: {q}'.format(q=queues[1]))
-    return queues
+    debug_print('lists after filling: {l}'.format(l=lists))
+    #debug_print('lists[0]: {l}'.format(l=lists[0]))
+    #debug_print('lists[1]: {l}'.format(l=lists[1]))
+    return lists
 
+
+def worker(db_table_pairs, global_args, output_lock):
+    #debug_print('Queue: {q}; global args copy: {a}'.format(q=queue, a=global_args))
+    for pair in db_table_pairs:
+        db = pair[0]
+        table = pair[1]
+
+        
+        
+
+
+def create_and_start_processes(items, output_lock):
+    processes = []
+
+    i = 0
+    for pairs in items:
+        i += 1
+        debug_print('queue {number} will process [db, table] pairs {pairs}'.format(number=i, pairs=pairs))
+        
+        process = Process(target=worker, args=[pairs, args, output_lock])
+        processes.append(process)
+
+    debug_print('Processes: {p}'.format(p=processes))
+    return processes
+    
 
 def main():
     database_table_map = get_candidates()
@@ -365,7 +393,16 @@ def main():
     database_table_pairs = flatten(database_table_map)
     debug_print('database_table_pairs: {d}'.format(d=database_table_pairs))
 
-    queues = split_into_queues(items = database_table_pairs, n = args.jobs)
+    lists_of_pairs = split_into_lists(items = database_table_pairs, n = args.jobs)
+
+    output_lock = Lock()
+    processes = create_and_start_processes(lists_of_pairs, output_lock)
+
+    for process in processes:
+        process.start()
+
+    for process in processes:
+        process.join()
     
     
 main()
@@ -421,12 +458,12 @@ main()
 
 # did we get through all tables?
 # exit, report results
-if not time_exit:
-    _print("All tables vacuumed.")
-    # verbose_print("%d tables in %d databases" % (tabcount, dbcount))
-else:
-    _print("Vacuuming halted due to timeout")
-    # verbose_print("after vacuuming %d tables in %d databases" % (tabcount, dbcount,))
+# if not time_exit:
+#     _print("All tables vacuumed.")
+#     # verbose_print("%d tables in %d databases" % (tabcount, dbcount))
+# else:
+#     _print("Vacuuming halted due to timeout")
+#     # verbose_print("after vacuuming %d tables in %d databases" % (tabcount, dbcount,))
 
-verbose_print("Flexible Freeze run complete")
-sys.exit(0)
+# verbose_print("Flexible Freeze run complete")
+# sys.exit(0)
