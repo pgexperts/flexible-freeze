@@ -226,7 +226,7 @@ for db in dblist:
     if args.vacuum:
         tabquery = """WITH deadrow_tables AS (
                 SELECT relid::regclass as full_table_name,
-                    ((n_dead_tup::numeric) / ( n_live_tup + 1 )) as dead_pct,
+                    n_dead_tup::numeric / NULLIF(n_dead_tup + n_live_tup, 0) as dead_pct,
                     pg_relation_size(relid) as table_bytes
                 FROM pg_stat_user_tables
                 WHERE n_dead_tup > 100
