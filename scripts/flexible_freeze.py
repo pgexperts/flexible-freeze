@@ -32,8 +32,8 @@ parser.add_argument("-m", "--minutes", dest="run_min",
                     type=int, default=120,
                     help="Number of minutes to run before halting.  Defaults to 2 hours")
 parser.add_argument("-s", "--minsizemb", dest="minsizemb",
-                    type=int, default=1,
-                    help="Minimum table size to vacuum/freeze.  Default is 1 (MB)")
+                    type=int, default=0,
+                    help="Minimum table size to vacuum/freeze (in MB).  Default is 0.")
 parser.add_argument("-d", "--databases", dest="dblist",
                     help="Comma-separated list of databases to vacuum, if not all of them")
 parser.add_argument("-T", "--exclude-table", action="append", dest="tables_to_exclude",
