@@ -28,6 +28,7 @@ Arguments:
 * -m, --minutes : number of minutes to run for (see note below)
 * -d, --databases : comma-delimited list of databases to vacuum
 * --vacuum : do a VACUUM ANALYZE instead of a VACUUM FREEZE
+* -s, --minsizemb : minimum table size in MB (0)
 * --pause : seconds to pause between vacuums (10)
 * --freezeage : minimum XID age for freezing (10000)
 * --costdelay : vacuum_cost_delay in ms (20)
