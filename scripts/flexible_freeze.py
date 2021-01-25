@@ -32,6 +32,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument("-m", "--minutes", dest="run_min",
                     type=int, default=120,
                     help="Number of minutes to run before halting.  Defaults to 2 hours")
+parser.add_argument("-s", "--minsizemb", dest="minsizemb",
+                    type=int, default=0,
+                    help="Minimum table size to vacuum/freeze (in MB).  Default is 0.")
 parser.add_argument("-d", "--databases", dest="dblist",
                     help="Comma-separated list of databases to vacuum, if not all of them")
 parser.add_argument("-T", "--exclude-table", action="append", dest="tables_to_exclude",
@@ -39,7 +42,7 @@ parser.add_argument("-T", "--exclude-table", action="append", dest="tables_to_ex
 parser.add_argument("--exclude-table-in-database", action="append", dest="exclude_table_in_database",
                     help="Argument is of form 'DATABASENAME.TABLENAME' exclude the named table, but only when processing the named database. You can pass this option multiple times.")
 parser.add_argument("--vacuum", dest="vacuum", action="store_true",
-                    help="Do regular vacuum instead of VACUUM FREEZE")
+                    help="Do VACUUM ANALYZE instead of VACUUM FREEZE")
 parser.add_argument("--pause", dest="pause_time", type=int, default=10,                    
                     help="seconds to pause between vacuums.  Default is 10.")
 parser.add_argument("--freezeage", dest="freezeage",
@@ -68,6 +71,8 @@ parser.add_argument("-p", "--port", dest="dbport",
                   help="database port")
 parser.add_argument("-w", "--password", dest="dbpass",
                   help="database password")
+parser.add_argument("-st", "--table", dest="table",
+                  help="single table", default = False)
 
 args = parser.parse_args()
 
@@ -227,7 +232,7 @@ for db in dblist:
     if args.vacuum:
         tabquery = """WITH deadrow_tables AS (
                 SELECT relid::regclass as full_table_name,
-                    ((n_dead_tup::numeric) / ( n_live_tup + 1 )) as dead_pct,
+                    n_dead_tup::numeric / NULLIF(n_dead_tup + n_live_tup, 0) as dead_pct,
                     pg_relation_size(relid) as table_bytes
                 FROM pg_stat_user_tables
                 WHERE n_dead_tup > 100
@@ -239,15 +244,15 @@ for db in dblist:
             SELECT full_table_name
             FROM deadrow_tables
             WHERE dead_pct > 0.05
-            AND table_bytes > 1000000
-            ORDER BY dead_pct DESC, table_bytes DESC;"""
+            AND table_bytes >= {0} * 2 ^ 20
+            ORDER BY dead_pct DESC, table_bytes DESC;""".format(args.minsizemb)
     else:
     # if freezing, get list of top tables to freeze
     # includes TOAST tables in case the toast table has older rows
         tabquery = """WITH tabfreeze AS (
                 SELECT pg_class.oid::regclass AS full_table_name,
                 greatest(age(pg_class.relfrozenxid), age(toast.relfrozenxid)) as freeze_age,
-                pg_relation_size(pg_class.oid)
+                pg_relation_size(pg_class.oid) as table_bytes
             FROM pg_class JOIN pg_namespace ON pg_class.relnamespace = pg_namespace.oid
                 LEFT OUTER JOIN pg_class as toast
                     ON pg_class.reltoastrelid = toast.oid
@@ -258,8 +263,9 @@ for db in dblist:
             SELECT full_table_name
             FROM tabfreeze
             WHERE freeze_age > {0}
-            ORDER BY freeze_age DESC
-            LIMIT 1000;""".format(args.freezeage)
+            AND table_bytes >= {1} * 2 ^ 20
+            ORDER BY freeze_age DESC, table_bytes DESC
+            LIMIT 1000;""".format(args.freezeage, args.minsizemb)
 
     cur.execute(tabquery)
     verbose_print("getting list of tables")
@@ -267,6 +273,9 @@ for db in dblist:
     table_resultset = cur.fetchall()
     tablist = map(lambda row: row[0], table_resultset)
 
+    #if only one table is desired
+    if args.table:
+      tablist = [args.table]
     # for each table in list
     for table in tablist:
         if db in database_table_map and table in database_table_map[db]:
