@@ -68,6 +68,8 @@ parser.add_argument("-p", "--port", dest="dbport",
                   help="database port")
 parser.add_argument("-w", "--password", dest="dbpass",
                   help="database password")
+parser.add_argument("-st", "--table", dest="table",
+                  help="single table", default = False)
 
 args = parser.parse_args()
 
@@ -267,6 +269,9 @@ for db in dblist:
     table_resultset = cur.fetchall()
     tablist = map(lambda row: row[0], table_resultset)
 
+    #if only one table is desired
+    if args.table:
+      tablist = [args.table]
     # for each table in list
     for table in tablist:
         if db in database_table_map and table in database_table_map[db]:
