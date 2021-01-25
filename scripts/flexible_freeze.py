@@ -72,7 +72,7 @@ parser.add_argument("-p", "--port", dest="dbport",
 parser.add_argument("-w", "--password", dest="dbpass",
                   help="database password")
 parser.add_argument("-st", "--table", dest="table",
-                  help="single table", default = False)
+                  help="only process specified  table", default=False)
 
 args = parser.parse_args()
 
@@ -275,6 +275,10 @@ for db in dblist:
 
     #if only one table is desired
     if args.table:
+      if args.table not in tablist:
+         print("specified single table {0} was not found (or excluded) in database {1}".format(args.table, db))
+         continue
+         
       tablist = [args.table]
     # for each table in list
     for table in tablist:
