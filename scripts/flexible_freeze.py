@@ -1,6 +1,7 @@
+#!/usr/bin/env python3
 '''Flexible Freeze script for PostgreSQL databases
-Version 0.5
-(c) 2014 PostgreSQL Experts Inc.
+Version 0.6
+(c) 2014-2021 PostgreSQL Experts Inc.
 Licensed under The PostgreSQL License
 
 This script is designed for doing VACUUM FREEZE or VACUUM ANALYZE runs
@@ -23,8 +24,8 @@ def timestamp():
     now = time.time()
     return time.strftime("%Y-%m-%d %H:%M:%S %Z")
 
-if sys.version_info[:2] not in ((2,6), (2,7),):
-    print >>sys.stderr, "python 2.6 or 2.7 required; you have %s" % sys.version
+if sys.hexversion < 0x3060000:
+    print("At least Python 3.6 required; you have %s" % sys.version, file=sys.stderr)
     exit(1)
 
 parser = argparse.ArgumentParser()
@@ -72,7 +73,7 @@ args = parser.parse_args()
 
 def debug_print(some_message):
     if args.debug:
-        print >>sys.stderr, ('DEBUG (%s): ' % timestamp()) + some_message
+        print(('DEBUG (%s): ' % timestamp()) + some_message, file=sys.stderr)
 
 def verbose_print(some_message):
     if args.verbose:
@@ -80,9 +81,9 @@ def verbose_print(some_message):
 
 def _print(some_message):
     if args.print_timestamps:
-        print "{timestamp}: {some_message}".format(timestamp=timestamp(), some_message=some_message)
+        print("{timestamp}: {some_message}".format(timestamp=timestamp(), some_message=some_message))
     else:
-        print some_message
+        print(some_message)
     sys.stdout.flush()
     return True
 
@@ -135,7 +136,7 @@ if args.exclude_table_in_database:
     for elem in args.exclude_table_in_database:
         parts = elem.split(".")
         if len(parts) != 2:
-            print >>sys.stderr, "invalid argument '{arg}' to flag --exclude-table-in-database: argument must be of the form DATABASE.TABLE".format(arg=elem)
+            print("invalid argument '{arg}' to flag --exclude-table-in-database: argument must be of the form DATABASE.TABLE".format(arg=elem), file=sys.stderr)
             exit(2)
         else:
             dat = parts[0]
@@ -264,7 +265,7 @@ for db in dblist:
     verbose_print("getting list of tables")
 
     table_resultset = cur.fetchall()
-    tablist = map(lambda(row): row[0], table_resultset)
+    tablist = map(lambda row: row[0], table_resultset)
 
     # for each table in list
     for table in tablist:
