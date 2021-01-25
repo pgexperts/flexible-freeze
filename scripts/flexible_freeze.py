@@ -32,6 +32,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument("-m", "--minutes", dest="run_min",
                     type=int, default=120,
                     help="Number of minutes to run before halting.  Defaults to 2 hours")
+parser.add_argument("-s", "--minsizemb", dest="minsizemb",
+                    type=int, default=0,
+                    help="Minimum table size to vacuum/freeze (in MB).  Default is 0.")
 parser.add_argument("-d", "--databases", dest="dblist",
                     help="Comma-separated list of databases to vacuum, if not all of them")
 parser.add_argument("-T", "--exclude-table", action="append", dest="tables_to_exclude",
@@ -241,15 +244,15 @@ for db in dblist:
             SELECT full_table_name
             FROM deadrow_tables
             WHERE dead_pct > 0.05
-            AND table_bytes > 1000000
-            ORDER BY dead_pct DESC, table_bytes DESC;"""
+            AND table_bytes >= {0} * 2 ^ 20
+            ORDER BY dead_pct DESC, table_bytes DESC;""".format(args.minsizemb)
     else:
     # if freezing, get list of top tables to freeze
     # includes TOAST tables in case the toast table has older rows
         tabquery = """WITH tabfreeze AS (
                 SELECT pg_class.oid::regclass AS full_table_name,
                 greatest(age(pg_class.relfrozenxid), age(toast.relfrozenxid)) as freeze_age,
-                pg_relation_size(pg_class.oid)
+                pg_relation_size(pg_class.oid) as table_bytes
             FROM pg_class JOIN pg_namespace ON pg_class.relnamespace = pg_namespace.oid
                 LEFT OUTER JOIN pg_class as toast
                     ON pg_class.reltoastrelid = toast.oid
@@ -260,8 +263,9 @@ for db in dblist:
             SELECT full_table_name
             FROM tabfreeze
             WHERE freeze_age > {0}
-            ORDER BY freeze_age DESC
-            LIMIT 1000;""".format(args.freezeage)
+            AND table_bytes >= {1} * 2 ^ 20
+            ORDER BY freeze_age DESC, table_bytes DESC
+            LIMIT 1000;""".format(args.freezeage, args.minsizemb)
 
     cur.execute(tabquery)
     verbose_print("getting list of tables")
