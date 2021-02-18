@@ -323,6 +323,8 @@ for db in dblist:
         try:
             if args.enforcetime:
                 excur.execute(timeout_query)
+            else:
+                excur.execute("SET statement_timeout = 0")
                 
             excur.execute(exquery)
         except Exception as ex:
