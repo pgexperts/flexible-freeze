@@ -41,8 +41,12 @@ parser.add_argument("-T", "--exclude-table", action="append", dest="tables_to_ex
                     help="Exclude any table with this name (in any database). You can pass this option multiple times to exclude multiple tables.")
 parser.add_argument("--exclude-table-in-database", action="append", dest="exclude_table_in_database",
                     help="Argument is of form 'DATABASENAME.TABLENAME' exclude the named table, but only when processing the named database. You can pass this option multiple times.")
+parser.add_argument("--no-freeze", dest="skip_freeze", action="store_true",
+                    help="Do VACUUM ANALYZE instead of VACUUM FREEZE ANALYZE")
+parser.add_argument("--no-analyze", dest="skip_analyze", action="store_true",
+                    help="Do not do an ANALYZE as part of the VACUUM operation")
 parser.add_argument("--vacuum", dest="vacuum", action="store_true",
-                    help="Do VACUUM ANALYZE instead of VACUUM FREEZE")
+                    help="Do VACUUM ANALYZE instead of VACUUM FREEZE ANALYZE (deprecated option; use --no-freeze instead)")
 parser.add_argument("--pause", dest="pause_time", type=int, default=10,                    
                     help="seconds to pause between vacuums.  Default is 10.")
 parser.add_argument("--freezeage", dest="freezeage",
@@ -229,7 +233,7 @@ for db in dblist:
     cur.execute("SET vacuum_cost_limit = {0}".format(args.costlimit))
     
     # if vacuuming, get list of top tables to vacuum
-    if args.vacuum:
+    if args.skip_freeze:
         tabquery = """WITH deadrow_tables AS (
                 SELECT relid::regclass as full_table_name,
                     n_dead_tup::numeric / NULLIF(n_dead_tup + n_live_tup, 0) as dead_pct,
@@ -305,12 +309,15 @@ for db in dblist:
                 timeout_query = """SET statement_timeout = '%ss'""" % timeout_secs
             
     # if not, vacuum or freeze
-        if args.vacuum:
-            exquery = """VACUUM ANALYZE %s""" % table
-        else:
-            exquery = """VACUUM FREEZE ANALYZE %s""" % table
+        exquery = "VACUUM "
+        if not args.skip_freeze:
+            exquery += "FREEZE "
+        if not args.skip_analyze:
+            exquery += "ANALYZE "
+        
+        exquery += '"%s"' % table
 
-        verbose_print("vacuuming table %s in database %s" % (table, db,))
+        verbose_print("%s in database %s" % (exquery, db,))
         excur = conn.cursor()
 
         try:

@@ -18,29 +18,50 @@ Requires: psycopg2
 Requires: argparse (which comes preinstalled with Python 2.7 and up)
 Requires: PostgreSQL 9.0 or later
 
-Usage example:
+    usage: flexible_freeze.py [-h] [-m RUN_MIN] [-s MINSIZEMB] [-d DBLIST] [-T TABLES_TO_EXCLUDE]
+                              [--exclude-table-in-database EXCLUDE_TABLE_IN_DATABASE] [--no-freeze] [--no-analyze] [--vacuum]
+                              [--pause PAUSE_TIME] [--freezeage FREEZEAGE] [--costdelay COSTDELAY] [--costlimit COSTLIMIT] [-t]
+                              [--enforce-time] [-l LOGFILE] [-v] [--debug] [-U DBUSER] [-H DBHOST] [-p DBPORT] [-w DBPASS] [-st TABLE]
 
-::
-    python flexible_freeze.py -m 120 --dblist="prod,queue" --pause 5 -U postgres
-
-Arguments:
-
-* -m, --minutes : number of minutes to run for (see note below)
-* -d, --databases : comma-delimited list of databases to vacuum
-* -st, --table : If specified, only process the specified table
-* --vacuum : do a VACUUM ANALYZE instead of a VACUUM FREEZE
-* -s, --minsizemb : minimum table size in MB (0)
-* --pause : seconds to pause between vacuums (10)
-* --freezeage : minimum XID age for freezing (10000)
-* --costdelay : vacuum_cost_delay in ms (20)
-* --costlimit : vacuum_cost_limit (2000)
-* --enforce-time : enforce ending time through statement_timeout
-* -l, --log : log file for all output (optional)
-* -v, --verbose
-* -U, --user : database user
-* -H, --host : database host
-* -p, --port : database port
-* -w, --password : database password
+    optional arguments:
+      -h, --help            show this help message and exit
+      -m RUN_MIN, --minutes RUN_MIN
+                            Number of minutes to run before halting. Defaults to 2 hours
+      -s MINSIZEMB, --minsizemb MINSIZEMB
+                            Minimum table size to vacuum/freeze (in MB). Default is 0.
+      -d DBLIST, --databases DBLIST
+                            Comma-separated list of databases to vacuum, if not all of them
+      -T TABLES_TO_EXCLUDE, --exclude-table TABLES_TO_EXCLUDE
+                            Exclude any table with this name (in any database). You can pass this option multiple times to exclude
+                            multiple tables.
+      --exclude-table-in-database EXCLUDE_TABLE_IN_DATABASE
+                            Argument is of form 'DATABASENAME.TABLENAME' exclude the named table, but only when processing the named
+                            database. You can pass this option multiple times.
+      --no-freeze           Do VACUUM ANALYZE instead of VACUUM ANALYZE FREEZE
+      --no-analyze          Do not do an ANALYZE as part of the VACUUM operation
+      --vacuum              Do VACUUM ANALYZE instead of VACUUM ANALYZE FREEZE (deprecated option; use --no-freeze instead)
+      --pause PAUSE_TIME    seconds to pause between vacuums. Default is 10.
+      --freezeage FREEZEAGE
+                            minimum age for freezing. Default 10m XIDs
+      --costdelay COSTDELAY
+                            vacuum_cost_delay setting in ms. Default 20
+      --costlimit COSTLIMIT
+                            vacuum_cost_limit setting. Default 2000
+      -t, --print-timestamps
+      --enforce-time        enforce time limit by terminating vacuum
+      -l LOGFILE, --log LOGFILE
+      -v, --verbose
+      --debug
+      -U DBUSER, --user DBUSER
+                            database user
+      -H DBHOST, --host DBHOST
+                            database hostname
+      -p DBPORT, --port DBPORT
+                            database port
+      -w DBPASS, --password DBPASS
+                            database password
+      -st TABLE, --table TABLE
+                            only process specified table
 
 Notes:
 
