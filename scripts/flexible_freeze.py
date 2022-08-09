@@ -315,7 +315,7 @@ for db in dblist:
         if not args.skip_analyze:
             exquery += "ANALYZE "
         
-        exquery += '"%s"' % table
+        exquery += '%s' % table
 
         verbose_print("%s in database %s" % (exquery, db,))
         excur = conn.cursor()
