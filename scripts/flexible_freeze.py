@@ -63,6 +63,8 @@ parser.add_argument("-t", "--print-timestamps", action="store_true",
 parser.add_argument("--enforce-time", dest="enforcetime", action="store_true",
                     help="enforce time limit by terminating vacuum")
 parser.add_argument("-l", "--log", dest="logfile")
+parser.add_argument("--lock-timeout", type=int, dest="lock_timeout",
+                    help="If VACUUM can't get a lock on a table after this many milliseconds, give up and move on to the next table (prevents VACUUM from waiting on existing autovacuums)")
 parser.add_argument("-v", "--verbose", action="store_true",
                     dest="verbose")
 parser.add_argument("--debug", action="store_true",
@@ -325,16 +327,21 @@ for db in dblist:
                 excur.execute(timeout_query)
             else:
                 excur.execute("SET statement_timeout = 0")
-                
+                        
+            if args.lock_timeout:
+                excur.execute("SET lock_timeout = {}".format(args.lock_timeout))
+
             excur.execute(exquery)
         except Exception as ex:
-            _print("VACUUMing %s failed." % table)
-            _print(str(ex))
-            if time.time() >= halt_time:
-                verbose_print("halted flexible_freeze due to enforced time limit")
+            strex = str(ex).rstrip()
+            if strex == 'canceling statement due to lock timeout':
+                _print("VACUUM failed to lock table %table after {locktime} ms. Skipping to the next table...".format(table=table, locktime=args.lock_timeout))
             else:
                 _print("VACUUMING %s failed." % table[0])
-                _print(str(ex))
+                _print(strex)
+
+            if time.time() >= halt_time:
+                verbose_print("halted flexible_freeze due to enforced time limit")
             sys.exit(1)
 
         time.sleep(args.pause_time)
