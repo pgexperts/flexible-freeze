@@ -76,7 +76,9 @@ parser.add_argument("-p", "--port", dest="dbport",
 parser.add_argument("-w", "--password", dest="dbpass",
                   help="database password")
 parser.add_argument("-st", "--table", dest="table",
-                  help="only process specified  table", default=False)
+                  help="only process specified table", default=False)
+parser.add_argument("-n", "--dry-run", dest="dry_run",
+                    help="don't really vacuum; just print info about what would have been vacuumed. Best used with --verbose and/or --debug", action="store_true")
 
 args = parser.parse_args()
 
@@ -284,8 +286,15 @@ for db in dblist:
          continue
          
       tablist = [args.table]
+
     # for each table in list
+    i = -1
     for table in tablist:
+        i += 1
+
+        if not args.skip_freeze:
+            debug_print("examining table {t} (xid age: {a}  heap size: {s}  row estimate: {r})".format(t=table, a=table_resultset[i][1], s=table_resultset[i][2], r=table_resultset[i][4]))
+
         if db in database_table_map and table in database_table_map[db]:
             debug_print("skipping table {t} in database {d} per --exclude-table-in-database argument".format(t=table, d=db))
             continue
@@ -307,8 +316,7 @@ for db in dblist:
             if args.enforcetime:
                 timeout_secs = int(halt_time - time.time()) + 30
                 timeout_query = """SET statement_timeout = '%ss'""" % timeout_secs
-            
-    # if not, vacuum or freeze
+
         exquery = "VACUUM "
         if not args.skip_freeze:
             exquery += "FREEZE "
@@ -321,12 +329,13 @@ for db in dblist:
         excur = conn.cursor()
 
         try:
-            if args.enforcetime:
-                excur.execute(timeout_query)
-            else:
-                excur.execute("SET statement_timeout = 0")
-                
-            excur.execute(exquery)
+            if not args.dry_run:
+                if args.enforcetime:
+                    excur.execute(timeout_query)
+                else:
+                    excur.execute("SET statement_timeout = 0")
+                excur.execute(exquery)
+
         except Exception as ex:
             _print("VACUUMing %s failed." % table)
             _print(str(ex))
