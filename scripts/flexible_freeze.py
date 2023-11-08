@@ -77,6 +77,8 @@ parser.add_argument("-w", "--password", dest="dbpass",
                   help="database password")
 parser.add_argument("-st", "--table", dest="table",
                   help="only process specified  table", default=False)
+parser.add_argument("-c", "--comment", dest="comment",
+                  help="optional comment to annotate commands with", default=None)
 
 args = parser.parse_args()
 
@@ -120,6 +122,25 @@ def dbconnect(dbname, dbuser, dbhost, dbport, dbpass):
     conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
 
     return conn
+
+
+comment_start = "/*"
+comment_end = "*/"
+
+
+def build_statement(sql):
+    if args.comment is None:
+        return sql
+
+    comment = args.comment.replace(comment_start, "").replace(comment_end, "")
+
+    if "/*" in sql or "*/" in sql:
+        debug_print(f"sql statement already has comment, not appending: {sql}, {comment}")
+        return sql
+
+    sql += f" /* {comment} */"
+    debug_print(f"appended comment to sql: {sql}")
+    return sql
 
 def signal_handler(signal, frame):
     _print('exiting due to user interrupt')
@@ -191,9 +212,10 @@ if args.dblist is None:
         sys.exit(1)
 
     cur = conn.cursor()
-    cur.execute("""SELECT datname FROM pg_database
+    stmt = build_statement("""SELECT datname FROM pg_database
         WHERE datname NOT IN ('postgres','template1','template0')
         ORDER BY age(datfrozenxid) DESC""")
+    cur.execute(stmt)
     dblist = []
     for dbname in cur:
         dblist.append(dbname[0])
@@ -229,8 +251,8 @@ for db in dblist:
         continue
 
     cur = conn.cursor()
-    cur.execute("SET vacuum_cost_delay = {0}".format(args.costdelay))
-    cur.execute("SET vacuum_cost_limit = {0}".format(args.costlimit))
+    cur.execute(build_statement("SET vacuum_cost_delay = {0}".format(args.costdelay)))
+    cur.execute(build_statement("SET vacuum_cost_limit = {0}".format(args.costlimit)))
     
     # if vacuuming, get list of top tables to vacuum
     if args.skip_freeze:
@@ -271,7 +293,7 @@ for db in dblist:
             ORDER BY freeze_age DESC, table_bytes DESC
             LIMIT 1000;""".format(args.freezeage, args.minsizemb)
 
-    cur.execute(tabquery)
+    cur.execute(build_statement(tabquery))
     verbose_print("getting list of tables")
 
     table_resultset = cur.fetchall()
@@ -322,11 +344,11 @@ for db in dblist:
 
         try:
             if args.enforcetime:
-                excur.execute(timeout_query)
+                excur.execute(build_statement(timeout_query))
             else:
-                excur.execute("SET statement_timeout = 0")
+                excur.execute(build_statement("SET statement_timeout = 0"))
                 
-            excur.execute(exquery)
+            excur.execute(build_statement(exquery))
         except Exception as ex:
             _print("VACUUMing %s failed." % table)
             _print(str(ex))

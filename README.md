@@ -21,6 +21,7 @@ Requires psycopg2
                               [--exclude-table-in-database EXCLUDE_TABLE_IN_DATABASE] [--no-freeze] [--no-analyze] [--vacuum]
                               [--pause PAUSE_TIME] [--freezeage FREEZEAGE] [--costdelay COSTDELAY] [--costlimit COSTLIMIT] [-t]
                               [--enforce-time] [-l LOGFILE] [-v] [--debug] [-U DBUSER] [-H DBHOST] [-p DBPORT] [-w DBPASS] [-st TABLE]
+                              [--comment COMMENT]
 
     optional arguments:
       -h, --help            show this help message and exit
@@ -61,6 +62,8 @@ Requires psycopg2
                             database password
       -st TABLE, --table TABLE
                             only process specified table
+      -c COMMENT, --comment COMMMENT
+                            specify an optional comment to annotate the query with
 
 Notes:
 
