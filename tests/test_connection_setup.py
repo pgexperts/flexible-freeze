@@ -273,7 +273,7 @@ def test_no_freeze_still_selects_and_analyzes_under_the_empty_path(db, run_ff):
     assert result.returncode == 0, result.stdout + result.stderr
     vacuums = db.script_vacuums()
     assert targets(vacuums) == [("public", "t_dead")]
-    assert vacuums[0].options == {"ANALYZE"}
+    assert vacuums[0].options == {"ANALYZE", "SKIP_LOCKED"}
     assert SET_SEARCH_PATH in db.script_statements()
     db.wait_for_vacuum_count("t_dead", 1)
     assert db.is_analyzed("t_dead")

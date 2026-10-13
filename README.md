@@ -13,14 +13,15 @@ timeout so that it won't overrun your slow traffic period.
 
 Tested on Python 3.8, but should work on any supported Python 3.
 
-Supports any non-EOL version of PostgreSQL.
+Requires PostgreSQL 12 or later: every `VACUUM` is sent with `SKIP_LOCKED`, which older versions do not have.
 
 Requires psycopg2
 
     usage: flexible_freeze.py [-h] [-m RUN_MIN] [-s MINSIZEMB] [-d DBLIST] [-T TABLES_TO_EXCLUDE]
                               [--exclude-table-in-database EXCLUDE_TABLE_IN_DATABASE] [--no-freeze] [--no-analyze] [--vacuum]
                               [--pause PAUSE_TIME] [--freezeage FREEZEAGE] [--costdelay COSTDELAY] [--costlimit COSTLIMIT] [-t]
-                              [--enforce-time] [-l LOGFILE] [-v] [--debug] [-U DBUSER] [-H DBHOST] [-p DBPORT] [-w DBPASS] [--table TABLE]
+                              [--enforce-time] [--lock-timeout LOCK_TIMEOUT] [--no-advisory-lock] [-l LOGFILE] [-v] [--debug]
+                              [-U DBUSER] [-H DBHOST] [-p DBPORT] [-w DBPASS] [--table TABLE]
 
     optional arguments:
       -h, --help            show this help message and exit
@@ -53,6 +54,12 @@ Requires psycopg2
                             vacuum_cost_limit setting. Default 2000
       -t, --print-timestamps
       --enforce-time        enforce time limit by terminating vacuum
+      --lock-timeout LOCK_TIMEOUT
+                            seconds to wait for a lock before giving up (set as the session's lock_timeout). A database whose table
+                            list cannot be read in that time is skipped, a table whose VACUUM runs into it is reported as failed, and
+                            the run goes on. 0 means wait without limit. Default is 10.
+      --no-advisory-lock    Do not guard against overlapping runs. By default a run takes an advisory lock in each database while it
+                            works there, and skips a database in which another run holds that lock.
       -l LOGFILE, --log LOGFILE
       -v, --verbose
       --debug
@@ -79,6 +86,12 @@ The minutes time limit is normally only enforced at the start of vacuuming each 
 If you do not specify a `--enforce_time`, `flexible_freeze` will issue a `SET statement_timeout = 0` statement before each operation
 to avoid cancellation by a system- or role-wide `statement_timeout` value.
 
+`flexible_freeze` does not wait for a table that another session has locked.  Each statement is sent as `VACUUM (FREEZE, ANALYZE, SKIP_LOCKED)` (without `FREEZE` or `ANALYZE` according to `--no-freeze` and `--no-analyze`), so a table held by an anti-wraparound autovacuum, a `CREATE INDEX` or anything else that conflicts with `VACUUM` is passed over at once.  The server reports that with a warning, and the table is then treated like any other the server declined to vacuum: its message is printed, the table is listed in the summary as not vacuumed, and the exit status is 1.  The table is selected again on the next run.
+
+Every other wait for a lock is limited by `--lock-timeout`, ten seconds unless you say otherwise.  That matters most for the query that lists the tables: it asks for the size of each candidate, and so waits behind a pending `ACCESS EXCLUSIVE` lock (an `ALTER TABLE`, a `TRUNCATE`, a `VACUUM FULL`) on any one of them.  A database whose tables cannot be listed in that time is skipped and listed in the summary.  A `VACUUM` that has its table but then has to wait for some other lock for that long is reported as a failed table.  `flexible_freeze` sets `lock_timeout` in every database it works on, whatever the value, so `--lock-timeout 0` means no limit even where the database or the role has a `lock_timeout` of its own.  The timeout measures time spent waiting for a lock, not time spent vacuuming.
+
+Two runs do not work on the same database at the same time.  While it works in a database, a run holds the advisory lock with the key `7380385457142659685` there (the ASCII bytes of `flexfrze` as a 64-bit integer; in `pg_locks`, `locktype = 'advisory'`, `classid = 1718379896`, `objid = 1718778469`, `objsubid = 1`).  A run that finds the lock taken, because an earlier run is still going or a second one was started by mistake, skips that database, says so, goes on to the databases that are free, and exits with status 1.  The lock is per database because PostgreSQL's advisory locks are: runs over different databases do not get in each other's way, and no single lock could cover a cluster.  It is released when the run's session in that database ends, so a run that was killed leaves nothing to clean up; one killed in the middle of a vacuum keeps the lock until the server has finished that vacuum.  `--no-advisory-lock` turns all of this off, for that run only: it neither takes the lock nor looks for it.  Keep the key out of your own applications' use of advisory locks.
+
 Normally flexible_freeze.py does VACUUM FREEZE ANALYZE, starting with the oldest tables.  If you set `--no-freeze`, though, it will instead do VACUUM ANALYZE, starting with the tables with the most dead rows.  If you are doing both, do the FREEZE first.
 
 When freezing, a table's age is the greatest of four numbers: its transaction ID age (`age(relfrozenxid)`), its MultiXact ID age (`mxid_age(relminmxid)`), and the same two for its TOAST table.  Each of them can force an anti-wraparound vacuum on its own.  Ordinary tables and materialized views are frozen, in every schema except `pg_catalog` and `information_schema`; there is no limit on how many tables a run selects, other than the time window.
@@ -91,7 +104,7 @@ If no `-d` is given, `flexible_freeze` works on every database that accepts conn
 
 Limitations: partitioned tables themselves are never selected, only their partitions.  Autovacuum does not analyze a partitioned table either, so the statistics kept for the parent as a whole go stale unless you run `ANALYZE` on it yourself.  Foreign tables are not selected, and neither are temporary tables, which only the session that owns them can vacuum.
 
-`--minutes`, `--minsizemb`, `--pause`, `--freezeage`, `--costdelay` and `--costlimit` take whole numbers and may not be negative.  Empty entries in the `-d` list are ignored, so a doubled or trailing comma is harmless, but a `-d` that names no database at all is an error.
+`--minutes`, `--minsizemb`, `--pause`, `--freezeage`, `--costdelay`, `--costlimit` and `--lock-timeout` take whole numbers and may not be negative.  Empty entries in the `-d` list are ignored, so a doubled or trailing comma is harmless, but a `-d` that names no database at all is an error.
 
 You can specify `--no-analyze` to skip the ANALYZE step. 
 
@@ -107,7 +120,7 @@ A mistyped `-T` or `--exclude-table-in-database` value excludes nothing.  With `
 
 The database user supplied is expected to have permissions on all tables (e.g. a superuser).  The server does not raise an error for a table the user may not vacuum: it skips the table with a warning.  `flexible_freeze` treats any warning the server raises during a table's VACUUM as "not vacuumed": it prints the server's message, lists the table in the summary, and exits with status 1.
 
-One table failing does not end the run.  The failure is printed, the run continues with the next table, and the summary at the end lists every table that failed.  The same goes for a database that cannot be connected to or whose tables cannot be listed: it is skipped and listed in the summary.  If the connection to a database is lost during a run, the rest of that database is skipped; `flexible_freeze` does not reconnect.
+One table failing does not end the run.  The failure is printed, the run continues with the next table, and the summary at the end lists every table that failed.  The same goes for a database that cannot be connected to, whose tables cannot be listed, or in which another run holds the advisory lock: it is skipped and listed in the summary.  If the connection to a database is lost during a run, the rest of that database is skipped; `flexible_freeze` does not reconnect.
 
 Exit status:
 

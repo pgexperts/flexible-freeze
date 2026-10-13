@@ -15,6 +15,8 @@ from ffharness import FREEZE_ALL, assert_lines_in_order
 
 T1 = ("public", "t1")
 SET_SEARCH_PATH = "SELECT pg_catalog.set_config('search_path', '', false)"
+# The key is part of what the script documents; test_locks.py says why.
+ADVISORY_LOCK = "SELECT pg_catalog.pg_try_advisory_lock(7380385457142659685)"
 TIMESTAMPED = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[^:]*: .+")
 
 
@@ -36,7 +38,7 @@ def test_default_run_freezes_and_analyzes(db, run_ff):
     db.wait_for_vacuum_count("t1", 1)
     vacuums = db.script_vacuums()
     assert targets(vacuums) == [T1]
-    assert vacuums[0].options == {"FREEZE", "ANALYZE"}
+    assert vacuums[0].options == {"FREEZE", "ANALYZE", "SKIP_LOCKED"}
 
 
 def test_default_freezeage_leaves_young_tables_alone(db, run_ff):
@@ -87,7 +89,7 @@ def test_no_analyze_drops_analyze(db, run_ff):
     assert result.returncode == 0
     vacuums = db.script_vacuums()
     assert targets(vacuums) == [T1]
-    assert vacuums[0].options == {"FREEZE"}
+    assert vacuums[0].options == {"FREEZE", "SKIP_LOCKED"}
     assert f"{vacuums[0].sql} in database {db.name}" in result.stdout.splitlines()
     assert "ANALYZE" not in result.stdout
     assert db.frozen_since(before) == {T1}
@@ -110,7 +112,7 @@ def test_no_freeze_vacuums_a_table_with_dead_rows_and_skips_a_clean_one(db, run_
     assert result.returncode == 0
     vacuums = db.script_vacuums()
     assert targets(vacuums) == [("public", "t_dead")]
-    assert vacuums[0].options == {"ANALYZE"}
+    assert vacuums[0].options == {"ANALYZE", "SKIP_LOCKED"}
     assert f"{vacuums[0].sql} in database {db.name}" in result.stdout.splitlines()
     assert "FREEZE" not in result.stdout
     db.wait_for_vacuum_count("t_dead", 1)
@@ -152,11 +154,16 @@ def test_session_settings_precede_the_work(db, run_ff):
     assert statements[0] == SET_SEARCH_PATH
     # Then the session settings, all of them before the table list is read.
     # Warnings are asked for so that a table the server declines to vacuum
-    # is noticed (test_run_outcome.py).
-    assert statements[1:4] == [
+    # is noticed (test_run_outcome.py).  The lock timeout has to be in place
+    # before the table list is read, which is the statement it is mainly
+    # there for, and the database is claimed for this run before any work is
+    # done in it (test_locks.py for both).
+    assert statements[1:6] == [
         "SET vacuum_cost_delay = 20",
         "SET vacuum_cost_limit = 2000",
         "SET client_min_messages = warning",
+        "SET lock_timeout = '10s'",
+        ADVISORY_LOCK,
     ]
     # ADR 0005: without --enforce-time any inherited statement_timeout is
     # cleared immediately before the vacuum.
@@ -175,11 +182,13 @@ def test_session_settings_precede_the_work_on_a_non_iso_datestyle(db, run_ff):
 
     assert result.returncode == 0
     statements = db.script_statements()
-    assert statements[:4] == [
+    assert statements[:6] == [
         SET_SEARCH_PATH,
         "SET vacuum_cost_delay = 20",
         "SET vacuum_cost_limit = 2000",
         "SET client_min_messages = warning",
+        "SET lock_timeout = '10s'",
+        ADVISORY_LOCK,
     ]
     assert statements[-2:] == ["SET statement_timeout = 0", db.script_vacuums()[0].sql]
 

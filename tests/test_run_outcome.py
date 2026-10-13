@@ -14,12 +14,20 @@
 #
 # How the failures are produced:
 #
-# * A VACUUM fails when another session holds a conflicting lock on the table
-#   and the database carries a lock_timeout (the script sets none itself).
-#   With no lock_timeout the VACUUM waits instead, which gives the test time
-#   to cancel or terminate the script's backend, or to move its clock.
-# * The table-listing query fails the same way behind an ACCESS EXCLUSIVE
-#   lock: it calls pg_table_size() on every candidate.
+# * A VACUUM fails when it names a table in a schema the connecting role may
+#   not use: the server refuses the statement with an error before it does
+#   anything to the table.  A lock on the table no longer produces a failure:
+#   the script's VACUUM passes over a locked table, which is a different
+#   outcome with a report of its own (test_locks.py).
+# * A VACUUM is kept from finishing by another session's pin on the table's
+#   only page.  A freezing VACUUM has to have that page to itself, so it
+#   waits, already holding the table's lock and genuinely under way, until
+#   the pin goes.  That gives the test time to cancel or terminate the
+#   script's backend, or to move its clock.  A lock would not do here either:
+#   the VACUUM would be over, skipped, before the test could act.
+# * The table-listing query fails behind an ACCESS EXCLUSIVE lock, once the
+#   script's --lock-timeout has run out: it calls pg_table_size() on every
+#   candidate.
 # * Deadlines are reached through the script_clock fixture; the script's
 #   window cannot be shorter than a minute otherwise.
 
@@ -33,23 +41,35 @@ from ffharness import FREEZE_ALL, SCRIPT_APP, assert_lines_in_order, wait_for
 NO_SUCH_DB = "ff_no_such_database"
 TIMESTAMPED = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[^:]*: .+")
 
-# Blocks VACUUM (which takes the same lock) but not the table-listing query.
-BLOCKS_VACUUM = "SHARE UPDATE EXCLUSIVE"
 # Blocks everything, the listing query's pg_table_size() included.
 BLOCKS_LISTING = "ACCESS EXCLUSIVE"
+
+# A schema the roles made by make_role have no USAGE on, and what the server
+# says to a VACUUM that names a table in it.
+CLOSED_SCHEMA = "vault"
+SCHEMA_DENIED = f"permission denied for schema {CLOSED_SCHEMA}"
 
 
 def targets(vacuums):
     return [vacuum.target for vacuum in vacuums]
 
 
-def fail_lock_waits(db):
-    """Make a lock wait in `db` an error after a moment instead of a wait."""
-    db.execute(f'ALTER DATABASE "{db.name}" SET lock_timeout = \'200ms\'')
+def table_the_role_cannot_reach(db, name):
+    """Create <CLOSED_SCHEMA>.<name>, whose VACUUM is an error for any role
+    but a superuser.
+
+    The table is still listed: the selection reads pg_class and the size
+    functions check no privilege.  It is the VACUUM, which looks the table up
+    by name, that is refused, and for the lack of USAGE on the schema that is
+    an ERROR.  (For a table the role can reach and does not own it is only a
+    WARNING; that case is further down.)
+    """
+    db.create_schema(CLOSED_SCHEMA)
+    return db.create_table(name, schema=CLOSED_SCHEMA)
 
 
 @contextlib.contextmanager
-def lock_held(db, table, mode=BLOCKS_VACUUM):
+def lock_held(db, table, mode):
     """Hold a lock on public.<table> in an open transaction.
 
     Yields the connection; rolling it back releases the lock early.
@@ -63,19 +83,50 @@ def lock_held(db, table, mode=BLOCKS_VACUUM):
         conn.close()
 
 
+@contextlib.contextmanager
+def vacuum_held_up(db, table):
+    """Keep a freezing VACUUM of public.<table> from finishing.
+
+    A cursor that has returned one row and is still open keeps a pin on the
+    page that row is on.  VACUUM (FREEZE) must freeze the rows of that page
+    and needs the page to itself for it, so it waits for the pin to go:
+    past the table's lock (the cursor's ACCESS SHARE does not conflict, so
+    SKIP_LOCKED does not come into it) and not waiting for any lock (so
+    lock_timeout does not either).  Only a freezing VACUUM waits; a plain
+    one leaves a pinned page for next time.  The table has to fit in one
+    page, as the tables create_table builds by default do.
+
+    Yields the connection; rolling it back closes the cursor, which drops
+    the pin and lets the VACUUM finish.
+    """
+    conn = db.connect(autocommit=False)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f'DECLARE ff_pin NO SCROLL CURSOR FOR SELECT id FROM public."{table}"'
+            )
+            cur.execute("FETCH 1 FROM ff_pin")
+        yield conn
+    finally:
+        conn.close()
+
+
 def waiting_backend(db):
-    """The pid of the script's backend in `db`, once it waits for a lock."""
+    """The pid of the script's backend in `db`, once its VACUUM is waiting
+    for the page that vacuum_held_up() has pinned."""
 
     def probe():
         rows = db.cluster.execute(
             "postgres",
             "SELECT pid FROM pg_stat_activity WHERE application_name = %s "
-            "AND datname = %s AND wait_event_type = 'Lock'",
+            "AND datname = %s AND wait_event_type = 'BufferPin'",
             (SCRIPT_APP, db.name),
         )
         return rows[0][0] if rows else None
 
-    return wait_for(probe, what=f"the script to wait for a lock in {db.name}")
+    return wait_for(
+        probe, what=f"the script's VACUUM to wait for a pinned page in {db.name}"
+    )
 
 
 def finish(proc, timeout=30.0):
@@ -87,40 +138,41 @@ def finish(proc, timeout=30.0):
 # -- a VACUUM that fails ------------------------------------------------------
 
 
-def test_failed_table_is_reported_once_and_the_run_continues(make_db, run_ff):
-    # t_locked is created first, so it is the oldest table and is taken
+def test_failed_table_is_reported_once_and_the_run_continues(
+    make_db, make_role, run_ff
+):
+    # t_denied is created first, so it is the oldest table and is taken
     # first: everything else in the run comes after the failure.
+    role = make_role("owner")
     one, two = make_db("one"), make_db("two")
-    one.create_table("t_locked")
-    one.create_table("t_next")
-    two.create_table("t_other")
-    fail_lock_waits(one)
+    denied = table_the_role_cannot_reach(one, "t_denied")
+    one.create_table("t_next", owner=role)
+    two.create_table("t_other", owner=role)
     before_one, before_two = one.frozenxids(), two.frozenxids()
 
-    with lock_held(one, "t_locked"):
-        result = run_ff(*FREEZE_ALL, "-v", "-d", f"{one.name},{two.name}")
+    result = run_ff(*FREEZE_ALL, "-v", "-U", role, "-d", f"{one.name},{two.name}")
 
     assert result.returncode == 1
     assert "Traceback" not in result.stderr
     # Later tables of the same database, and later databases, are still done.
-    assert targets(one.script_vacuums()) == [("public", "t_locked"), ("public", "t_next")]
+    assert targets(one.script_vacuums()) == [denied, ("public", "t_next")]
     assert one.frozen_since(before_one) == {("public", "t_next")}
     assert two.frozen_since(before_two) == {("public", "t_other")}
 
     lines = result.stdout.splitlines()
     # Once, and with the table's whole name.
-    assert lines.count("VACUUMing public.t_locked failed.") == 1
+    assert lines.count(f"VACUUMing {CLOSED_SCHEMA}.t_denied failed.") == 1
     assert not [line for line in lines if line.startswith("VACUUMING ")]
-    assert result.stdout.count("canceling statement due to lock timeout") == 1
+    assert result.stdout.count(SCHEMA_DENIED) == 1
     assert "All tables vacuumed." not in lines
     assert_lines_in_order(
         result.stdout,
         [
-            "VACUUMing public.t_locked failed.",
+            f"VACUUMing {CLOSED_SCHEMA}.t_denied failed.",
             "processing table public.t_next",
             f"working on database {two.name}",
             "Not all tables were vacuumed.",
-            f"Tables that failed: public.t_locked in database {one.name}",
+            f"Tables that failed: {CLOSED_SCHEMA}.t_denied in database {one.name}",
             # The failed table is not counted; the two that worked are.
             "2 tables in 2 databases",
             "Flexible Freeze run complete",
@@ -128,19 +180,18 @@ def test_failed_table_is_reported_once_and_the_run_continues(make_db, run_ff):
     )
 
 
-def test_failure_report_without_verbose(db, run_ff):
-    db.create_table("t_locked")
-    fail_lock_waits(db)
+def test_failure_report_without_verbose(db, make_role, run_ff):
+    role = make_role("owner")
+    table_the_role_cannot_reach(db, "t_denied")
 
-    with lock_held(db, "t_locked"):
-        result = run_ff(*FREEZE_ALL, "-d", db.name)
+    result = run_ff(*FREEZE_ALL, "-U", role, "-d", db.name)
 
     assert result.returncode == 1
     assert result.stdout.splitlines() == [
-        "VACUUMing public.t_locked failed.",
-        "canceling statement due to lock timeout",
+        f"VACUUMing {CLOSED_SCHEMA}.t_denied failed.",
+        SCHEMA_DENIED,
         "Not all tables were vacuumed.",
-        f"Tables that failed: public.t_locked in database {db.name}",
+        f"Tables that failed: {CLOSED_SCHEMA}.t_denied in database {db.name}",
     ]
 
 
@@ -148,11 +199,11 @@ def test_cancelled_vacuum_inside_the_window_is_a_failure(db, start_ff):
     # A cancel that the time limit did not ask for (pg_cancel_backend by an
     # operator, say) is a failed table like any other, with or without
     # --enforce-time, and the run goes on to the next table.
-    db.create_table("t_locked")
+    db.create_table("t_held")
     db.create_table("t_next")
     before = db.frozenxids()
 
-    with lock_held(db, "t_locked"):
+    with vacuum_held_up(db, "t_held"):
         proc = start_ff(*FREEZE_ALL, "--enforce-time", "-d", db.name)
         pid = waiting_backend(db)
         db.cluster.execute("postgres", "SELECT pg_cancel_backend(%s)", (pid,))
@@ -162,19 +213,19 @@ def test_cancelled_vacuum_inside_the_window_is_a_failure(db, start_ff):
     assert "Traceback" not in stderr
     assert db.frozen_since(before) == {("public", "t_next")}
     lines = stdout.splitlines()
-    assert lines.count("VACUUMing public.t_locked failed.") == 1
+    assert lines.count("VACUUMing public.t_held failed.") == 1
     assert "Vacuuming halted due to timeout" not in lines
-    assert f"Tables that failed: public.t_locked in database {db.name}" in lines
+    assert f"Tables that failed: public.t_held in database {db.name}" in lines
 
 
 def test_lost_connection_ends_that_database_and_the_run_continues(make_db, start_ff):
     one, two = make_db("one"), make_db("two")
-    one.create_table("t_locked")
+    one.create_table("t_held")
     one.create_table("t_next")
     two.create_table("t_other")
     before_one, before_two = one.frozenxids(), two.frozenxids()
 
-    with lock_held(one, "t_locked"):
+    with vacuum_held_up(one, "t_held"):
         proc = start_ff(*FREEZE_ALL, "-v", "-d", f"{one.name},{two.name}")
         pid = waiting_backend(one)
         one.cluster.execute("postgres", "SELECT pg_terminate_backend(%s)", (pid,))
@@ -184,18 +235,18 @@ def test_lost_connection_ends_that_database_and_the_run_continues(make_db, start
     assert "Traceback" not in stderr
     # Nothing more is attempted in the database whose connection is gone, and
     # no second connection to it is made.
-    assert targets(one.script_vacuums()) == [("public", "t_locked")]
+    assert targets(one.script_vacuums()) == [("public", "t_held")]
     assert one.frozen_since(before_one) == set()
     assert len({record.pid for record in one.cluster.statements(dbname=one.name)}) == 1
     assert two.frozen_since(before_two) == {("public", "t_other")}
     assert_lines_in_order(
         stdout,
         [
-            "VACUUMing public.t_locked failed.",
+            "VACUUMing public.t_held failed.",
             f"skipping the rest of database {one.name} (connection lost)",
             f"working on database {two.name}",
             "Not all tables were vacuumed.",
-            f"Tables that failed: public.t_locked in database {one.name}",
+            f"Tables that failed: public.t_held in database {one.name}",
             f"Databases skipped or left unfinished: {one.name}",
             "1 tables in 2 databases",
         ],
@@ -302,13 +353,17 @@ def test_unreachable_database_is_reported_and_fails_the_run(db, run_ff, position
 
 def test_table_listing_failure_skips_that_database_only(make_db, run_ff):
     one, two = make_db("one"), make_db("two")
+    # The timeout is the script's own (--lock-timeout); the database sets
+    # none.  One second keeps the test short; the default and the timing are
+    # in test_locks.py.
     one.create_table("t_locked")
     two.create_table("t_other")
-    fail_lock_waits(one)
     before_one, before_two = one.frozenxids(), two.frozenxids()
 
     with lock_held(one, "t_locked", BLOCKS_LISTING):
-        result = run_ff(*FREEZE_ALL, "-v", "-d", f"{one.name},{two.name}")
+        result = run_ff(
+            *FREEZE_ALL, "-v", "--lock-timeout", "1", "-d", f"{one.name},{two.name}"
+        )
 
     assert result.returncode == 1
     assert "Traceback" not in result.stderr
@@ -467,7 +522,7 @@ def test_vacuum_cancelled_at_the_enforced_limit_is_a_time_limited_stop(
     db.create_table("t_later")
     before = db.frozenxids()
 
-    with lock_held(db, "t_big"):
+    with vacuum_held_up(db, "t_big"):
         proc = start_ff(
             *FREEZE_ALL, "--enforce-time", "-m", "1", "-d", db.name,
             env=script_clock.env,
@@ -494,7 +549,7 @@ def test_time_limited_stop_with_verbose_counts_only_finished_tables(
 ):
     db.create_table("t_big")
 
-    with lock_held(db, "t_big"):
+    with vacuum_held_up(db, "t_big"):
         proc = start_ff(
             *FREEZE_ALL, "-v", "--enforce-time", "-m", "1", "-d", db.name,
             env=script_clock.env,
@@ -548,7 +603,7 @@ def test_no_pause_once_the_deadline_has_passed(db, start_ff, script_clock):
     db.create_table("t_second")
     before = db.frozenxids()
 
-    with lock_held(db, "t_first") as holder:
+    with vacuum_held_up(db, "t_first") as holder:
         proc = start_ff(
             *FREEZE_ALL, "-v", "-m", "1", "--pause", "20", "-d", db.name,
             env=script_clock.env,
@@ -581,7 +636,7 @@ def test_pause_is_cut_short_at_the_deadline(db, start_ff, script_clock):
     db.create_table("t_second")
     before = db.frozenxids()
 
-    with lock_held(db, "t_first") as holder:
+    with vacuum_held_up(db, "t_first") as holder:
         proc = start_ff(
             *FREEZE_ALL, "-v", "-m", "1", "--pause", "30", "-d", db.name,
             env=script_clock.env,

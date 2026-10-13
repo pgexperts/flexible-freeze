@@ -27,7 +27,7 @@ NO_SUCH_DB = "ff_no_such_database"
 
 NON_NEGATIVE_OPTIONS = [
     "-m", "--minutes", "-s", "--minsizemb", "--pause",
-    "--freezeage", "--costdelay", "--costlimit",
+    "--freezeage", "--costdelay", "--costlimit", "--lock-timeout",
 ]
 
 
@@ -57,7 +57,7 @@ def test_vacuum_option_is_the_same_as_no_freeze(db, run_ff):
     assert result.returncode == 0
     vacuums = db.script_vacuums()
     assert [vacuum.target for vacuum in vacuums] == [("public", "t_dead")]
-    assert vacuums[0].options == {"ANALYZE"}
+    assert vacuums[0].options == {"ANALYZE", "SKIP_LOCKED"}
     assert "FREEZE" not in result.stdout
 
 
