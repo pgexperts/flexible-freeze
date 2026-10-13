@@ -4,8 +4,8 @@
 #
 # Every test proves the selection from relfrozenxid, which moves for exactly
 # the tables that were frozen.  Table names are bare lowercase names in
-# schema public; matching of qualified or mixed-case names is unreliable
-# today (issues #31 and #38) and is left to the branches that fix it.
+# schema public; other schemas, qualified names and names that need quoting
+# are covered in test_table_names.py.
 #
 # The default database list leaves out the postgres database by name.  That
 # is recorded here because it is what the tool does today; whether it should
