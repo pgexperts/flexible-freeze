@@ -1,0 +1,100 @@
+# CI: lint, and run the test suite against each supported PostgreSQL major
+# version.
+#
+# Manual trigger only: the pipeline is run at the end of a block of work,
+# not on every push.  (GitHub offers the "Run workflow" button, and
+# `gh workflow run ci.yml --ref <branch>`, only once this file exists on the
+# default branch.)
+#
+# The tests start their own throwaway cluster from the binaries in
+# PG_BINDIR (see tests/conftest.py).  The distribution's service is stopped
+# and no "main" cluster is created, so nothing listens on port 5432 while the
+# tests run; setting PG_BINDIR explicitly also turns a missing server
+# installation into a failure instead of a skipped suite.
+
+name: CI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install development requirements
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Lint the tests
+        run: ruff check tests
+
+      # The script predates the linter; only errors that would stop it from
+      # running (syntax errors, undefined names) are enforced there.
+      - name: Lint the script
+        run: ruff check --select E9,F63,F7,F82 scripts
+
+  test:
+    name: PostgreSQL ${{ matrix.postgres }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: [14, 15, 16, 17, 18]
+    env:
+      PG_MAJOR: ${{ matrix.postgres }}
+      PG_BINDIR: /usr/lib/postgresql/${{ matrix.postgres }}/bin
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install PostgreSQL ${{ matrix.postgres }} server binaries from PGDG
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          # Installing a server package would otherwise create and start a
+          # "main" cluster on the default port.
+          echo "create_main_cluster = false" \
+            | sudo tee -a /etc/postgresql-common/createcluster.conf
+          sudo apt-get install -y "postgresql-$PG_MAJOR"
+          # The runner image may ship its own cluster; make sure it is down.
+          sudo systemctl stop postgresql || true
+          sudo systemctl disable postgresql || true
+
+      - name: Check the server version and that port 5432 is unused
+        run: |
+          "$PG_BINDIR/postgres" --version | grep -F " $PG_MAJOR."
+          # pg_isready exits 2 only when nothing answers at all; a server
+          # that is starting up or rejecting connections is still a server.
+          for host in /var/run/postgresql 127.0.0.1 ::1; do
+            status=0
+            "$PG_BINDIR/pg_isready" -q -h "$host" -p 5432 || status=$?
+            if [ "$status" -ne 2 ]; then
+              echo "something answers on $host port 5432 (pg_isready: $status)" >&2
+              exit 1
+            fi
+          done
+
+      - name: Install development requirements
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Test
+        run: python -m pytest
