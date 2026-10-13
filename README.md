@@ -122,6 +122,21 @@ The database user supplied is expected to have permissions on all tables (e.g. a
 
 One table failing does not end the run.  The failure is printed, the run continues with the next table, and the summary at the end lists every table that failed.  The same goes for a database that cannot be connected to, whose tables cannot be listed, or in which another run holds the advisory lock: it is skipped and listed in the summary.  If the connection to a database is lost during a run, the rest of that database is skipped; `flexible_freeze` does not reconnect.
 
+Where the output goes:
+
+    progress and information    standard output; with -l, the log file instead
+    reports of a failure        standard error; with -l, the log file as well
+    --debug output              standard error
+    command-line errors         standard error
+
+A report of a failure is any line about something that by itself makes the exit status other than 0: a table that failed or that the server declined to vacuum, a database that was skipped or left unfinished, a `--table` name found in no database, a run that could not start, a run stopped by a signal, and the lines of the closing summary that list those.  Everything else is progress or information and stays off standard error: the closing `All tables vacuumed.`, everything `-v` adds, the note that a table named with `--table` is excluded, and a stop at the time limit, which is how a run is meant to end.
+
+The split is made for schedulers such as cron, which mail what a job writes to standard error.  A run with `-l` writes nothing to standard output, writes its failures to standard error, and keeps the whole run, failures included and in order, in the log file.  A run without `-l` writes a failure to standard error only; it is not repeated on standard output.  A run in which nothing went wrong writes nothing to standard error, with or without `-l`, unless `--debug` is given.
+
+The log file is appended to, never truncated.  Each run starts its part of it with a blank line, a rule and a `flexible freeze started` line with the time; that header is written only to a log file.  Lines are written out as they are produced, and the file is closed when the script ends, a stop on SIGINT or SIGTERM included; a process that is killed outright (SIGKILL) closes nothing, and loses nothing that was written.  If standard error is itself sent to the log file (`-l FILE 2>>FILE`), each failure is in it twice.  A failure report that cannot be written to standard error, because whatever was reading it has gone away, is still written to the log file; the run goes on, writes nothing more to standard error, and ends with the exit status it would have had.  If the file cannot be opened, the run does not start: the error is on standard error and the exit status is 1.  Errors in the command line are found before the log file is opened and are never in it.
+
+`-t` puts the time in front of each message (once, if the message runs to several lines), failure reports included; the copy of a report in the log file carries the same time as the one on standard error.  A password given with `-w` is shown as `********` wherever the arguments are printed (`--debug`, and the log file with `-v`).
+
 Exit status:
 
     0   every selected table was vacuumed, or the run stopped at the time limit

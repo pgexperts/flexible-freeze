@@ -169,18 +169,25 @@ def finish(proc, timeout=PROMPT):
 
 @BOTH_SIGNALS
 def test_signal_during_a_vacuum_cancels_it_and_ends_the_run(
-    make_db, start_ff, signum, status
+    make_db, start_ff, tmp_path, signum, status
 ):
     # t_held is created first, so it is the oldest table and is taken
     # first: everything else in the run would come after it.
+    #
+    # Run with a log file: it is where the report of the interrupt and the
+    # progress lines are found in one sequence, so that the place of the
+    # report in the run can be asserted on.  The report is on stderr too.
     one, two = make_db("one"), make_db("two")
     one.create_table("t_held")
     one.create_table("t_next")
     two.create_table("t_other")
     before_one, before_two = one.frozenxids(), two.frozenxids()
+    log = tmp_path / "ff.log"
 
     with vacuum_held_up(one, "t_held"):
-        proc = start_ff(*FREEZE_ALL, "-v", "-d", f"{one.name},{two.name}")
+        proc = start_ff(
+            *FREEZE_ALL, "-v", "-l", str(log), "-d", f"{one.name},{two.name}"
+        )
         wait_until_blocked(one)
         proc.send_signal(signum)
         code, stdout, stderr = finish(proc)
@@ -197,9 +204,22 @@ def test_signal_during_a_vacuum_cancels_it_and_ends_the_run(
     assert two.frozen_since(before_two) == set()
 
     name = signal.Signals(signum).name
-    lines = stdout.splitlines()
+    # The report of the interrupt is a failure report and so on stderr; the
+    # progress lines are in the log file, which has both
+    # (test_output_streams.py has the rule).
+    assert stdout == ""
+    lines = log.read_text().splitlines()
+    failures = stderr.splitlines()
     assert_lines_in_order(
-        stdout,
+        stderr,
+        [
+            f"Vacuuming interrupted by {name}",
+            (f"Work remains: VACUUM of public.t_held in database {one.name} "
+             "was interrupted."),
+        ],
+    )
+    assert_lines_in_order(
+        log.read_text(),
         [
             "processing table public.t_held",
             f"Vacuuming interrupted by {name}",
@@ -211,10 +231,12 @@ def test_signal_during_a_vacuum_cancels_it_and_ends_the_run(
     )
     # Interrupted is not failed, and the run is not described as complete,
     # as merely incomplete, or as out of time.
-    assert "VACUUMing public.t_held failed." not in lines
-    assert not [line for line in lines if line.startswith("Tables that failed")]
+    assert "VACUUMing public.t_held failed." not in lines + failures
+    assert not [
+        line for line in lines + failures if line.startswith("Tables that failed")
+    ]
     assert "All tables vacuumed." not in lines
-    assert "Not all tables were vacuumed." not in lines
+    assert "Not all tables were vacuumed." not in lines + failures
     assert "Vacuuming halted due to timeout" not in lines
     assert f"working on database {two.name}" not in lines
 
@@ -230,8 +252,8 @@ def test_interrupt_report_without_verbose(db, start_ff, signum, status):
         code, stdout, stderr = finish(proc)
 
     assert code == status
-    assert stderr == ""
-    assert stdout.splitlines() == [
+    assert stdout == ""
+    assert stderr.splitlines() == [
         f"Vacuuming interrupted by {signal.Signals(signum).name}",
         f"Work remains: VACUUM of public.t_held in database {db.name} was interrupted.",
     ]
@@ -258,7 +280,8 @@ def test_interrupt_outranks_the_enforced_time_limit(db, start_ff, script_clock):
     assert code == 130
     assert "Traceback" not in stderr
     assert db.frozen_since(before) == set()
-    assert stdout.splitlines() == [
+    assert stdout == ""
+    assert stderr.splitlines() == [
         "Vacuuming interrupted by SIGINT",
         f"Work remains: VACUUM of public.t_big in database {db.name} was interrupted.",
     ]
@@ -298,7 +321,7 @@ def test_interrupt_outranks_a_failure_and_the_failure_is_still_reported(
     assert two.frozen_since(before_two) == set()
     assert targets(two.script_vacuums()) == [("public", "t_held")]
     assert_lines_in_order(
-        stdout,
+        stderr,
         [
             "VACUUMing vault.t_fails failed.",
             "permission denied for schema vault",
@@ -306,11 +329,13 @@ def test_interrupt_outranks_a_failure_and_the_failure_is_still_reported(
             (f"Work remains: VACUUM of public.t_held in database {two.name} "
              "was interrupted."),
             f"Tables that failed: vault.t_fails in database {one.name}",
-            "after vacuuming 1 tables in 2 databases",
-            "Flexible Freeze run complete",
         ],
     )
-    assert "VACUUMing public.t_held failed." not in stdout
+    assert_lines_in_order(
+        stdout,
+        ["after vacuuming 1 tables in 2 databases", "Flexible Freeze run complete"],
+    )
+    assert "VACUUMing public.t_held failed." not in stdout + stderr
 
 
 def test_second_signal_gives_up_on_a_server_that_does_not_answer(db, start_ff):
@@ -338,8 +363,8 @@ def test_second_signal_gives_up_on_a_server_that_does_not_answer(db, start_ff):
         assert_no_backend_left(db.cluster)
 
     assert code == 130
-    assert stderr == ""
-    assert stdout.splitlines() == [
+    assert stdout == ""
+    assert stderr.splitlines() == [
         "Vacuuming interrupted by SIGINT",
         (f"Work remains: VACUUM of public.t_held in database {db.name} was "
          "interrupted; the server did not confirm that it was cancelled, and it "
@@ -390,7 +415,8 @@ def test_signal_while_idle_between_statements_stops_the_next_vacuum(
     assert code == 130
     assert "Traceback" not in stderr
     assert db.frozen_since(before) == set()
-    assert stdout.splitlines() == [
+    assert stdout == ""
+    assert stderr.splitlines() == [
         "Vacuuming interrupted by SIGINT",
         f"Work remains: VACUUM of public.t_held in database {db.name} was interrupted.",
     ]
@@ -460,10 +486,10 @@ def test_signal_during_the_table_listing_ends_the_run(
         assert_no_backend_left(one.cluster)
 
     assert code == status
-    assert stderr == ""
+    assert stdout == ""
     # Not "skipping database ... (couldn't list its tables ...)": the query
     # was cancelled on request, and the run does not go on to the next one.
-    assert stdout.splitlines() == [
+    assert stderr.splitlines() == [
         f"Vacuuming interrupted by {signal.Signals(signum).name}"
     ]
     assert one.script_vacuums() == []
@@ -485,10 +511,10 @@ def test_signal_while_connecting_to_a_database_ends_the_run(
     code, stdout, stderr = finish(proc)
 
     assert code == status
-    assert stderr == ""
+    assert stdout == ""
     # Not "skipping database ff_one (couldn't connect ...)", and no attempt
     # on the second database.
-    assert stdout.splitlines() == [
+    assert stderr.splitlines() == [
         f"Vacuuming interrupted by {signal.Signals(signum).name}"
     ]
 
@@ -505,8 +531,8 @@ def test_signal_while_connecting_for_the_database_list_ends_the_run(
     code, stdout, stderr = finish(proc)
 
     assert code == status
-    assert stderr == ""
-    assert stdout.splitlines() == [
+    assert stdout == ""
+    assert stderr.splitlines() == [
         f"Vacuuming interrupted by {signal.Signals(signum).name}"
     ]
 
@@ -545,8 +571,8 @@ def test_signal_during_the_database_listing_query_ends_the_run(
         holder.close()
 
     assert code == 143
-    assert stderr == ""
-    assert stdout.splitlines() == ["Vacuuming interrupted by SIGTERM"]
+    assert stdout == ""
+    assert stderr.splitlines() == ["Vacuuming interrupted by SIGTERM"]
     assert db.script_statements() == []
     assert db.frozen_since(before) == set()
 
@@ -567,7 +593,7 @@ def test_connect_timeout_still_applies(run_ff, silent_server):
 
     assert result.returncode == 1
     assert 2 <= elapsed < 20
-    lines = result.stdout.splitlines()
+    lines = result.stderr.splitlines()
     assert lines[0].startswith("skipping database ff_one (couldn't connect: ")
     assert "timeout expired" in lines[0]
     assert "Databases skipped or left unfinished: ff_one" in lines

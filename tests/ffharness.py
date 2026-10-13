@@ -367,11 +367,17 @@ def coverage_env():
     }
 
 
-def start_ff(host, port, *args, env=None, cwd=None):
+def start_ff(host, port, *args, env=None, cwd=None, merge_streams=False):
     """Start the script and return the Popen object.
 
     This is the only place in the test suite that launches the script.
     Output is captured as text on proc.stdout / proc.stderr.
+
+    The script writes its failure reports to stderr and everything else to
+    stdout, and two pipes cannot say in what order lines on different
+    streams were written.  `merge_streams` gives the script one pipe for
+    both, as `2>&1` does, for the tests of that order; proc.stderr is then
+    None and nothing says which stream a line came from.
     """
     return subprocess.Popen(
         ff_command(host, port, args),
@@ -379,14 +385,15 @@ def start_ff(host, port, *args, env=None, cwd=None):
         cwd=cwd,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.STDOUT if merge_streams else subprocess.PIPE,
         text=True,
     )
 
 
-def run_ff(host, port, *args, env=None, cwd=None, timeout=RUN_TIMEOUT):
+def run_ff(host, port, *args, env=None, cwd=None, timeout=RUN_TIMEOUT,
+           merge_streams=False):
     """Run the script to completion and return a CompletedProcess."""
-    proc = start_ff(host, port, *args, env=env, cwd=cwd)
+    proc = start_ff(host, port, *args, env=env, cwd=cwd, merge_streams=merge_streams)
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -502,6 +509,75 @@ class ScriptClock:
     def release(self):
         """Let a held script go on."""
         self._hold_file.unlink()
+
+
+# -- which files the script left open ------------------------------------------
+
+_OPEN_FILES_VARIABLE = "FF_TEST_OPEN_FILES_REPORT"
+_OPEN_FILES_SOURCE = f'''\
+# Written by the flexible_freeze test harness (ffharness.OpenFilesProbe).
+# As the last thing the process does, lists the text files it still has open.
+import atexit
+import gc
+import io
+import os
+
+
+def _report_open_files():
+    names = sorted(
+        str(stream.name) for stream in gc.get_objects()
+        if isinstance(stream, io.TextIOWrapper) and not stream.closed
+    )
+    with open(os.environ["{_OPEN_FILES_VARIABLE}"], "w") as report:
+        report.write("\\n".join(names))
+
+
+atexit.register(_report_open_files)
+'''
+
+
+class OpenFilesProbe:
+    """Tells a test which text files the script had not closed when it ended.
+
+    Whether a process closed a file before exiting cannot be seen from
+    outside it: the operating system closes whatever is left, and the file's
+    content is the same either way, because the script flushes every line.
+    So the question is asked inside the process, by a shim like ScriptClock's
+    (a sitecustomize module found through PYTHONPATH; the script stays
+    unmodified).  The shim registers an exit handler before the script's
+    first line has run.  Exit handlers run in the reverse of the order they
+    were registered in, so the shim's is the last, after anything the script
+    does on its way out, on whichever of its exits it leaves by.
+
+    A script that is killed runs no exit handler, and files_left_open() then
+    fails for want of a report.  Not to be combined with ScriptClock: only
+    one sitecustomize module is loaded.
+    """
+
+    def __init__(self, directory):
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        (self.directory / _CLOCK_MODULE).write_text(_OPEN_FILES_SOURCE)
+        self._report = self.directory / "open-files"
+
+    @property
+    def env(self):
+        """Environment for start_ff / run_ff that puts the shim in place."""
+        inherited = os.environ.get("PYTHONPATH")
+        path = [str(self.directory)] + ([inherited] if inherited else [])
+        return {
+            "PYTHONPATH": os.pathsep.join(path),
+            _OPEN_FILES_VARIABLE: str(self._report),
+        }
+
+    def files_left_open(self):
+        """Names of the text files still open at exit, as given to open().
+
+        The standard streams are among them, under names like <stdout>.
+        """
+        if not self._report.exists():
+            raise AssertionError("the script ended without running its exit handlers")
+        return self._report.read_text().splitlines()
 
 
 # -- a server that never answers ---------------------------------------------
@@ -908,10 +984,15 @@ class Cluster:
         """
         return start_ff(self.sockdir, port or self.port, *args, env=env, cwd=cwd)
 
-    def run_ff(self, *args, env=None, cwd=None, timeout=RUN_TIMEOUT, port=None):
-        """Run the script against this cluster; returns a CompletedProcess."""
+    def run_ff(self, *args, env=None, cwd=None, timeout=RUN_TIMEOUT, port=None,
+               merge_streams=False):
+        """Run the script against this cluster; returns a CompletedProcess.
+
+        `merge_streams`: see the module-level start_ff.
+        """
         return run_ff(
-            self.sockdir, port or self.port, *args, env=env, cwd=cwd, timeout=timeout
+            self.sockdir, port or self.port, *args, env=env, cwd=cwd, timeout=timeout,
+            merge_streams=merge_streams,
         )
 
     def silent_server(self):

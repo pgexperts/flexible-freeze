@@ -12,6 +12,10 @@
 # Also here, because they decide the same summary: the pause between vacuums
 # and the report of exclusions that matched nothing.
 #
+# The lines that report a failure are on stderr and the rest of the output is
+# on stdout, so each is asserted on where it belongs; the rule for which is
+# which, and the order of the two taken together, is in test_output_streams.py.
+#
 # How the failures are produced:
 #
 # * A VACUUM fails when it names a table in a schema the connecting role may
@@ -160,19 +164,26 @@ def test_failed_table_is_reported_once_and_the_run_continues(
     assert two.frozen_since(before_two) == {("public", "t_other")}
 
     lines = result.stdout.splitlines()
+    failures = result.stderr.splitlines()
     # Once, and with the table's whole name.
-    assert lines.count(f"VACUUMing {CLOSED_SCHEMA}.t_denied failed.") == 1
-    assert not [line for line in lines if line.startswith("VACUUMING ")]
-    assert result.stdout.count(SCHEMA_DENIED) == 1
+    assert failures.count(f"VACUUMing {CLOSED_SCHEMA}.t_denied failed.") == 1
+    assert not [line for line in lines + failures if line.startswith("VACUUMING ")]
+    assert result.stderr.count(SCHEMA_DENIED) == 1
+    assert SCHEMA_DENIED not in result.stdout
     assert "All tables vacuumed." not in lines
+    assert_lines_in_order(
+        result.stderr,
+        [
+            f"VACUUMing {CLOSED_SCHEMA}.t_denied failed.",
+            "Not all tables were vacuumed.",
+            f"Tables that failed: {CLOSED_SCHEMA}.t_denied in database {one.name}",
+        ],
+    )
     assert_lines_in_order(
         result.stdout,
         [
-            f"VACUUMing {CLOSED_SCHEMA}.t_denied failed.",
             "processing table public.t_next",
             f"working on database {two.name}",
-            "Not all tables were vacuumed.",
-            f"Tables that failed: {CLOSED_SCHEMA}.t_denied in database {one.name}",
             # The failed table is not counted; the two that worked are.
             "2 tables in 2 databases",
             "Flexible Freeze run complete",
@@ -187,12 +198,13 @@ def test_failure_report_without_verbose(db, make_role, run_ff):
     result = run_ff(*FREEZE_ALL, "-U", role, "-d", db.name)
 
     assert result.returncode == 1
-    assert result.stdout.splitlines() == [
+    assert result.stderr.splitlines() == [
         f"VACUUMing {CLOSED_SCHEMA}.t_denied failed.",
         SCHEMA_DENIED,
         "Not all tables were vacuumed.",
         f"Tables that failed: {CLOSED_SCHEMA}.t_denied in database {db.name}",
     ]
+    assert result.stdout == ""
 
 
 def test_cancelled_vacuum_inside_the_window_is_a_failure(db, start_ff):
@@ -212,21 +224,29 @@ def test_cancelled_vacuum_inside_the_window_is_a_failure(db, start_ff):
     assert status == 1
     assert "Traceback" not in stderr
     assert db.frozen_since(before) == {("public", "t_next")}
-    lines = stdout.splitlines()
-    assert lines.count("VACUUMing public.t_held failed.") == 1
-    assert "Vacuuming halted due to timeout" not in lines
-    assert f"Tables that failed: public.t_held in database {db.name}" in lines
+    failures = stderr.splitlines()
+    assert failures.count("VACUUMing public.t_held failed.") == 1
+    assert "Vacuuming halted due to timeout" not in stdout.splitlines()
+    assert f"Tables that failed: public.t_held in database {db.name}" in failures
 
 
-def test_lost_connection_ends_that_database_and_the_run_continues(make_db, start_ff):
+def test_lost_connection_ends_that_database_and_the_run_continues(
+    make_db, start_ff, tmp_path
+):
+    # Run with a log file: it is where the failure reports and the progress
+    # lines are found in one sequence, so that the place of each report in
+    # the run can be asserted on.  The reports are on stderr as well.
     one, two = make_db("one"), make_db("two")
     one.create_table("t_held")
     one.create_table("t_next")
     two.create_table("t_other")
     before_one, before_two = one.frozenxids(), two.frozenxids()
+    logfile = tmp_path / "ff.log"
 
     with vacuum_held_up(one, "t_held"):
-        proc = start_ff(*FREEZE_ALL, "-v", "-d", f"{one.name},{two.name}")
+        proc = start_ff(
+            *FREEZE_ALL, "-v", "-l", str(logfile), "-d", f"{one.name},{two.name}"
+        )
         pid = waiting_backend(one)
         one.cluster.execute("postgres", "SELECT pg_terminate_backend(%s)", (pid,))
         status, stdout, stderr = finish(proc)
@@ -240,7 +260,18 @@ def test_lost_connection_ends_that_database_and_the_run_continues(make_db, start
     assert len({record.pid for record in one.cluster.statements(dbname=one.name)}) == 1
     assert two.frozen_since(before_two) == {("public", "t_other")}
     assert_lines_in_order(
-        stdout,
+        stderr,
+        [
+            "VACUUMing public.t_held failed.",
+            f"skipping the rest of database {one.name} (connection lost)",
+            "Not all tables were vacuumed.",
+            f"Tables that failed: public.t_held in database {one.name}",
+            f"Databases skipped or left unfinished: {one.name}",
+        ],
+    )
+    assert stdout == ""
+    assert_lines_in_order(
+        logfile.read_text(),
         [
             "VACUUMing public.t_held failed.",
             f"skipping the rest of database {one.name} (connection lost)",
@@ -284,23 +315,24 @@ def test_table_the_role_may_not_vacuum_is_reported_and_not_counted(
     assert db.frozen_since(before) == {("public", "t_own")}
 
     lines = result.stdout.splitlines()
+    failures = result.stderr.splitlines()
     assert "All tables vacuumed." not in lines
-    report = lines.index(
+    report = failures.index(
         "VACUUMing public.t_other drew a message from the server; "
         "not counting it as vacuumed."
     )
     # The server's own text follows, as received.
-    assert lines[report + 1].startswith("WARNING:")
-    assert '"t_other"' in lines[report + 1]
+    assert failures[report + 1].startswith("WARNING:")
+    assert '"t_other"' in failures[report + 1]
     assert_lines_in_order(
-        result.stdout,
+        result.stderr,
         [
             "Not all tables were vacuumed.",
             f"Tables not counted as vacuumed: public.t_other in database {db.name}",
-            "1 tables in 1 databases",
         ],
     )
-    assert "VACUUMing public.t_own" not in result.stdout
+    assert "1 tables in 1 databases" in lines
+    assert "VACUUMing public.t_own" not in result.stdout + result.stderr
 
 
 def test_messages_of_one_table_are_not_held_against_the_next(db, make_role, run_ff):
@@ -314,7 +346,7 @@ def test_messages_of_one_table_are_not_held_against_the_next(db, make_role, run_
 
     assert result.returncode == 1
     assert targets(db.script_vacuums()) == [("public", "t_other"), ("public", "t_own")]
-    lines = result.stdout.splitlines()
+    lines = result.stderr.splitlines()
     assert lines[-1] == (
         f"Tables not counted as vacuumed: public.t_other in database {db.name}"
     )
@@ -336,14 +368,19 @@ def test_unreachable_database_is_reported_and_fails_the_run(db, run_ff, position
     assert result.returncode == 1
     assert "Traceback" not in result.stderr
     assert db.frozen_since(before) == {("public", "t1")}
-    assert f"skipping database {NO_SUCH_DB} (couldn't connect: " in result.stdout
+    assert f"skipping database {NO_SUCH_DB} (couldn't connect: " in result.stderr
     lines = result.stdout.splitlines()
     assert "All tables vacuumed." not in lines
     assert_lines_in_order(
-        result.stdout,
+        result.stderr,
         [
             "Not all tables were vacuumed.",
             f"Databases skipped or left unfinished: {NO_SUCH_DB}",
+        ],
+    )
+    assert_lines_in_order(
+        result.stdout,
+        [
             # Only the database that was worked on is counted.
             "1 tables in 1 databases",
             "Flexible Freeze run complete",
@@ -373,15 +410,16 @@ def test_table_listing_failure_skips_that_database_only(make_db, run_ff):
     assert (
         f"skipping database {one.name} (couldn't list its tables: "
         "canceling statement due to lock timeout"
-    ) in result.stdout
+    ) in result.stderr
     assert_lines_in_order(
-        result.stdout,
+        result.stderr,
         [
-            f"working on database {two.name}",
             "Not all tables were vacuumed.",
             f"Databases skipped or left unfinished: {one.name}",
-            "1 tables in 1 databases",
         ],
+    )
+    assert_lines_in_order(
+        result.stdout, [f"working on database {two.name}", "1 tables in 1 databases"]
     )
 
 
@@ -397,8 +435,8 @@ def test_rejected_session_setting_skips_the_database(db, run_ff):
     assert result.returncode == 1
     assert "Traceback" not in result.stderr
     assert db.frozen_since(before) == set()
-    assert f"skipping database {db.name} (couldn't list its tables: " in result.stdout
-    assert result.stdout.splitlines()[-2:] == [
+    assert f"skipping database {db.name} (couldn't list its tables: " in result.stderr
+    assert result.stderr.splitlines()[-2:] == [
         "Not all tables were vacuumed.",
         f"Databases skipped or left unfinished: {db.name}",
     ]
@@ -415,7 +453,8 @@ def test_table_option_that_matches_in_no_database_fails_the_run(make_db, run_ff)
 
     assert result.returncode == 1
     assert one.script_vacuums() == two.script_vacuums() == []
-    lines = result.stdout.splitlines()
+    assert result.stdout == ""
+    lines = result.stderr.splitlines()
     for line in lines:
         assert TIMESTAMPED.fullmatch(line), line
     messages = [line.split(": ", 1)[1] for line in lines]
@@ -478,7 +517,7 @@ def test_table_option_missing_and_a_skipped_database_reports_both(db, run_ff):
     )
 
     assert result.returncode == 1
-    assert result.stdout.splitlines()[-3:] == [
+    assert result.stderr.splitlines()[-3:] == [
         "Not all tables were vacuumed.",
         f"Databases skipped or left unfinished: {NO_SUCH_DB}",
         f"Databases where --table orders matched no table: {db.name}",
@@ -557,10 +596,10 @@ def test_time_limited_stop_with_verbose_counts_only_finished_tables(
         pid = waiting_backend(db)
         script_clock.advance(3600)
         db.cluster.execute("postgres", "SELECT pg_cancel_backend(%s)", (pid,))
-        status, stdout, _ = finish(proc)
+        status, stdout, stderr = finish(proc)
 
     assert status == 0
-    assert "VACUUMing public.t_big failed." not in stdout
+    assert "VACUUMing public.t_big failed." not in stdout + stderr
     assert_lines_in_order(
         stdout,
         [

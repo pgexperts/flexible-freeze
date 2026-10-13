@@ -145,7 +145,7 @@ def test_no_database_to_vacuum_aborts(cluster, run_ff):
         cluster.execute("postgres", "ALTER DATABASE postgres IS_TEMPLATE false")
 
     assert result.returncode == 1
-    assert "no databases to vacuum, aborting" in result.stdout + result.stderr
+    assert "no databases to vacuum, aborting" in result.stderr
     assert "All tables vacuumed." not in result.stdout
 
 
@@ -178,7 +178,7 @@ def test_default_database_list_goes_by_the_catalog_flags(
 
         assert result.returncode == 0, result.stdout + result.stderr
         assert databases_processed(result) == {"postgres", plain.name}
-        assert "skipping database" not in result.stdout
+        assert "skipping database" not in result.stdout + result.stderr
         assert cluster.statements(dbname=flagged.name, since=mark) == []
         assert plain.frozen_since(before) == {T}
     finally:

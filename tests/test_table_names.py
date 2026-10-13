@@ -398,10 +398,14 @@ def test_table_option_says_when_the_table_does_not_exist(db, run_ff):
     result = run_ff(*FREEZE_ALL, "-v", "--table", "t_absent", "-d", db.name)
 
     assert result.returncode == 1, result.stdout + result.stderr
+    # The line for the database is information and on stdout; that the name
+    # was found nowhere is a failure, and its two lines are on stderr.
+    assert (
+        f"specified single table t_absent does not exist in database {db.name}"
+    ) in result.stdout.splitlines()
     assert_lines_in_order(
-        result.stdout,
+        result.stderr,
         [
-            f"specified single table t_absent does not exist in database {db.name}",
             "Not all tables were vacuumed.",
             f"Databases where --table t_absent matched no table: {db.name}",
         ],
@@ -412,7 +416,8 @@ def test_table_option_says_when_the_table_does_not_exist(db, run_ff):
     result = run_ff(*FREEZE_ALL, "--table", "t_absent", "-d", db.name)
 
     assert result.returncode == 1, result.stdout + result.stderr
-    assert result.stdout.splitlines() == [
+    assert result.stdout == ""
+    assert result.stderr.splitlines() == [
         "Not all tables were vacuumed.",
         f"Databases where --table t_absent matched no table: {db.name}",
     ]

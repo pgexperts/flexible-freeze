@@ -231,11 +231,12 @@ def db(make_db):
 
 @pytest.fixture
 def run_ff(cluster):
-    """run_ff(*args, env=None, cwd=None, timeout=60, port=None) ->
-    CompletedProcess.
+    """run_ff(*args, env=None, cwd=None, timeout=60, port=None,
+    merge_streams=False) -> CompletedProcess.
 
     Runs the script against the throwaway cluster with text stdout/stderr.
-    `port` is only for a silent_server.
+    `port` is only for a silent_server.  `merge_streams=True` captures both
+    streams on stdout, in the order they were written (stderr is then None).
     """
     return cluster.run_ff
 
@@ -246,6 +247,14 @@ def script_clock(tmp_path):
     and call `script_clock.advance(seconds)` to put its deadline in the past
     without waiting for it."""
     return ffharness.ScriptClock(tmp_path / "clock")
+
+
+@pytest.fixture
+def open_files_probe(tmp_path):
+    """A ffharness.OpenFilesProbe.  Start the script with
+    `env=open_files_probe.env`; once it has exited, `files_left_open()` names
+    the text files it had not closed."""
+    return ffharness.OpenFilesProbe(tmp_path / "open-files-probe")
 
 
 @pytest.fixture
