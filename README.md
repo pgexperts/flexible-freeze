@@ -58,7 +58,8 @@ Requires psycopg2
       -p DBPORT, --port DBPORT
                             database port
       -w DBPASS, --password DBPASS
-                            database password
+                            database password. Visible to other local users in the process list for the whole run; prefer PGPASSWORD,
+                            a .pgpass file or PGSERVICE
       -st TABLE, --table TABLE
                             only process specified table
 
@@ -74,6 +75,8 @@ Normally flexible_freeze.py does VACUUM FREEZE ANALYZE, starting with the tables
 You can specify `--no-analyze` to skip the ANALYZE step. 
 
 The database user supplied is expected to have permissions on all tables (e.g. a superuser).  If they do not, `flexible_freeze` will error out.
+
+libpq's `PGPASSWORD`, `~/.pgpass` and `PGSERVICE` are honoured, so `-w` is not needed to authenticate.  A password given with `-w` is visible to other local users in the process list for the whole run; prefer one of those instead.
 
 Currently, `flexible_freeze` will not respond to a CTRL-C until the current vacuum is done.  If you need to halt `flexible_freeze` before then, we recommend using pg_cancel_backend() from the Postgres command line.  This will cause flexible_freeze to error out and exit.
 
