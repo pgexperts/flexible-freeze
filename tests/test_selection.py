@@ -102,8 +102,8 @@ def test_exclude_table_by_bare_name(db, run_ff):
 
     assert result.returncode == 0
     lines = result.stdout.splitlines()
-    assert "skipping table t_skip per --exclude-table argument" in lines
-    assert "skipping table t_skip_too per --exclude-table argument" in lines
+    assert "skipping table public.t_skip per --exclude-table argument" in lines
+    assert "skipping table public.t_skip_too per --exclude-table argument" in lines
     assert db.frozen_since(before) == {T_KEEP}
     assert targets(db.script_vacuums()) == [T_KEEP]
 
@@ -137,7 +137,7 @@ def test_exclude_table_in_database_applies_to_that_database_only(make_db, run_ff
 
     assert result.returncode == 0
     assert (
-        f"skipping table t in database {one.name} "
+        f"skipping table public.t in database {one.name} "
         "per --exclude-table-in-database argument"
     ) in result.stderr
     assert one.frozen_since(before_one) == {T_KEEP}
