@@ -1,5 +1,6 @@
 # CI: lint, and run the test suite against each supported PostgreSQL major
-# version.
+# version.  Lint and the tests decide the result; the script's line coverage
+# is printed for information and cannot fail a job.
 #
 # Manual trigger only: the pipeline is run at the end of a block of work,
 # not on every push.  (GitHub offers the "Run workflow" button, and
@@ -98,3 +99,25 @@ jobs:
 
       - name: Test
         run: python -m pytest
+
+      # Report only.  The suite is run a second time with coverage.py started
+      # inside each script subprocess (see .coveragerc), so the step above,
+      # which decides the job, never runs instrumented.  continue-on-error
+      # keeps a failure here, and the figure itself, from failing the job;
+      # there is deliberately no threshold.  The step has a timeout of its
+      # own because running into the job's timeout would fail the job.  A
+      # test that fails only when instrumented is flagged and the figure is
+      # still printed.
+      - name: Line coverage of the script (report only)
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          COVERAGE_PROCESS_START="$PWD/.coveragerc" python -m pytest -q \
+            || echo "::warning::the test suite failed when run with coverage"
+          python -m coverage combine
+          {
+            echo "### Line coverage, PostgreSQL $PG_MAJOR"
+            echo '```'
+            python -m coverage report
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"

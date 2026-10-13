@@ -19,6 +19,9 @@
 # * The cluster listens on a unix socket only, in a private temporary
 #   directory, so its port number never competes with anything else on the
 #   machine and no other server can be reached through that directory.
+#
+# * Because the script only ever runs in a child process, its line coverage
+#   is recorded by each child for itself, on request: see coverage_env().
 
 from __future__ import annotations
 
@@ -27,6 +30,7 @@ import os
 import pwd
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -63,6 +67,23 @@ HARNESS_APP = "ff_test_harness"
 # to delete any directory without it.
 MARKER = ".ff-test-cluster"
 
+# Name prefix of every base directory the harness creates, which is where
+# sweep_stale_clusters() looks for clusters a killed session left running.
+BASE_PREFIX = "ffpg"
+
+# A running cluster whose marker is older than this is taken to be abandoned.
+# The whole suite runs in well under a minute, so an hour leaves any session
+# that is merely slow, or running beside this one, alone.  The cost is that a
+# session kept open for longer (stopped in a debugger, say) looks abandoned
+# to the next session that starts.
+STALE_AFTER = 60 * 60
+
+# The one role that pg_hba.conf asks a password of; every other connection is
+# trusted.  Tests that need the server to check a -w value create this role
+# with the password under test and run the script as it.  The name goes into
+# pg_hba.conf unquoted.
+SCRAM_ROLE = "ff_scram_role"
+
 # Freshly created tables are a handful of transactions old, far below the
 # script's default --freezeage of ten million.  Passing this makes every
 # table whose relfrozenxid is behind the next XID eligible, which is every
@@ -87,14 +108,27 @@ _LOG_STATEMENT = re.compile(
 # clustered behind the script's value-less short flags ("-vH x", "-tp1").
 _TARGET_OPTION = re.compile(r"^(-[vt]*[Hp]|--ho|--po)")
 
-# The script pastes -d/-U/-w values into a libpq connection string without
-# quoting, so a value such as "x host=elsewhere" would add a keyword that
-# overrides the harness's host.  No argument may carry one of these.
+# Defence in depth.  The script hands its -d/-U/-w values to the driver as
+# separate connection parameters, so a value such as "x host=elsewhere" is
+# inert today.  Should the script ever go back to formatting a connection
+# string, such a value would add a keyword that overrides the harness's host,
+# and nothing else here would notice.  No argument may carry one of these;
+# tests that need such text in a database name create the database through
+# the fixtures instead of passing the name as an argument.
 _DSN_REDIRECT = re.compile(r"\b(host|hostaddr|port|service|servicefile)\s*=", re.IGNORECASE)
 
-# Directory names that can be pasted into that connection string, and into
-# postgresql.conf, without quoting.
+# Directory names that can be written into postgresql.conf without escaping
+# and that libpq can only read as one socket directory (a comma would make
+# the -H value a list of hosts).
 _PLAIN_PATH = re.compile(r"[A-Za-z0-9_./+-]+")
+
+# What psycopg2 itself sends when a session starts, before the caller's first
+# statement: it switches DateStyle to ISO on a server (or database, or role)
+# configured with any other style.  The statement carries the session's
+# application_name like any other, so only its text tells it apart.  The list
+# is deliberately closed: an unrecognised statement stays in the log and
+# fails a test rather than being dropped as "probably the driver's".
+_DRIVER_SETUP = re.compile(r"SET datestyle TO 'ISO'", re.IGNORECASE)
 
 _IDENT = r'(?:"(?:[^"]|"")*"|[A-Za-z_][A-Za-z0-9_$]*)'
 _VACUUM = re.compile(
@@ -152,10 +186,13 @@ def _unquote_identifier(text):
 def parse_vacuum(statement):
     """Parse one single-table VACUUM statement into a VacuumStatement.
 
-    An unqualified table name is reported in schema "public": sessions in
-    the test cluster run with the default search_path.  Note that this reads
-    the statement the way the server does, so a qualified name wrongly sent
-    inside one pair of quotes parses as a single table name containing a dot.
+    The script's own statements always name the schema: its sessions run
+    with an empty search_path, so the regclass text it sends verbatim as the
+    target is schema-qualified and already quoted by the server.  An
+    unqualified name, as in a statement written by hand, is reported in
+    schema "public".  Identifiers are read the way the server reads them, so
+    a qualified name inside a single pair of quotes is one table name
+    containing a dot, not a schema and a table.
     """
     match = _VACUUM.match(statement.strip())
     if not match:
@@ -264,9 +301,11 @@ def ff_command(host, port, args):
     argparse keeps the last occurrence of an option, so the harness's values
     win over anything earlier.  Arguments that name a host or port are also
     rejected outright, so a test that tries to redirect the script fails
-    loudly instead of being silently overridden; so are values that would
-    smuggle a host or port keyword into the script's connection string,
-    which the trailing -H cannot override.
+    loudly instead of being silently overridden.  So are values that read as
+    a host or port connection keyword: the script passes each value to the
+    driver as a parameter of its own, which makes them harmless, but the
+    trailing -H could not override one if the script ever built a connection
+    string out of them (see _DSN_REDIRECT).
     """
     host, port = check_target(host, port)
     for arg in args:
@@ -283,6 +322,43 @@ def ff_command(host, port, args):
     ]
 
 
+def coverage_env():
+    """Environment that lets a script run record its own line coverage.
+
+    Coverage measured in the test process says nothing about the script,
+    which runs in a child.  coverage.py covers that case itself: from
+    release 7.13 it installs a .pth file that starts measurement in every
+    Python process that finds COVERAGE_PROCESS_START set, and with
+    parallel = true in the configuration that variable names, each process
+    writes a data file of its own, to be merged afterwards by
+    `coverage combine`.  So the script is still launched unmodified and by
+    the same argv; no hook of the harness's own is involved.
+
+    What is left to do here is to make the two paths independent of the
+    child's working directory, which a test may choose: a relative
+    configuration path would not be found from there, and the data files
+    would be scattered over temporary directories.  The data file defaults
+    to the repository root, where `coverage combine` looks for it.
+
+    Returns {} unless the caller set COVERAGE_PROCESS_START, so an ordinary
+    run starts the script exactly as before, whether or not coverage is
+    installed.  A value that does not name a file is an error here, once:
+    otherwise every script run would carry coverage's complaint on its
+    stderr and the tests would fail one by one on that.
+    """
+    config = os.environ.get("COVERAGE_PROCESS_START")
+    if not config:
+        return {}
+    if not os.path.isfile(config):
+        raise HarnessError(f"COVERAGE_PROCESS_START={config} is not a file")
+    return {
+        "COVERAGE_PROCESS_START": os.path.abspath(config),
+        "COVERAGE_FILE": os.path.abspath(
+            os.environ.get("COVERAGE_FILE") or REPO_ROOT / ".coverage"
+        ),
+    }
+
+
 def start_ff(host, port, *args, env=None, cwd=None):
     """Start the script and return the Popen object.
 
@@ -291,7 +367,7 @@ def start_ff(host, port, *args, env=None, cwd=None):
     """
     return subprocess.Popen(
         ff_command(host, port, args),
-        env=child_env(env),
+        env=child_env({**coverage_env(), **(env or {})}),
         cwd=cwd,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -362,16 +438,21 @@ def find_pg_bindir():
     return None
 
 
+def _base_parents():
+    """The directories a cluster's base directory may be created in."""
+    return (tempfile.gettempdir(), "/tmp")
+
+
 def _make_base_dir():
     """Create the cluster's private base directory and mark it as ours.
 
     The default temporary directory is tried first, then /tmp: the path has
-    to be short enough to hold the server's socket, and plain enough to go
-    unquoted into the script's connection string.
+    to be short enough to hold the server's socket, and plain enough for
+    check_target() to accept it as the script's -H value (see _PLAIN_PATH).
     """
-    for parent in (None, "/tmp"):
+    for parent in _base_parents():
         try:
-            base = Path(tempfile.mkdtemp(prefix="ffpg", dir=parent))
+            base = Path(tempfile.mkdtemp(prefix=BASE_PREFIX, dir=parent))
         except OSError:
             continue
         socket_path = str(base / f".s.PGSQL.{TEST_PORT}")
@@ -487,10 +568,22 @@ class Cluster:
             # the script sent (see Cluster.statements).
             "log_statement": "all",
             "log_line_prefix": _LOG_PREFIX,
+            # The pg_hba.conf rule below can only verify a password stored
+            # as a SCRAM verifier.
+            "password_encryption": "scram-sha-256",
         }
         with open(str(self.datadir / "postgresql.conf"), "a") as conf:
             conf.write("\n# test harness settings\n")
             conf.writelines(f"{name} = '{value}'\n" for name, value in settings.items())
+
+        # One role must present a password, so that a test can tell whether
+        # the script's -w value reached the server intact; initdb's trust
+        # rules stay in force for everyone else, the harness included.  The
+        # first matching rule wins, so this one has to come before them.
+        hba = self.datadir / "pg_hba.conf"
+        hba.write_text(
+            f"local all {SCRAM_ROLE} scram-sha-256\n" + hba.read_text()
+        )
 
     def _pg_ctl(self, *args, check=True):
         # Output is discarded rather than piped: a postmaster that inherited
@@ -575,13 +668,17 @@ class Cluster:
         )
         return [row[0] for row in rows]
 
-    def create_role(self, name, *, login=True, superuser=False):
+    def create_role(self, name, *, login=True, superuser=False, password=None):
+        """Create a role.  A password is only ever asked of SCRAM_ROLE (see
+        _configure); for any other role it is stored and never checked."""
         self.execute(
             "postgres",
-            sql.SQL("CREATE ROLE {} {} {}").format(
+            sql.SQL("CREATE ROLE {} {} {} PASSWORD {}").format(
                 sql.Identifier(name),
                 sql.SQL("LOGIN" if login else "NOLOGIN"),
                 sql.SQL("SUPERUSER" if superuser else "NOSUPERUSER"),
+                # Literal(None) renders as NULL, which is "no password".
+                sql.Literal(password),
             ),
         )
         return name
@@ -597,7 +694,9 @@ class Cluster:
         """Current size of the server log, for statements(since=...)."""
         return self.logfile.stat().st_size
 
-    def statements(self, *, dbname=None, app=SCRIPT_APP, user=None, since=0):
+    def statements(
+        self, *, dbname=None, app=SCRIPT_APP, user=None, since=0, driver_setup=False
+    ):
         """Statements the server logged, in order, filtered by session.
 
         By default only the script's (application_name flexible_freeze).
@@ -605,6 +704,12 @@ class Cluster:
         everything a finished script run sent is already here: unlike the
         statistics views, this needs no waiting.  `since` is a log_offset()
         taken earlier, for databases whose name is not unique to one test.
+
+        Statements the driver sends on its own account when a session starts
+        (see _DRIVER_SETUP) are left out unless `driver_setup` is true.
+        Whether there are any depends on how the server is configured, not
+        on the script, so with them left in "the first statement of the
+        session" would not reliably be the script's first.
         """
         with open(str(self.logfile), "rb") as log:
             log.seek(since)
@@ -631,6 +736,7 @@ class Cluster:
             if (dbname is None or r["db"] == dbname)
             and (app is None or r["app"] == app)
             and (user is None or r["user"] == user)
+            and (driver_setup or not _DRIVER_SETUP.fullmatch(r["sql"]))
         ]
 
     # -- the script ---------------------------------------------------------
@@ -644,6 +750,144 @@ class Cluster:
         return run_ff(
             self.sockdir, self.port, *args, env=env, cwd=cwd, timeout=timeout
         )
+
+    # -- recognising an abandoned cluster ------------------------------------
+
+    def _postmaster_pid(self):
+        """The pid recorded in postmaster.pid if that process exists, else None.
+
+        A process existing is not proof that it is this cluster's postmaster:
+        the file outlives a reboot or a crash, and the number may since have
+        been given to something unrelated.  _is_serving() settles that.
+        """
+        try:
+            pid = int((self.datadir / "postmaster.pid").read_text().split()[0])
+        except (OSError, ValueError, IndexError):
+            return None
+        # Zero and negative numbers would address process groups, and a
+        # negative one is how a standalone backend marks the file.
+        if pid <= 0:
+            return None
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, OverflowError):
+            # No such process, or a number too large to be a process ID.
+            return None
+        except PermissionError:
+            # Exists, but belongs to another user: not ours to stop.
+            return None
+        return pid
+
+    def _is_serving(self):
+        """Whether a server answers on this directory's socket and reports
+        this data directory.
+
+        That identifies the cluster's own postmaster only where nobody else
+        can put a socket into the directory, which is what the sweep's
+        ownership check on the directory establishes before it gets here.
+        """
+        try:
+            reported = self.execute("postgres", "SHOW data_directory")[0][0]
+        except psycopg2.Error:
+            return False
+        return os.path.realpath(reported) == os.path.realpath(str(self.datadir))
+
+    def _is_abandoned(self, max_age):
+        """Whether this is a cluster left running by a session long gone.
+
+        The data directory and the pid file must be the current user's own
+        entries before the pid is read: that number is what `pg_ctl stop`
+        will signal.  See sweep_stale_clusters() for the whole list.
+        """
+        marker = _own_entry(self.basedir / MARKER, stat.S_ISREG)
+        return (
+            marker is not None
+            and time.time() - marker.st_mtime > max_age
+            and _own_entry(self.datadir, stat.S_ISDIR) is not None
+            and _own_entry(self.datadir / "postmaster.pid", stat.S_ISREG) is not None
+            and self._postmaster_pid() is not None
+            and self._is_serving()
+        )
+
+
+def _own_entry(path, is_kind):
+    """lstat() of `path` if the entry is of the wanted kind and belongs to
+    the effective user, else None.
+
+    lstat, so that a symbolic link is judged as a link (and fails the kind
+    test) instead of passing on the strength of whatever it points to.
+    """
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    if not is_kind(info.st_mode) or info.st_uid != os.geteuid():
+        return None
+    return info
+
+
+def sweep_stale_clusters(bindir, *, parents=None, max_age=STALE_AFTER):
+    """Stop and remove clusters that an earlier, killed session left running.
+
+    A SIGKILL of pytest runs neither the fixture teardown nor the atexit
+    backstop, and pg_ctl detached the postmaster, so the server keeps
+    running and its directory stays.  Called once at session start, before
+    this session's own cluster exists.  Returns the directories removed.
+
+    A directory is touched only if all of these hold:
+
+    * it is named BASE_PREFIX* directly under one of the directories
+      _make_base_dir() uses, and is itself a real directory (not a symbolic
+      link) that belongs to the current user and that neither group nor
+      others can write to.  One of those parents is /tmp, where any local
+      user can create a directory of that name and fill it as they like.
+      The marker cannot settle whose directory it is: another user can
+      hard-link one of the current user's files under the marker's name,
+      and that file is then, truthfully, the current user's.  A directory
+      cannot be hard-linked or given away, so one that is the current
+      user's and closed to everyone else can only hold what that user put
+      there, and stays that way while the sweep works on it;
+    * it carries the harness's marker file, a regular file of the current
+      user's.  The candidate is wrapped in a Cluster, whose constructor and
+      stop() both refuse a directory without the marker, so the sweep cannot
+      stop or delete anything those guards would not;
+    * the marker is older than `max_age` (see STALE_AFTER), which is what
+      keeps the sweep away from sessions running at the same time;
+    * the data directory and postmaster.pid are likewise the current user's
+      own directory and regular file, checked before the pid is read;
+    * the pid in postmaster.pid is alive, and a server answering on the
+      directory's own socket reports that data directory.  The second half
+      matters because the stop is `pg_ctl stop`, which signals whatever
+      process has the recorded pid: after a reboot that can be an unrelated
+      process of the same user.  Given the first point, a socket in the
+      directory was put there by a process of the current user, and one
+      that reports this data directory is taken to be its postmaster.
+
+    Whatever fails a check is left exactly as it is.  Stale directories
+    with no running server are left for the system's temporary-file
+    cleanup: they hold nothing that needs stopping.  The sweep is best
+    effort; a candidate that cannot be examined or stopped is skipped rather
+    than allowed to fail the session.
+    """
+    superuser = pwd.getpwuid(os.geteuid()).pw_name
+    swept = []
+    for parent in dict.fromkeys(parents or _base_parents()):
+        try:
+            candidates = sorted(Path(parent).glob(f"{BASE_PREFIX}*"))
+        except OSError:
+            continue
+        for base in candidates:
+            try:
+                directory = _own_entry(base, stat.S_ISDIR)
+                if directory is None or directory.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                    continue
+                stale = Cluster(bindir, base, TEST_PORT, superuser)
+                if stale._is_abandoned(max_age):
+                    stale.stop()
+                    swept.append(base)
+            except (OSError, HarnessError):
+                continue
+    return swept
 
 
 class Database:
@@ -811,7 +1055,12 @@ class Database:
     # -- probes: server log (immediate) --------------------------------------
 
     def script_statements(self, *, user=None, since=0):
-        """Every statement the script sent to this database, in order."""
+        """Every statement the script sent to this database, in order.
+
+        The script's own only: what the driver adds at session start is
+        filtered out by content (see Cluster.statements), so position 0 is
+        the first statement the script issued on a connection.
+        """
         return [
             record.sql
             for record in self.cluster.statements(

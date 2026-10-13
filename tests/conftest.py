@@ -30,9 +30,17 @@
 #
 # The server is stopped and its directory removed when the session ends,
 # including on Ctrl-C, SIGTERM and SIGHUP.  Only a SIGKILL of pytest leaves
-# it behind: look for a postgres process whose data directory is under a
-# temporary directory named ffpg*, and stop it with
+# it behind.  The next session to start stops and removes such a server once
+# its marker file is an hour old (ffharness.sweep_stale_clusters).  To be
+# rid of it sooner, look for a postgres process whose data directory is
+# under a temporary directory named ffpg*, and stop it with
 # `pg_ctl -D <that directory>/data -m immediate stop`.
+#
+# Every connection is trusted except those of one role,
+# ffharness.SCRAM_ROLE, which pg_hba.conf asks for a password.  A test that
+# needs the server to check the script's -w value creates that role with
+# make_role(name=ffharness.SCRAM_ROLE, password=...) and runs the script as
+# it; the harness itself never connects as that role.
 #
 # Running it
 # ----------
@@ -42,6 +50,12 @@
 # or, without installing anything:
 #
 #   uv run -q --with pytest --with psycopg2-binary pytest -q
+#
+# Line coverage of the script is measured only on request, because the
+# script runs in subprocesses that each have to record their own:
+#
+#   COVERAGE_PROCESS_START=$PWD/.coveragerc python -m pytest
+#   python -m coverage combine && python -m coverage report
 #
 # initdb and pg_ctl are looked up in $PG_BINDIR, then PATH, then
 # `pg_config --bindir`, then /usr/local/pgsql/bin.  If none has them the
@@ -134,6 +148,9 @@ def _termination_as_interrupt():
 @pytest.fixture(scope="session")
 def cluster(pg_bindir):
     """The session's throwaway server (ffharness.Cluster)."""
+    # Before this session's own cluster exists, so the sweep can only ever
+    # meet clusters left by other sessions.
+    ffharness.sweep_stale_clusters(pg_bindir)
     with _termination_as_interrupt():
         server = ffharness.Cluster.start(pg_bindir)
         try:
@@ -167,12 +184,16 @@ _serial = itertools.count(1)
 @pytest.fixture
 def make_role(cluster):
     """Factory: make_role(label="role", *, name=None, login=True,
-    superuser=False) -> role name.  Roles are dropped after the test."""
+    superuser=False, password=None) -> role name.  Roles are dropped after
+    the test.  A password is checked by the server only for the role named
+    ffharness.SCRAM_ROLE."""
     created = []
 
-    def factory(label="role", *, name=None, login=True, superuser=False):
+    def factory(label="role", *, name=None, login=True, superuser=False, password=None):
         name = name or f"ffr{next(_serial)}_{label}"
-        cluster.create_role(name, login=login, superuser=superuser)
+        cluster.create_role(
+            name, login=login, superuser=superuser, password=password
+        )
         created.append(name)
         return name
 
