@@ -38,9 +38,9 @@ parser.add_argument("-s", "--minsizemb", dest="minsizemb",
 parser.add_argument("-d", "--databases", dest="dblist",
                     help="Comma-separated list of databases to vacuum, if not all of them")
 parser.add_argument("-T", "--exclude-table", action="append", dest="tables_to_exclude",
-                    help="Exclude any table with this name (in any database). You can pass this option multiple times to exclude multiple tables.")
+                    help="Exclude any table with this name (in any database).  A bare name matches in every schema; SCHEMA.TABLE matches only that table. You can pass this option multiple times to exclude multiple tables.")
 parser.add_argument("--exclude-table-in-database", action="append", dest="exclude_table_in_database",
-                    help="Argument is of form 'DATABASENAME.TABLENAME' exclude the named table, but only when processing the named database. You can pass this option multiple times.")
+                    help="Argument is of form 'DATABASENAME.TABLENAME' or 'DATABASENAME.SCHEMANAME.TABLENAME': exclude the named table, but only when processing the named database. You can pass this option multiple times.")
 parser.add_argument("--no-freeze", dest="skip_freeze", action="store_true",
                     help="Do VACUUM ANALYZE instead of VACUUM FREEZE ANALYZE")
 parser.add_argument("--no-analyze", dest="skip_analyze", action="store_true",
@@ -78,7 +78,7 @@ parser.add_argument("-w", "--password", dest="dbpass",
                        "process list for the whole run; prefer PGPASSWORD, a "
                        ".pgpass file or PGSERVICE")
 parser.add_argument("-st", "--table", dest="table",
-                  help="only process specified  table", default=False)
+                  help="only process tables with this name: a bare name matches in every schema, SCHEMA.TABLE only that table", default=False)
 
 args = parser.parse_args()
 
@@ -177,7 +177,7 @@ if args.exclude_table_in_database:
         # schema-qualified: DATABASE.TABLE or DATABASE.SCHEMA.TABLE
         parts = elem.split(".", 1)
         if len(parts) != 2:
-            print("invalid argument '{arg}' to flag --exclude-table-in-database: argument must be of the form DATABASE.TABLE".format(arg=elem), file=sys.stderr)
+            print("invalid argument '{arg}' to flag --exclude-table-in-database: argument must be of the form DATABASE.TABLE or DATABASE.SCHEMA.TABLE".format(arg=elem), file=sys.stderr)
             exit(2)
         else:
             dat = parts[0]
