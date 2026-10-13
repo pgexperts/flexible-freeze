@@ -209,7 +209,7 @@ def test_function_shadowing_a_catalog_function_in_public_is_not_called(
     db, make_role, run_ff
 ):
     # A less-privileged role with CREATE on public defines an exact-signature
-    # match, public.pg_relation_size(oid), where pg_catalog offers only a
+    # match, public.pg_table_size(oid), where pg_catalog offers only a
     # coercion match (its function takes regclass).  Under a non-empty path
     # the planted function is resolved and runs as the connecting role; its
     # side effect (a row in ff_tripwire) is the proof.  An empty search_path
@@ -218,7 +218,7 @@ def test_function_shadowing_a_catalog_function_in_public_is_not_called(
     db.execute(f"GRANT CREATE ON SCHEMA public TO {role}")
     db.execute("CREATE TABLE public.ff_tripwire (n serial PRIMARY KEY)")
     db.execute(
-        "CREATE FUNCTION public.pg_relation_size(oid) RETURNS bigint "
+        "CREATE FUNCTION public.pg_table_size(oid) RETURNS bigint "
         "LANGUAGE plpgsql AS "
         "$$ BEGIN INSERT INTO public.ff_tripwire DEFAULT VALUES; RETURN 0; END; $$",
         user=role,
@@ -230,7 +230,7 @@ def test_function_shadowing_a_catalog_function_in_public_is_not_called(
 
     assert result.returncode == 0, result.stdout + result.stderr
     fired = db.execute("SELECT count(*) FROM public.ff_tripwire")[0][0]
-    assert fired == 0, "planted public.pg_relation_size(oid) was called"
+    assert fired == 0, "planted public.pg_table_size(oid) was called"
     # The real table is still selected and frozen under the empty path.
     assert TARGET in db.frozen_since(before)
     assert TARGET in set(targets(db.script_vacuums()))
