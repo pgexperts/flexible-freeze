@@ -28,12 +28,30 @@ if sys.hexversion < 0x3060000:
     print("At least Python 3.6 required; you have %s" % sys.version, file=sys.stderr)
     exit(1)
 
+# argparse type for the options that are counts, sizes or durations.  A
+# negative value is rejected for all of them.  For most it would surface far
+# from the command line: as a ValueError from time.sleep() after the first
+# table (--pause), as a server error from SET (--costdelay, --costlimit), or
+# as a run that halts at once and still exits 0 (--minutes).  For --freezeage
+# and --minsizemb it is at best an obscure way of asking for every table.
+# Zero stays legal for all of them (-m 0 and --pause 0 are in use).  No upper
+# bounds are applied here; the server enforces its own on the cost settings.
+def non_negative_int(text):
+    try:
+        value = int(text)
+    except ValueError:
+        # the wording argparse itself uses for type=int
+        raise argparse.ArgumentTypeError("invalid int value: %r" % text)
+    if value < 0:
+        raise argparse.ArgumentTypeError("must not be negative: %r" % text)
+    return value
+
 parser = argparse.ArgumentParser()
 parser.add_argument("-m", "--minutes", dest="run_min",
-                    type=int, default=120,
+                    type=non_negative_int, default=120,
                     help="Number of minutes to run before halting.  Defaults to 2 hours")
 parser.add_argument("-s", "--minsizemb", dest="minsizemb",
-                    type=int, default=0,
+                    type=non_negative_int, default=0,
                     help="Minimum table size to vacuum/freeze (in MB).  Default is 0.")
 parser.add_argument("-d", "--databases", dest="dblist",
                     help="Comma-separated list of databases to vacuum, if not all of them")
@@ -41,22 +59,26 @@ parser.add_argument("-T", "--exclude-table", action="append", dest="tables_to_ex
                     help="Exclude any table with this name (in any database).  A bare name matches in every schema; SCHEMA.TABLE matches only that table. You can pass this option multiple times to exclude multiple tables.")
 parser.add_argument("--exclude-table-in-database", action="append", dest="exclude_table_in_database",
                     help="Argument is of form 'DATABASENAME.TABLENAME' or 'DATABASENAME.SCHEMANAME.TABLENAME': exclude the named table, but only when processing the named database. You can pass this option multiple times.")
+# argparse %-formats help strings, hence the doubled percent sign.
 parser.add_argument("--no-freeze", dest="skip_freeze", action="store_true",
-                    help="Do VACUUM ANALYZE instead of VACUUM FREEZE ANALYZE")
+                    help="Do VACUUM ANALYZE instead of VACUUM FREEZE ANALYZE.  Tables are then chosen by fixed thresholds instead of by age: more than 100 dead rows, more than 5%% of rows dead, and not vacuumed (manually or by autovacuum) in the last hour.  --freezeage is ignored.")
 parser.add_argument("--no-analyze", dest="skip_analyze", action="store_true",
                     help="Do not do an ANALYZE as part of the VACUUM operation")
-parser.add_argument("--vacuum", dest="vacuum", action="store_true",
-                    help="Do VACUUM ANALYZE instead of VACUUM FREEZE ANALYZE (deprecated option; use --no-freeze instead)")
-parser.add_argument("--pause", dest="pause_time", type=int, default=10,                    
+# Deprecated spelling of --no-freeze.  It must keep that option's dest: the
+# rest of the script reads skip_freeze only, so a dest of its own would make
+# this option a silent no-op and the run a much heavier VACUUM FREEZE.
+parser.add_argument("--vacuum", dest="skip_freeze", action="store_true",
+                    help="Same as --no-freeze (deprecated spelling; use --no-freeze instead)")
+parser.add_argument("--pause", dest="pause_time", type=non_negative_int, default=10,
                     help="seconds to pause between vacuums.  Default is 10.")
 parser.add_argument("--freezeage", dest="freezeage",
-                    type=int, default=10000000,
-                    help="minimum age for freezing.  Default 10m XIDs")
+                    type=non_negative_int, default=10000000,
+                    help="freeze tables older than this many XIDs; a table whose age is exactly this is not selected.  Default 10m XIDs.  Ignored with --no-freeze")
 parser.add_argument("--costdelay", dest="costdelay", 
-                    type=int, default = 20,
+                    type=non_negative_int, default = 20,
                     help="vacuum_cost_delay setting in ms.  Default 20")
 parser.add_argument("--costlimit", dest="costlimit",
-                    type=int, default = 2000,
+                    type=non_negative_int, default = 2000,
                     help="vacuum_cost_limit setting.  Default 2000")
 parser.add_argument("-t", "--print-timestamps", action="store_true",
                     dest="print_timestamps")
@@ -71,14 +93,16 @@ parser.add_argument("-U", "--user", dest="dbuser",
                   help="database user")
 parser.add_argument("-H", "--host", dest="dbhost",
                   help="database hostname")
-parser.add_argument("-p", "--port", dest="dbport",
+parser.add_argument("-p", "--port", dest="dbport", type=int,
                   help="database port")
 parser.add_argument("-w", "--password", dest="dbpass",
                   help="database password.  Visible to other local users in the "
                        "process list for the whole run; prefer PGPASSWORD, a "
                        ".pgpass file or PGSERVICE")
-parser.add_argument("-st", "--table", dest="table",
-                  help="only process tables with this name: a bare name matches in every schema, SCHEMA.TABLE only that table", default=False)
+# --table is listed first so that it is the spelling shown in the usage line;
+# -st is kept because existing invocations use it.
+parser.add_argument("--table", "-st", dest="table",
+                  help="only process tables with this name: a bare name matches in every schema, SCHEMA.TABLE only that table.  -st is an older spelling of this option")
 
 args = parser.parse_args()
 
@@ -176,7 +200,10 @@ if args.exclude_table_in_database:
         # split on the first dot only, so that the table part can be
         # schema-qualified: DATABASE.TABLE or DATABASE.SCHEMA.TABLE
         parts = elem.split(".", 1)
-        if len(parts) != 2:
+        # An empty database or table part ('.t', 'db.') has the right shape
+        # but can never match anything, so the table it was meant to protect
+        # would be vacuumed; it is rejected like a value with no dot at all.
+        if len(parts) != 2 or not parts[0] or not parts[1]:
             print("invalid argument '{arg}' to flag --exclude-table-in-database: argument must be of the form DATABASE.TABLE or DATABASE.SCHEMA.TABLE".format(arg=elem), file=sys.stderr)
             exit(2)
         else:
@@ -186,9 +213,20 @@ if args.exclude_table_in_database:
                 database_table_map[dat].append(tab)
             else:
                 database_table_map[dat] = [tab]
-                exit
 
 debug_print("database_table_map: {m}".format(m=database_table_map))
+
+# -d: surrounding whitespace and empty entries ('a,,b', a trailing comma) are
+# dropped here rather than passed on as database names, because an empty name
+# is not something the connection code downstream can skip cleanly.  A -d that
+# names no database at all is an error, not a request for every database:
+# falling back to the full list would vacuum far more than was asked for.
+named_dblist = None
+if args.dblist is not None:
+    named_dblist = [name.strip() for name in args.dblist.split(',') if name.strip()]
+    if not named_dblist:
+        print("invalid argument '{arg}' to flag --databases: argument must name at least one database".format(arg=args.dblist), file=sys.stderr)
+        sys.exit(2)
 
 # set times
 halt_time = time.time() + ( args.run_min * 60 )
@@ -235,7 +273,7 @@ if args.dblist is None:
         _print("no databases to vacuum, aborting")
         sys.exit(1)
 else:
-    dblist = args.dblist.split(',')
+    dblist = named_dblist
 
 verbose_print("Flexible Freeze run starting")
 n_dbs = len(dblist)
