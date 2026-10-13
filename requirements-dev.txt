@@ -1,0 +1,6 @@
+# Development and CI dependencies: the test suite (tests/) and the linter.
+# Runtime dependencies of the script itself are in scripts/requirements.txt.
+pytest>=7.0
+# 2.8 is the first release with multi-part sql.Identifier, used by the harness.
+psycopg2-binary>=2.8
+ruff
