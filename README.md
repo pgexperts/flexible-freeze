@@ -69,7 +69,9 @@ Requires psycopg2
 
 Notes:
 
-The minutes time limit is normally only enforced at the start of vacuuming each table, allowing vacuums to continue past the end of the time window.  If you set `--enforce-time`, however, it uses statement_timeout to terminate a running vacuum at the end of the time window (plus 30 seconds grace period).
+The minutes time limit is normally only enforced at the start of vacuuming each table, allowing vacuums to continue past the end of the time window.  If you set `--enforce-time`, however, it uses statement_timeout to terminate a running vacuum at the end of the time window (plus 30 seconds grace period).  A vacuum terminated that way is not a failure: the run ends as it does for any other stop at the time limit, and the summary names the table whose vacuum was cancelled.  The work done on that table is lost, and it will be selected first again on the next run, so a table that needs longer than the time window to vacuum needs a longer window.
+
+`--pause` is a pause between vacuums.  There is none after the last table, and a pause never runs past the end of the time window.
 
 If you do not specify a `--enforce_time`, `flexible_freeze` will issue a `SET statement_timeout = 0` statement before each operation
 to avoid cancellation by a system- or role-wide `statement_timeout` value.
@@ -88,11 +90,24 @@ Table names given to `-T`, `--exclude-table-in-database` and `--table` can be wr
 
 Connection settings other than host, port, user and password are taken from the standard libpq environment variables (`PGSSLMODE`, `PGSERVICE`, `PGCONNECT_TIMEOUT` and so on).  The `-H`, `-U`, `-p`, `-w` and `-d` values are passed to the server as given; they cannot carry additional connection options.
 
-The database user supplied is expected to have permissions on all tables (e.g. a superuser).  If they do not, `flexible_freeze` will error out.
+A mistyped `-T` or `--exclude-table-in-database` value excludes nothing.  With `-v`, the end of the run lists the exclusion values that matched none of the selected tables.  That is not an error: a correct value also matches nothing when its table was not selected for vacuuming in that run.
+
+The database user supplied is expected to have permissions on all tables (e.g. a superuser).  The server does not raise an error for a table the user may not vacuum: it skips the table with a warning.  `flexible_freeze` treats any warning the server raises during a table's VACUUM as "not vacuumed": it prints the server's message, lists the table in the summary, and exits with status 1.
+
+One table failing does not end the run.  The failure is printed, the run continues with the next table, and the summary at the end lists every table that failed.  The same goes for a database that cannot be connected to or whose tables cannot be listed: it is skipped and listed in the summary.  If the connection to a database is lost during a run, the rest of that database is skipped; `flexible_freeze` does not reconnect.
+
+Exit status:
+
+    0   every selected table was vacuumed, or the run stopped at the time limit
+    1   at least one table failed or was not vacuumed, a database was skipped
+        or left unfinished, or --table matched no table in a database; also
+        when the run could not start (no databases, database list or logfile
+        unavailable)
+    2   invalid command-line arguments
 
 libpq's `PGPASSWORD`, `~/.pgpass` and `PGSERVICE` are honoured, so `-w` is not needed to authenticate.  A password given with `-w` is visible to other local users in the process list for the whole run; prefer one of those instead.
 
-Currently, `flexible_freeze` will not respond to a CTRL-C until the current vacuum is done.  If you need to halt `flexible_freeze` before then, we recommend using pg_cancel_backend() from the Postgres command line.  This will cause flexible_freeze to error out and exit.
+Currently, `flexible_freeze` will not respond to a CTRL-C until the current vacuum is done.  If you need to halt `flexible_freeze` before then, press CTRL-C and then use pg_cancel_backend() from the Postgres command line; the CTRL-C takes effect as soon as the cancelled vacuum returns.  Without the CTRL-C, a cancelled vacuum is reported as a failed table and the run continues with the next one.
 
 Running the tests
 -----------------

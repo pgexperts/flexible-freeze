@@ -370,7 +370,9 @@ def test_table_option_honours_exclusions_among_its_matches(db, run_ff):
 
 
 def test_table_option_reports_a_name_that_matches_nothing(make_db, run_ff):
-    # The run moves on to the next database, where the name does match.
+    # The run moves on to the next database, where the name does match.  It
+    # still exits 1: the name matched nothing in one of the databases it was
+    # asked to work on (see test_run_outcome.py).
     one, two = make_db("one"), make_db("two")
     build(one, ("sales", "items"))
     build(two, ("sales", "orders"))
@@ -380,7 +382,7 @@ def test_table_option_reports_a_name_that_matches_nothing(make_db, run_ff):
         *FREEZE_ALL, "--table", "orders", "-d", f"{one.name},{two.name}"
     )
 
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.returncode == 1, result.stdout + result.stderr
     assert (
         f"specified single table orders was not found (or excluded) "
         f"in database {one.name}"
@@ -444,13 +446,14 @@ def test_table_option_reports_an_existing_table_the_selection_left_out(
     # message as a name that matches nothing, although it is neither missing
     # nor excluded.  Issue #38 item 3 changes this (resolve the name directly
     # and vacuum the table whatever the filters say); this test is expected
-    # to be rewritten with that fix.
+    # to be rewritten with that fix.  Until then the run also exits 1, as it
+    # does for any --table that matched nothing.
     build(db, ("public", "t_small"))
     before = db.frozenxids()
 
     result = run_ff(*selection, "--table", "t_small", "-d", db.name)
 
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.returncode == 1, result.stdout + result.stderr
     assert (
         f"specified single table t_small was not found (or excluded) "
         f"in database {db.name}"

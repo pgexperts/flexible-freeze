@@ -1,13 +1,13 @@
 # Characterization tests for how a run is bounded and reported: connection
 # options and failures, the time limit, the log file and debug output.
 #
-# Two things are deliberately left unpinned because they are open questions
-# (issue #40), not settled behaviour:
+# One thing is deliberately left unpinned because it is an open question
+# (issue #40), not settled behaviour: which stream an error message goes to.
+# Such messages are looked for in stdout and stderr together (see `output`).
 #
-# * exit status after skipping a database or stopping at the time limit:
-#   those tests assert the message and the effect on the tables only;
-# * which stream an error message goes to: such messages are looked for in
-#   stdout and stderr together (see `output`).
+# The exit status is settled: 0 for a complete run and for one that stopped
+# at its time limit, 1 when work was missed.  The cases where work is missed
+# are in test_run_outcome.py.
 
 from ffharness import FREEZE_ALL, assert_lines_in_order
 
@@ -26,6 +26,7 @@ def test_unreachable_database_is_skipped_and_the_run_continues(db, run_ff):
 
     result = run_ff(*FREEZE_ALL, "-d", f"ff_no_such_database,{db.name}")
 
+    assert result.returncode == 1
     assert "skipping database ff_no_such_database (couldn't connect: " in output(result)
     assert "Traceback" not in result.stderr
     assert db.frozen_since(before) == {T1}
@@ -39,6 +40,8 @@ def test_zero_minute_limit_halts_before_the_first_table(db, run_ff):
 
     result = run_ff(*FREEZE_ALL, "-v", "-m", "0", "-d", db.name)
 
+    # Stopping at the limit is how a run is meant to end, not a failure.
+    assert result.returncode == 0
     assert_lines_in_order(
         result.stdout,
         ["Reached time limit.  Exiting.", "Vacuuming halted due to timeout"],
@@ -54,6 +57,7 @@ def test_zero_minute_limit_without_verbose_prints_only_the_halt(db, run_ff):
 
     result = run_ff(*FREEZE_ALL, "-m", "0", "-d", db.name)
 
+    assert result.returncode == 0
     assert result.stdout == "Vacuuming halted due to timeout\n"
 
 
