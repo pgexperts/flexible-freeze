@@ -74,11 +74,23 @@ parser.add_argument("-H", "--host", dest="dbhost",
 parser.add_argument("-p", "--port", dest="dbport",
                   help="database port")
 parser.add_argument("-w", "--password", dest="dbpass",
-                  help="database password")
+                  help="database password.  Visible to other local users in the "
+                       "process list for the whole run; prefer PGPASSWORD, a "
+                       ".pgpass file or PGSERVICE")
 parser.add_argument("-st", "--table", dest="table",
                   help="only process specified  table", default=False)
 
 args = parser.parse_args()
+
+# The argument namespace is printed to the debug output and the logfile, both
+# of which outlive the process and may be readable by others, so a password
+# given with -w is replaced by a placeholder in a copy.  args itself is left
+# alone: dbconnect() needs the real value.
+def args_for_display():
+    shown = argparse.Namespace(**vars(args))
+    if shown.dbpass is not None:
+        shown.dbpass = '********'
+    return shown
 
 def debug_print(some_message):
     if args.debug:
@@ -154,7 +166,7 @@ def table_named_in(names, tabrow):
 debug_print("python version: %s" % sys.version)
 debug_print("psycopg2 version: %s" % psycopg2.__version__)
 debug_print("argparse version: %s" % argparse.__version__)
-debug_print("parameters: %s" % repr(args))
+debug_print("parameters: %s" % repr(args_for_display()))
 
 # process arguments that argparse can't handle completely on its own
 
@@ -197,7 +209,7 @@ if args.logfile:
     _print('')
     _print('='*40)
     _print('flexible freeze started %s' % str(datetime.datetime.now()))
-    verbose_print('arguments: %s' % str(args))
+    verbose_print('arguments: %s' % str(args_for_display()))
 
 # do we have a database list?
 # if not, connect to "postgres" database and get a list of non-system databases
