@@ -16,8 +16,10 @@ may still overrun the vacuum period, unless you use the --enforce-time switch.
 import time
 import sys
 import signal
+import select
 import argparse
 import psycopg2
+import psycopg2.extensions
 import datetime
 
 def timestamp():
@@ -163,15 +165,133 @@ def dbconnect(dbname, dbuser, dbhost, dbport, dbpass):
 
     return conn
 
-def signal_handler(signal, frame):
-    _print('exiting due to user interrupt')
-    if conn:
-        try:
-            conn.close()
-        except:
-            verbose_print('could not clean up db connections')
-        
-    sys.exit(0)
+# Stopping on SIGINT or SIGTERM.
+#
+# interrupt_signal is the first of the two to arrive, or None.  The handler
+# does nothing but record it, because it can run between any two bytecodes of
+# the script: printing from it can re-enter a print that is in progress,
+# exiting from it skips the summary, and closing the connection from it
+# abandons a VACUUM that the server then runs to completion, since a backend
+# does not notice a client that has gone away while it is vacuuming.  The
+# stopping is done by the code that the signal interrupted: wait_for_server()
+# cancels the statement in progress, pause() ends early, the loops test the
+# variable before starting anything new, and the summary and the exit status
+# (128 + the signal number, the shell's convention) come from the same place
+# as for any other run.
+#
+# interrupt_repeated: a further signal arrived after the first.  The first
+# one waits for the server to confirm the cancellation, and a server that
+# never answers (a frozen backend, a proxy that drops cancel requests) would
+# otherwise leave a process that only SIGKILL could end.  The second one
+# gives up that wait; see wait_for_server().
+interrupt_signal = None
+interrupt_repeated = False
+
+def signal_handler(signum, frame):
+    global interrupt_signal, interrupt_repeated
+    if interrupt_signal is None:
+        interrupt_signal = signum
+    else:
+        interrupt_repeated = True
+
+def interruption_notice(signum):
+    return "Vacuuming interrupted by {s}".format(s=signal.Signals(signum).name)
+
+# For the steps before the first database is started.  They have nothing to
+# summarise and already end the process themselves when they fail, so an
+# interrupt ends it there too, with the line the summary would have led with.
+def exit_if_interrupted():
+    if interrupt_signal is not None:
+        _print(interruption_notice(interrupt_signal))
+        sys.exit(128 + interrupt_signal)
+
+# The longest a wait goes without looking at interrupt_signal.  A handler
+# that returns normally does not end the system call it interrupted: Python
+# resumes select() and sleep() for the rest of their timeout (PEP 475).  So
+# the waits below are made in slices of this length, and the variable is
+# tested between slices.
+WAIT_SLICE_SECS = 0.5
+
+# How long a cancel request is given to take effect before it is repeated.
+CANCEL_RETRY_SECS = 2
+
+# psycopg2 wait callback (psycopg2.extensions.set_wait_callback): called
+# whenever the driver has to wait for the server, in place of a blocking libpq
+# call.  Inside a blocking call the interpreter does not run at all, so the
+# handler above could not even record a signal until the VACUUM had finished;
+# here the wait is a select() in Python, and each slice of it can act on
+# interrupt_signal.
+#
+# On an interrupt the statement is cancelled on the server and the wait goes
+# on until the server answers, normally with the query-cancelled error, which
+# is raised from the execute() call that was waiting.  The request is repeated
+# because one can be lost: it travels on a connection of its own, and a
+# backend that receives it before it has read the statement ignores it.
+# That is also why the test of interrupt_signal comes before the first
+# select(): a signal that arrived while nothing was waiting on the server,
+# between two statements, is acted on when the next statement's wait begins.
+#
+# The wait is given up, without the server's answer, in two cases: the
+# request cannot be delivered (cancel() raises), or a second signal arrives.
+# Either way an exception leaves this function, and psycopg2 then closes the
+# connection, since it can no longer tell what the server will send on it.
+# That closed connection is how the caller knows that the statement was not
+# confirmed cancelled and may still be running.  A second signal is tested
+# only after a request has been sent, so that an impatient double CTRL-C
+# still cancels the VACUUM and only skips the wait for the confirmation.
+#
+# cancel() is itself a blocking libpq call (it opens a connection to the
+# server) and is not covered by any of this: while the server's host does not
+# answer at all, it blocks for as long as the operating system lets a
+# connection attempt take.
+#
+# With a wait callback installed libpq no longer applies connect_timeout
+# (PGCONNECT_TIMEOUT, or a service file's), so it is applied here.  The limit
+# covers the whole attempt, where libpq's own would start afresh for each
+# host of a multi-host connection.
+def wait_for_server(waiting_conn):
+    # psycopg2 moves a connection to STATUS_READY once it is established; a
+    # statement can be cancelled from then on, and not before.
+    connecting = waiting_conn.status not in (psycopg2.extensions.STATUS_READY,
+                                             psycopg2.extensions.STATUS_BEGIN)
+    give_up_at = None
+    if connecting:
+        connect_timeout = int(waiting_conn.get_dsn_parameters().get('connect_timeout') or 0)
+        if connect_timeout > 0:
+            give_up_at = time.monotonic() + connect_timeout
+    next_cancel = 0
+
+    while True:
+        state = waiting_conn.poll()
+        if state == psycopg2.extensions.POLL_OK:
+            return
+
+        if interrupt_signal is not None:
+            if connecting:
+                raise psycopg2.OperationalError("connection attempt abandoned on an interrupt")
+            if time.monotonic() >= next_cancel:
+                waiting_conn.cancel()
+                next_cancel = time.monotonic() + CANCEL_RETRY_SECS
+            if interrupt_repeated:
+                raise psycopg2.OperationalError("gave up waiting for the server on a second signal")
+        elif give_up_at is not None and time.monotonic() >= give_up_at:
+            raise psycopg2.OperationalError("timeout expired")
+
+        if state == psycopg2.extensions.POLL_READ:
+            select.select([waiting_conn], [], [], WAIT_SLICE_SECS)
+        elif state == psycopg2.extensions.POLL_WRITE:
+            select.select([], [waiting_conn], [], WAIT_SLICE_SECS)
+        else:
+            raise psycopg2.OperationalError("unexpected poll state: %r" % (state,))
+
+# The pause between vacuums, ended early by an interrupt.
+def pause(seconds):
+    wake_at = time.monotonic() + seconds
+    while interrupt_signal is None:
+        remaining = wake_at - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(remaining, WAIT_SLICE_SECS))
 
 # Tables are carried around as rows of (regclass text, schema name, table name).
 # The regclass text is what gets printed and what goes into the VACUUM
@@ -217,6 +337,15 @@ class RunOutcome(object):
         # be in the middle of a vacuum, which is then the cancelled table.
         self.time_limited = False
         self.cancelled_table = None
+        # The run was stopped by a signal (its number), and the table whose
+        # VACUUM that cut short, if there was one.  Neither is a failure:
+        # an interrupted table is kept out of failed_tables, and the exit
+        # status for a signal takes precedence over 0 and 1.
+        self.interrupted_by = None
+        self.interrupted_table = None
+        # The wait for that VACUUM was given up without the server's answer,
+        # so it is not known to have been cancelled.
+        self.interrupt_unconfirmed = False
 
     # Exit status 1.  Stopping at the time limit is not in this list: it is
     # the designed way for a nightly run to end, and exits 0.
@@ -273,9 +402,14 @@ if args.dblist is not None:
 # set times
 halt_time = time.time() + ( args.run_min * 60 )
 
-# get set for user interrupt
-conn = None
+# Get set for an interrupt.  SIGTERM is what cron, systemd and a plain kill
+# send; left at its default it ends the process at once, and the VACUUM in
+# progress carries on in the server with nobody waiting for it.  The wait
+# callback goes in before the first connection is made: it is what lets
+# either handler run while the driver waits for the server.
+psycopg2.extensions.set_wait_callback(wait_for_server)
 signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 # start logging to log file, if used
 if args.logfile:
@@ -298,18 +432,28 @@ if args.dblist is None:
         dbname = 'postgres'
         conn = dbconnect(dbname, args.dbuser, args.dbhost, args.dbport, args.dbpass)
     except Exception as ex:
+        # A connection attempt given up on a signal is not a failed one.
+        exit_if_interrupted()
         _print("Could not list databases: connection to database {d} failed: {e}".format(d=dbname, e=str(ex)))
         sys.exit(1)
 
     cur = conn.cursor()
-    cur.execute("""SELECT datname FROM pg_database
-        WHERE datname NOT IN ('postgres','template1','template0')
-        ORDER BY age(datfrozenxid) DESC""")
+    try:
+        cur.execute("""SELECT datname FROM pg_database
+            WHERE datname NOT IN ('postgres','template1','template0')
+            ORDER BY age(datfrozenxid) DESC""")
+    except Exception:
+        # Only the cancellation an interrupt asked for is dealt with here;
+        # any other failure of this query is left as it was.
+        exit_if_interrupted()
+        raise
     dblist = []
     for dbname in cur:
         dblist.append(dbname[0])
 
     conn.close()
+    # Before the test for an empty list: a signal outranks that exit status.
+    exit_if_interrupted()
     if not dblist:
         _print("no databases to vacuum, aborting")
         sys.exit(1)
@@ -334,6 +478,10 @@ pause_pending = False
 exclusions_matched = set()
 
 for db in dblist:
+    # An interrupted run starts no further database.  This is also where the
+    # table loop's break for an interrupt ends up.
+    if interrupt_signal is not None:
+        break
     verbose_print("working on database {0}".format(db))
     if outcome.time_limited:
         break
@@ -341,6 +489,13 @@ for db in dblist:
     try:
         conn = dbconnect(db, args.dbuser, args.dbhost, args.dbport, args.dbpass)
     except Exception as err:
+        # In each handler from here to the end of the loop the interrupt is
+        # tested first.  What stops a statement or a connection attempt on a
+        # signal reaches the script as an ordinary error (a cancelled query,
+        # a failed connection), and taken at face value it would be recorded
+        # as a skipped database or a failed table, and the run would go on.
+        if interrupt_signal is not None:
+            break
         _print("skipping database {d} (couldn't connect: {e})".format(d=db, e=str(err)))
         outcome.skipped_databases.append(db)
         continue
@@ -391,7 +546,7 @@ for db in dblist:
 
     # From here on the connection is closed on every way out of this
     # database: the skips below, the end of its table list, a stop at the
-    # time limit, and an exit raised by the signal handler.
+    # time limit, and a stop on a signal.
     try:
         try:
             cur.execute("SET vacuum_cost_delay = {0}".format(args.costdelay))
@@ -407,6 +562,8 @@ for db in dblist:
             # rows of (regclass text, schema name, table name); see table_named_in()
             tablist = cur.fetchall()
         except Exception as err:
+            if interrupt_signal is not None:
+                break
             _print("skipping database {d} (couldn't list its tables: {e})".format(d=db, e=str(err).rstrip()))
             outcome.skipped_databases.append(db)
             continue
@@ -455,7 +612,15 @@ for db in dblist:
                 pause_pending = False
                 pause_secs = min(args.pause_time, halt_time - time.time())
                 if pause_secs > 0:
-                    time.sleep(pause_secs)
+                    pause(pause_secs)
+
+            # An interrupt that arrived during the pause, or during a
+            # statement that completed all the same, stops the run before
+            # the next table.  Tested ahead of the time limit so that a run
+            # stopped by a signal is never reported as one that ran out of
+            # time.
+            if interrupt_signal is not None:
+                break
 
             # check time; if overtime, exit
             if time.time() >= halt_time:
@@ -495,6 +660,23 @@ for db in dblist:
                 del conn.notices[:]
                 cur.execute(exquery)
             except Exception as ex:
+                # An interrupt first (see the note at the connection attempt
+                # above).  The error is then almost always the cancellation
+                # that wait_for_server() asked for, and whatever else it may
+                # be, the table was not vacuumed and the run is stopping.
+                # This has to come before the --enforce-time test, which
+                # would take a cancel after the deadline for a stop at the
+                # time limit, and before the failure handling, which would
+                # report the table as failed and go on to the next one.
+                #
+                # A connection that is closed at this point was given up on
+                # before the server answered (see wait_for_server), or was
+                # lost; in both cases nothing says the VACUUM has stopped.
+                if interrupt_signal is not None:
+                    outcome.interrupted_table = (table, db)
+                    outcome.interrupt_unconfirmed = bool(conn.closed)
+                    break
+
                 # The cancellation --enforce-time asked for, arriving when it
                 # was asked for.  That ends the run, but as a stop at the
                 # time limit and not as a failure.  A cancel inside the
@@ -539,9 +721,22 @@ for db in dblist:
         cur.close()
         conn.close()
 
+# Read once.  A signal that arrives from here on finds the work finished and
+# changes nothing; reading the variable again below could give a summary and
+# an exit status that disagree.
+outcome.interrupted_by = interrupt_signal
+
 # did we get through all tables?
 # exit, report results
-if outcome.time_limited:
+if outcome.interrupted_by is not None:
+    _print(interruption_notice(outcome.interrupted_by))
+    if outcome.interrupted_table and outcome.interrupt_unconfirmed:
+        _print("Work remains: VACUUM of {t} was interrupted; the server did not confirm that it was cancelled, and it may still be running there.".format(
+            t=tables_for_display([outcome.interrupted_table])))
+    elif outcome.interrupted_table:
+        _print("Work remains: VACUUM of {t} was interrupted.".format(
+            t=tables_for_display([outcome.interrupted_table])))
+elif outcome.time_limited:
     _print("Vacuuming halted due to timeout")
     if outcome.cancelled_table:
         _print("Work remains: VACUUM of {t} was cancelled at the time limit.".format(
@@ -561,7 +756,7 @@ if outcome.table_missing_in:
     _print("Databases where --table {t} matched no selected table: {d}".format(
         t=args.table, d=', '.join(outcome.table_missing_in)))
 
-if outcome.time_limited:
+if outcome.time_limited or outcome.interrupted_by is not None:
     verbose_print("after vacuuming %d tables in %d databases" % (outcome.tables_vacuumed, outcome.databases_listed,))
 else:
     verbose_print("%d tables in %d databases" % (outcome.tables_vacuumed, outcome.databases_listed))
@@ -581,4 +776,6 @@ if unmatched:
                      else " (not every database was examined)"))
 
 verbose_print("Flexible Freeze run complete")
+if outcome.interrupted_by is not None:
+    sys.exit(128 + outcome.interrupted_by)
 sys.exit(1 if outcome.work_was_missed() else 0)

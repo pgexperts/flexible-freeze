@@ -6,9 +6,10 @@
 # Design constraints:
 #
 # * flexible_freeze.py is a top-to-bottom script that parses arguments and
-#   does its whole run at import, rebinds sys.stdout under -l and installs a
-#   SIGINT handler.  It therefore cannot be imported into the test process and
-#   is always run as a subprocess.
+#   does its whole run at import, rebinds sys.stdout under -l and installs
+#   signal handlers and a process-wide driver wait callback.  It therefore
+#   cannot be imported into the test process and is always run as a
+#   subprocess.
 #
 # * Run without -H/-p the script connects to whatever libpq finds by default
 #   and VACUUM FREEZEs every database there.  Every launch goes through
@@ -30,6 +31,7 @@ import os
 import pwd
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -92,6 +94,10 @@ SCRAM_ROLE = "ff_scram_role"
 FREEZE_ALL = ("--freezeage", "0")
 
 RUN_TIMEOUT = 60.0
+
+# libpq variables a test may hand to the script.  None of them can change
+# which server is reached; PGCONNECT_TIMEOUT has no command-line equivalent.
+_HARMLESS_LIBPQ_VARIABLES = frozenset({"PGCONNECT_TIMEOUT"})
 FALLBACK_BINDIR = Path("/usr/local/pgsql/bin")
 
 # Marker at the start of every server log line, so that records can be
@@ -282,11 +288,13 @@ def child_env(extra=None):
 
     libpq reads PGHOST, PGPORT, PGSERVICE, PGOPTIONS and friends, and the
     server programs read PGDATA and PGPORT; none of them may steer a child.
-    `extra` is merged on top and may not reintroduce such a variable.
+    `extra` is merged on top and may not reintroduce such a variable, apart
+    from the few that cannot redirect a connection
+    (_HARMLESS_LIBPQ_VARIABLES).
     """
     env = {k: v for k, v in os.environ.items() if not k.startswith("PG")}
     for key in extra or {}:
-        if key.startswith("PG"):
+        if key.startswith("PG") and key not in _HARMLESS_LIBPQ_VARIABLES:
             raise UnsafeInvocation(
                 f"refusing to pass {key} to a child process"
             )
@@ -400,15 +408,23 @@ _CLOCK_OFFSET_VARIABLE = "FF_TEST_CLOCK_OFFSET_FILE"
 _CLOCK_SOURCE = f'''\
 # Written by the flexible_freeze test harness (ffharness.ScriptClock).
 # Adds the number of seconds held in a file to time.time(), so that a test
-# can move the clock of the script it is running.
+# can move the clock of the script it is running, and waits in time.time()
+# for as long as a second file exists, so that a test can stop the script
+# at the point where it next reads the clock.
 import os
 import time
 
 _real_time = time.time
+_real_sleep = time.sleep
 _offset_file = os.environ["{_CLOCK_OFFSET_VARIABLE}"]
+_hold_file = _offset_file + ".hold"
+_held_file = _offset_file + ".held"
 
 
 def _shifted_time():
+    while os.path.exists(_hold_file):
+        open(_held_file, "w").close()
+        _real_sleep(0.01)
     try:
         with open(_offset_file) as source:
             return _real_time() + float(source.read())
@@ -436,6 +452,13 @@ class ScriptClock:
     shim is found through PYTHONPATH, which is why it shadows any
     sitecustomize module the interpreter would otherwise load.  Only
     time.time() moves: sleeps and timestamps are real.
+
+    hold() stops the script inside its next reading of the clock until
+    release().  The script reads the clock before each table, after the
+    table list has been fetched and before anything is sent for the table,
+    which makes that the one place where a test can keep it idle between two
+    statements; wait_until_held() returns once it is there.  Its signal
+    handlers still run while it is held.
     """
 
     def __init__(self, directory):
@@ -443,6 +466,9 @@ class ScriptClock:
         self.directory.mkdir(parents=True, exist_ok=True)
         (self.directory / _CLOCK_MODULE).write_text(_CLOCK_SOURCE)
         self._offset_file = self.directory / "offset"
+        # Names fixed by the shim: the offset file's, with a suffix added.
+        self._hold_file = self.directory / "offset.hold"
+        self._held_file = self.directory / "offset.held"
         self.advance(0)
 
     @property
@@ -462,6 +488,65 @@ class ScriptClock:
         scratch = self._offset_file.with_suffix(".new")
         scratch.write_text(repr(float(seconds)))
         os.replace(str(scratch), str(self._offset_file))
+
+    def hold(self):
+        """Stop the script at its next reading of the clock."""
+        self._hold_file.write_text("")
+
+    def wait_until_held(self, timeout=30.0):
+        wait_for(
+            self._held_file.exists, timeout=timeout,
+            what="the script to stop at its next reading of the clock",
+        )
+
+    def release(self):
+        """Let a held script go on."""
+        self._hold_file.unlink()
+
+
+# -- a server that never answers ---------------------------------------------
+
+
+class SilentServer:
+    """A listening socket that accepts connections and never says a word.
+
+    To the script this is a server that can be reached and does not respond:
+    its connection attempt gets as far as sending the startup packet and then
+    waits, for as long as the test likes.  The real cluster cannot be made to
+    do that.
+
+    The socket is put in the throwaway cluster's own socket directory, under
+    a port number of its own, so the launcher accepts it as a target exactly
+    as it accepts the cluster (check_target) and it still cannot lead to any
+    other server.  Start the script against it with start_ff(..., port=...).
+    """
+
+    def __init__(self, sockdir, port):
+        self.port = port
+        self._path = Path(sockdir) / f".s.PGSQL.{port}"
+        self._clients = []
+        self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._listener.bind(str(self._path))
+        self._listener.listen(5)
+
+    def wait_for_client(self, timeout=30.0):
+        """Return once a client has connected; it is then left waiting."""
+        self._listener.settimeout(timeout)
+        try:
+            client, _ = self._listener.accept()
+        # socket.timeout before Python 3.10, where it is not yet the same class
+        # and would simply propagate.
+        except TimeoutError:
+            raise AssertionError(
+                f"timed out after {timeout}s waiting for a connection attempt"
+            ) from None
+        # Kept open: closing it would end the client's wait with an error.
+        self._clients.append(client)
+
+    def close(self):
+        for sock in [*self._clients, self._listener]:
+            sock.close()
+        self._path.unlink()
 
 
 # -- locating PostgreSQL ----------------------------------------------------
@@ -814,15 +899,22 @@ class Cluster:
 
     # -- the script ---------------------------------------------------------
 
-    def start_ff(self, *args, env=None, cwd=None):
-        """Start the script against this cluster; returns a Popen."""
-        return start_ff(self.sockdir, self.port, *args, env=env, cwd=cwd)
+    def start_ff(self, *args, env=None, cwd=None, port=None):
+        """Start the script against this cluster; returns a Popen.
 
-    def run_ff(self, *args, env=None, cwd=None, timeout=RUN_TIMEOUT):
+        `port` is for a SilentServer in this cluster's socket directory.
+        """
+        return start_ff(self.sockdir, port or self.port, *args, env=env, cwd=cwd)
+
+    def run_ff(self, *args, env=None, cwd=None, timeout=RUN_TIMEOUT, port=None):
         """Run the script against this cluster; returns a CompletedProcess."""
         return run_ff(
-            self.sockdir, self.port, *args, env=env, cwd=cwd, timeout=timeout
+            self.sockdir, port or self.port, *args, env=env, cwd=cwd, timeout=timeout
         )
+
+    def silent_server(self):
+        """A SilentServer beside this cluster's socket; the caller closes it."""
+        return SilentServer(self.sockdir, self.port + 1)
 
     # -- recognising an abandoned cluster ------------------------------------
 

@@ -88,7 +88,7 @@ Table names given to `-T`, `--exclude-table-in-database` and `--table` can be wr
 
 `flexible_freeze` runs every session with an empty `search_path`, as `vacuumdb` does, so table names in its output are always schema-qualified (`public.orders`).  On PostgreSQL 16 and earlier, this means the ANALYZE of a table with an expression index can fail if the index's function depends on `search_path`; give such functions an explicit `SET search_path`, or schema-qualify the names they use.
 
-Connection settings other than host, port, user and password are taken from the standard libpq environment variables (`PGSSLMODE`, `PGSERVICE`, `PGCONNECT_TIMEOUT` and so on).  The `-H`, `-U`, `-p`, `-w` and `-d` values are passed to the server as given; they cannot carry additional connection options.
+Connection settings other than host, port, user and password are taken from the standard libpq environment variables (`PGSSLMODE`, `PGSERVICE`, `PGCONNECT_TIMEOUT` and so on).  The `-H`, `-U`, `-p`, `-w` and `-d` values are passed to the server as given; they cannot carry additional connection options.  The connection timeout (`PGCONNECT_TIMEOUT`, or `connect_timeout` in a service file) limits each connection attempt as a whole: if `-H` lists several hosts, a host that does not answer uses up the timeout instead of being passed over for the next one.
 
 A mistyped `-T` or `--exclude-table-in-database` value excludes nothing.  With `-v`, the end of the run lists the exclusion values that matched none of the selected tables.  That is not an error: a correct value also matches nothing when its table was not selected for vacuuming in that run.
 
@@ -104,10 +104,18 @@ Exit status:
         when the run could not start (no databases, database list or logfile
         unavailable)
     2   invalid command-line arguments
+    130 stopped by SIGINT (CTRL-C)
+    143 stopped by SIGTERM
+
+130 and 143 take precedence over 0 and 1: a run that was stopped by a signal exits with that status whatever else happened in it.
 
 libpq's `PGPASSWORD`, `~/.pgpass` and `PGSERVICE` are honoured, so `-w` is not needed to authenticate.  A password given with `-w` is visible to other local users in the process list for the whole run; prefer one of those instead.
 
-Currently, `flexible_freeze` will not respond to a CTRL-C until the current vacuum is done.  If you need to halt `flexible_freeze` before then, press CTRL-C and then use pg_cancel_backend() from the Postgres command line; the CTRL-C takes effect as soon as the cancelled vacuum returns.  Without the CTRL-C, a cancelled vacuum is reported as a failed table and the run continues with the next one.
+CTRL-C (SIGINT) stops a run, and so does SIGTERM, which is what cron, systemd and `kill` send.  `flexible_freeze` cancels the vacuum in progress on the server, starts no further table or database, and prints its usual summary, which says that the run was interrupted and names the table whose vacuum was cut short.  That table is not counted as failed; as with a vacuum cancelled by `--enforce-time`, the work done on it is lost and it will be selected again on the next run.  A signal is also acted on while `flexible_freeze` is connecting, listing tables, or pausing between vacuums.
+
+After a signal `flexible_freeze` waits for the server to confirm that the vacuum was cancelled.  If that does not come (the server is not responding, or something between the two drops the cancel request), a second signal ends the wait; so does a cancel request that cannot be delivered at all.  The summary then says that the vacuum was not confirmed cancelled and may still be running on the server; check `pg_stat_activity`.  SIGKILL cannot be handled: it ends `flexible_freeze` at once, and the vacuum it was running carries on in the server until it is done.
+
+A vacuum cancelled from elsewhere, with `pg_cancel_backend()` for instance, does not stop the run: it is reported as a failed table and the run continues with the next one.
 
 Running the tests
 -----------------

@@ -111,6 +111,17 @@ def test_child_environment_refuses_libpq_variables():
         ffharness.child_env({"PGDATABASE": "elsewhere"})
 
 
+def test_child_environment_admits_only_the_connect_timeout(monkeypatch):
+    # The one libpq variable a test may set for the script: it cannot change
+    # which server is reached.  It is still not inherited from the caller.
+    monkeypatch.setenv("PGCONNECT_TIMEOUT", "99")
+    assert "PGCONNECT_TIMEOUT" not in ffharness.child_env()
+    assert ffharness.child_env({"PGCONNECT_TIMEOUT": "2"})["PGCONNECT_TIMEOUT"] == "2"
+    for redirecting in ("PGHOST", "PGPORT", "PGSERVICE", "PGHOSTADDR"):
+        with pytest.raises(UnsafeInvocation):
+            ffharness.child_env({redirecting: "elsewhere"})
+
+
 # -- coverage of the script --------------------------------------------------
 
 
