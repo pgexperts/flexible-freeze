@@ -31,11 +31,11 @@ Requires psycopg2
       -d DBLIST, --databases DBLIST
                             Comma-separated list of databases to vacuum, if not all of them
       -T TABLES_TO_EXCLUDE, --exclude-table TABLES_TO_EXCLUDE
-                            Exclude any table with this name (in any database). You can pass this option multiple times to exclude
-                            multiple tables.
+                            Exclude any table with this name (in any database). A bare name matches in every schema; SCHEMA.TABLE
+                            matches only that table. You can pass this option multiple times to exclude multiple tables.
       --exclude-table-in-database EXCLUDE_TABLE_IN_DATABASE
-                            Argument is of form 'DATABASENAME.TABLENAME' exclude the named table, but only when processing the named
-                            database. You can pass this option multiple times.
+                            Argument is of form 'DATABASENAME.TABLENAME' or 'DATABASENAME.SCHEMANAME.TABLENAME': exclude the named
+                            table, but only when processing the named database. You can pass this option multiple times.
       --no-freeze           Do VACUUM ANALYZE instead of VACUUM ANALYZE FREEZE
       --no-analyze          Do not do an ANALYZE as part of the VACUUM operation
       --vacuum              Do VACUUM ANALYZE instead of VACUUM ANALYZE FREEZE (deprecated option; use --no-freeze instead)
@@ -61,7 +61,7 @@ Requires psycopg2
                             database password. Visible to other local users in the process list for the whole run; prefer PGPASSWORD,
                             a .pgpass file or PGSERVICE
       -st TABLE, --table TABLE
-                            only process specified table
+                            only process tables with this name: a bare name matches in every schema, SCHEMA.TABLE only that table
 
 Notes:
 
@@ -74,10 +74,28 @@ Normally flexible_freeze.py does VACUUM FREEZE ANALYZE, starting with the tables
 
 You can specify `--no-analyze` to skip the ANALYZE step. 
 
+Table names given to `-T`, `--exclude-table-in-database` and `--table` can be written three ways: a bare table name (`orders`), which matches a table of that name in every schema; `schema.table` (`sales.orders`), written plain without SQL quoting, which matches only that table; or the name exactly as `flexible_freeze` prints it (for example `public."Orders"`).  Names are case-sensitive.
+
+`flexible_freeze` runs every session with an empty `search_path`, as `vacuumdb` does, so table names in its output are always schema-qualified (`public.orders`).  On PostgreSQL 16 and earlier, this means the ANALYZE of a table with an expression index can fail if the index's function depends on `search_path`; give such functions an explicit `SET search_path`, or schema-qualify the names they use.
+
+Connection settings other than host, port, user and password are taken from the standard libpq environment variables (`PGSSLMODE`, `PGSERVICE`, `PGCONNECT_TIMEOUT` and so on).  The `-H`, `-U`, `-p`, `-w` and `-d` values are passed to the server as given; they cannot carry additional connection options.
+
 The database user supplied is expected to have permissions on all tables (e.g. a superuser).  If they do not, `flexible_freeze` will error out.
 
 libpq's `PGPASSWORD`, `~/.pgpass` and `PGSERVICE` are honoured, so `-w` is not needed to authenticate.  A password given with `-w` is visible to other local users in the process list for the whole run; prefer one of those instead.
 
 Currently, `flexible_freeze` will not respond to a CTRL-C until the current vacuum is done.  If you need to halt `flexible_freeze` before then, we recommend using pg_cancel_backend() from the Postgres command line.  This will cause flexible_freeze to error out and exit.
+
+Running the tests
+-----------------
+
+The test suite runs the script against a throwaway PostgreSQL cluster that it creates in a temporary directory and removes afterwards.  It needs `initdb` and `pg_ctl`, found through the `PG_BINDIR` environment variable, `PATH`, or `pg_config --bindir`.  It never connects to any other server.
+
+    pip install -r requirements-dev.txt
+    pytest
+    ruff check tests
+    ruff check --select E9,F63,F7,F82 scripts
+
+The same checks run in GitHub Actions against PostgreSQL 14 through 18 (`.github/workflows/ci.yml`).  The workflow is started manually from the Actions tab.
 
 
