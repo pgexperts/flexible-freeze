@@ -98,26 +98,30 @@ def _print(some_message):
 
 def dbconnect(dbname, dbuser, dbhost, dbport, dbpass):
 
-    if dbname:
-        connect_string ="dbname=%s application_name=flexible_freeze" % dbname
-    else:
+    if not dbname:
         _print("ERROR: a target database is required.")
         return None
 
-    if dbhost:
-        connect_string += " host=%s " % dbhost
-
-    if dbuser:
-        connect_string += " user=%s " % dbuser
-
-    if dbpass:
-        connect_string += " password=%s " % dbpass
-
-    if dbport:
-        connect_string += " port=%s " % dbport
-
-    conn = psycopg2.connect( connect_string )
+    # Pass each value to libpq as a parameter rather than pasting it into a
+    # key=value connection string.  Database names come from pg_database when
+    # -d is not given, so they are not under the operator's control; a value
+    # carrying whitespace, '=' or a backslash would otherwise be reparsed as
+    # further connection keywords or silently mangled.  None is passed for an
+    # option left unset so libpq applies its own default.
+    conn = psycopg2.connect(dbname=dbname, host=dbhost, user=dbuser,
+                            password=dbpass, port=dbport,
+                            application_name='flexible_freeze')
     conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+
+    # Resolve catalog names through pg_catalog only, by running every session
+    # with an empty search_path -- the same measure vacuumdb takes.  An object
+    # planted in a schema on the effective search_path must not be chosen over
+    # the catalog object and executed as the connecting role.  Accepted
+    # trade-off: on PostgreSQL 16 and earlier, ANALYZE of a table whose
+    # expression index depends on search_path can fail under the empty path.
+    cur = conn.cursor()
+    cur.execute("SELECT pg_catalog.set_config('search_path', '', false)")
+    cur.close()
 
     return conn
 

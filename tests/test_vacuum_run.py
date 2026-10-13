@@ -67,7 +67,7 @@ def test_verbose_names_the_statement_run(db, run_ff):
             f"Processing 1 database (list of databases is {db.name})",
             f"working on database {db.name}",
             "getting list of tables",
-            "processing table t1",
+            "processing table public.t1",
             # The statement printed is the one the server received.
             f"{vacuums[0].sql} in database {db.name}",
             "All tables vacuumed.",
@@ -143,7 +143,9 @@ def test_session_settings_precede_the_work(db, run_ff):
 
     assert result.returncode == 0
     statements = db.script_statements()
-    assert statements[:2] == [
+    # The empty search_path is set first, before any other statement.
+    assert statements[0] == "SELECT pg_catalog.set_config('search_path', '', false)"
+    assert statements[1:3] == [
         "SET vacuum_cost_delay = 20",
         "SET vacuum_cost_limit = 2000",
     ]
@@ -161,7 +163,9 @@ def test_cost_options_are_applied(db, run_ff):
     )
 
     assert result.returncode == 0
-    assert db.script_statements()[:2] == [
+    statements = db.script_statements()
+    assert statements[0] == "SELECT pg_catalog.set_config('search_path', '', false)"
+    assert statements[1:3] == [
         "SET vacuum_cost_delay = 3",
         "SET vacuum_cost_limit = 700",
     ]
