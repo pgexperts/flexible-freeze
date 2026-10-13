@@ -131,6 +131,20 @@ def signal_handler(signal, frame):
         
     sys.exit(0)
 
+# Tables are carried around as rows of (regclass text, schema name, table name).
+# The regclass text is what gets printed and what goes into the VACUUM
+# statement, but it changes with search_path and quoting (orders, sales.orders,
+# "Orders"), so a name given on the command line is also compared with the
+# plain catalog names.  A name matches a table if it is:
+#   - the regclass text, exactly as the script prints it; or
+#   - the bare table name, which matches that table in every schema; or
+#   - schema.table, written plain, without any SQL quoting.
+# Used for --table, --exclude-table and --exclude-table-in-database alike.
+def table_named_in(names, tabrow):
+    regclass_text, nspname, relname = tabrow
+    forms = (regclass_text, relname, "%s.%s" % (nspname, relname))
+    return any(name in forms for name in names)
+
 # startup debugging info
 
 debug_print("python version: %s" % sys.version)
@@ -143,7 +157,9 @@ debug_print("parameters: %s" % repr(args))
 database_table_map = {}
 if args.exclude_table_in_database:
     for elem in args.exclude_table_in_database:
-        parts = elem.split(".")
+        # split on the first dot only, so that the table part can be
+        # schema-qualified: DATABASE.TABLE or DATABASE.SCHEMA.TABLE
+        parts = elem.split(".", 1)
         if len(parts) != 2:
             print("invalid argument '{arg}' to flag --exclude-table-in-database: argument must be of the form DATABASE.TABLE".format(arg=elem), file=sys.stderr)
             exit(2)
@@ -236,6 +252,7 @@ for db in dblist:
     if args.skip_freeze:
         tabquery = """WITH deadrow_tables AS (
                 SELECT relid::regclass as full_table_name,
+                    schemaname as nspname, relname,
                     n_dead_tup::numeric / NULLIF(n_dead_tup + n_live_tup, 0) as dead_pct,
                     pg_relation_size(relid) as table_bytes
                 FROM pg_stat_user_tables
@@ -245,7 +262,7 @@ for db in dblist:
                 AND ( (now() - last_vacuum) > INTERVAL '1 hour'
                     OR last_vacuum IS NULL )
             )
-            SELECT full_table_name
+            SELECT full_table_name, nspname, relname
             FROM deadrow_tables
             WHERE dead_pct > 0.05
             AND table_bytes >= {0} * 2 ^ 20
@@ -255,6 +272,7 @@ for db in dblist:
     # includes TOAST tables in case the toast table has older rows
         tabquery = """WITH tabfreeze AS (
                 SELECT pg_class.oid::regclass AS full_table_name,
+                nspname, pg_class.relname,
                 greatest(age(pg_class.relfrozenxid), age(toast.relfrozenxid)) as freeze_age,
                 pg_relation_size(pg_class.oid) as table_bytes
             FROM pg_class JOIN pg_namespace ON pg_class.relnamespace = pg_namespace.oid
@@ -264,7 +282,7 @@ for db in dblist:
                 AND nspname NOT LIKE 'pg_temp%'
                 AND pg_class.relkind = 'r'
             )
-            SELECT full_table_name
+            SELECT full_table_name, nspname, relname
             FROM tabfreeze
             WHERE freeze_age > {0}
             AND table_bytes >= {1} * 2 ^ 20
@@ -274,23 +292,26 @@ for db in dblist:
     cur.execute(tabquery)
     verbose_print("getting list of tables")
 
-    table_resultset = cur.fetchall()
-    tablist = map(lambda row: row[0], table_resultset)
+    # rows of (regclass text, schema name, table name); see table_named_in()
+    tablist = cur.fetchall()
 
     #if only one table is desired
     if args.table:
-      if args.table not in tablist:
+      # a bare name can match in more than one schema; all of them are kept
+      tablist = [tabrow for tabrow in tablist if table_named_in([args.table], tabrow)]
+      if not tablist:
          print("specified single table {0} was not found (or excluded) in database {1}".format(args.table, db))
          continue
-         
-      tablist = [args.table]
+
     # for each table in list
-    for table in tablist:
-        if db in database_table_map and table in database_table_map[db]:
+    for tabrow in tablist:
+        # the regclass text: used for all output and as the VACUUM target
+        table = tabrow[0]
+        if db in database_table_map and table_named_in(database_table_map[db], tabrow):
             debug_print("skipping table {t} in database {d} per --exclude-table-in-database argument".format(t=table, d=db))
             continue
     # check time; if overtime, exit
-        elif args.tables_to_exclude and (table in args.tables_to_exclude):
+        elif args.tables_to_exclude and table_named_in(args.tables_to_exclude, tabrow):
             verbose_print(
                 "skipping table {t} per --exclude-table argument".format(t=table))
             continue
@@ -315,7 +336,12 @@ for db in dblist:
         if not args.skip_analyze:
             exquery += "ANALYZE "
         
-        exquery += '"%s"' % table
+        # The regclass text is already valid SQL for this session: the server
+        # schema-qualifies it when the schema is not on the search_path and
+        # double-quotes each part that needs it.  It must go in unmodified;
+        # wrapping it in quotes again turns sales.orders into a single
+        # (nonexistent) name and "Orders" into an invalid identifier.
+        exquery += table
 
         verbose_print("%s in database %s" % (exquery, db,))
         excur = conn.cursor()
