@@ -3,7 +3,7 @@
 flexible-freeze is one Python script, `scripts/flexible_freeze.py`, that runs
 `VACUUM ([FREEZE,] [ANALYZE,] [TRUNCATE false,] SKIP_LOCKED)` table by table inside a time
 window (as a superuser on PostgreSQL 14 or later, a table's TOAST table by a
-statement of its own; see the invariants). PostgreSQL 12 is the oldest server it supports (CI covers 14-18) and
+statement of its own; see the invariants and ADR 0019). PostgreSQL 12 is the oldest server it supports (CI covers 14-18) and
 Python 3.11 the oldest interpreter (ADR 0018). It is a
 top-to-bottom script: there is no `main()`, and argument parsing, signal
 registration and the whole run execute at import. It cannot be imported.
@@ -12,14 +12,14 @@ registration and the whole run execute at import. It cannot be imported.
 
 | Component | Responsibility | Entry points |
 |---|---|---|
-| Argument parsing | Options, defaults, the per-database exclusion map, the checks made after parsing (one of them between two options: `--system-catalogs` with `--no-freeze`); `--version`, which argparse answers itself before anything connects | module level, `parser`, `args`, `database_table_map`, `__version__` |
+| Argument parsing (ADR 0021) | Options, defaults, the per-database exclusion map, the checks made after parsing (one of them between two options: `--system-catalogs` with `--no-freeze`); `--version`, which argparse answers itself before anything connects | module level, `parser`, `args`, `database_table_map`, `__version__` |
 | Output | Progress, verbose and debug printing; failure reports, which go to stderr and to the log file; password masking | `_print`, `verbose_print`, `failure_print`, `debug_print`, `stamped`, `log_file`, `args_for_display` |
 | Connection | The only place a connection is made; sets autocommit and an empty `search_path` | `dbconnect` |
 | Statements (ADR 0017) | The only place a statement is sent; appends the `--comment` text, which `comment_text` has vetted at argument parsing | `execute`, `comment_text` |
 | Name matching | Compares a user-supplied table name with a table: in Python for the exclusions, in SQL for `--table` | `table_named_in`, `TABLE_NAME_MATCH_SQL` (in `TABLE_LOOKUP_QUERY` and `TABLE_KIND_QUERY`) |
-| Database list (ADR 0013) | `-d`, in the order given, else every connectable non-template database in `pg_database`, by the greater of XID and MultiXact age, read via the `postgres` database in a session with the run's `lock_timeout`; a failure to connect or to read the list is reported with `failure_print` and ends the run (exit 1) | module level, `dblist` |
+| Database list (ADR 0020) | `-d`, in the order given, else every connectable non-template database in `pg_database`, by the greater of XID and MultiXact age, read via the `postgres` database in a session with the run's `lock_timeout`; a failure to connect or to read the list is reported with `failure_print` and ends the run (exit 1) | module level, `dblist` |
 | Table selection (ADR 0012) | Three queries: freeze mode (by the greater of XID and MultiXact age; with `--system-catalogs` the system schemas too), `--no-freeze` mode (by dead-tuple fraction), and the `--table` lookup, which replaces either; when that lookup finds no table, a second one asks whether the name is a partitioned table, a foreign table or a view, for the message only | module level, `tabquery`, `system_schema_filter`, `FREEZE_AGE_SQL`, `TABLE_LOOKUP_QUERY`, `TABLE_KIND_QUERY`, `UNVACUUMABLE_KINDS` |
-| Vacuum loop | Exclusions, pause, time check, `statement_timeout`, VACUUM (one statement, or the table's and its TOAST table's: issue #64), server messages | module level, `for db in dblist`, `TOAST_SPLIT_QUERY`, `vacuums` |
+| Vacuum loop | Exclusions, pause, time check, `statement_timeout`, VACUUM (one statement, or the table's and its TOAST table's: ADR 0019), server messages | module level, `for db in dblist`, `TOAST_SPLIT_QUERY`, `vacuums` |
 | Lock handling (ADR 0014, 0015) | `SKIP_LOCKED` on every VACUUM; the session's `lock_timeout` (`--lock-timeout`); one advisory lock per database against overlapping runs (`--no-advisory-lock`), and when it is refused a lookup that names its holders | `ADVISORY_LOCK_KEY`, `ADVISORY_LOCK_HOLDER_QUERY`, `advisory_lock_holders_report`, `APPLICATION_NAME`, the session settings and `vacuum_options` in the database loop |
 | Run outcome (ADR 0009) | What was and was not done; the only input to the summary and the exit status | `RunOutcome`, `outcome`, the summary block at the end of the file |
 | Interruption (ADR 0011) | SIGINT, SIGTERM and SIGHUP (the last only if it was not already ignored when the script started): the handler records the signal; the psycopg2 wait callback cancels the running statement and applies `connect_timeout`; the pause ends early; a second signal stops waiting for the server | `signal_handler`, `interrupt_signal`, `interrupt_repeated`, `wait_for_server`, `pause`, `exit_if_interrupted` |
@@ -52,7 +52,8 @@ registration and the whole run execute at import. It cannot be imported.
   name is one thing when a table is looked for and another when its kind is
   reported.
 - **`TABLE_KIND_QUERY` is sent only when `TABLE_LOOKUP_QUERY` returned no
-  row, and its rows are never vacuumed.** Breaks: sent every time, a run
+  row (with or without `-v`, though only `-v` prints what it finds), and its
+  rows are never vacuumed (ADR 0007).** Breaks: sent every time, a run
   that finds its table issues a statement it did not before; fed into the
   table list, a view or a foreign table gets a VACUUM the server declines
   and a partitioned table one that vacuums every partition unasked.
@@ -104,7 +105,7 @@ registration and the whole run execute at import. It cannot be imported.
 - **A table with a TOAST table is vacuumed with two statements exactly when
   `TOAST_SPLIT_QUERY` (sent once per database session, after `SET
   lock_timeout`) returns true: server 14 or later and `USAGE` on schema
-  `pg_toast`, in practice a superuser (issue #64).** The parent's statement
+  `pg_toast`, in practice a superuser (ADR 0019).** The parent's statement
   gets `PROCESS_TOAST false`, and the TOAST table's (`pg_toast.pg_toast_NNNN`)
   follows it with the same options otherwise; nothing is sent between them,
   and none is sent after a parent that drew a message. Otherwise the single
@@ -127,7 +128,7 @@ registration and the whole run execute at import. It cannot be imported.
   outside that `try` can outlive the database's work.
 - **SIGHUP gets the handler only if it is not already ignored when the
   script starts** (`signal.getsignal` is not `SIG_IGN`), and only where the
-  platform has the signal. Breaks: registered unconditionally, a run
+  platform has the signal (ADR 0011). Breaks: registered unconditionally, a run
   started with `nohup` is stopped by the hangup it was protected from.
 - **The signal handler only assigns `interrupt_signal` and
   `interrupt_repeated`.** It can run between any two bytecodes (ADR 0011).
@@ -164,7 +165,7 @@ registration and the whole run execute at import. It cannot be imported.
   host or port option, or carries a connection keyword, is refused). That
   is safe because libpq uses the port only to pick a socket inside that
   private directory, and every `PG*` variable is stripped; the reasoning
-  is in `ff_command`'s docstring. Breaks: the same freedom given to the host, or to arguments,
+  is in `ff_command`'s docstring (ADR 0008). Breaks: the same freedom given to the host, or to arguments,
   lets a test reach a real server.
 
 ## Landmines
@@ -176,7 +177,7 @@ registration and the whole run execute at import. It cannot be imported.
 - A database in which another session holds the advisory lock is one more
   skipped database: same list in the summary, same exit status 1, with the
   reason in the line printed when it is skipped. Any role that can connect
-  can hold the key; nothing checks (ADR 0015). So when
+  can hold the key; nothing checks (ADR 0015 and its addendum). So when
   `pg_try_advisory_lock` returns false, and only then,
   `ADVISORY_LOCK_HOLDER_QUERY` asks `pg_locks` (left join
   `pg_stat_activity`) for the holders, and the line names each: pid, role,
@@ -200,7 +201,7 @@ registration and the whole run execute at import. It cannot be imported.
   "failed", and costs no wait. A lock timeout during a VACUUM is "failed".
   A lock timeout during the listing skips the database.
 - `SKIP_LOCKED` reports a skipped table with a WARNING, but not a TOAST
-  table skipped along with its parent. Superuser runs on 14 or later name
+  table skipped along with its parent (ADR 0019). Superuser runs on 14 or later name
   the TOAST table in a statement of its own and so see the WARNING; the
   report line names both, and the parent is what is recorded. Every other
   run (any other role, or a server before 14) still has the gap: the
@@ -220,7 +221,7 @@ registration and the whole run execute at import. It cannot be imported.
   in the session that reads the database list. A lock timeout there ends
   the run before it has begun (exit 1); in a database's table listing it
   skips that database.
-- Reading the database list is all or nothing: a failed connection, a
+- Reading the database list is all or nothing (ADR 0020): a failed connection, a
   failed `SET lock_timeout`, a failed query or a failed fetch is reported
   with `failure_print` ("Could not list databases: ...") and exits 1. The
   query and the fetch share one `try`; the message for both says "query".
@@ -282,7 +283,10 @@ registration and the whole run execute at import. It cannot be imported.
   as the default port. `args.dbport` is the text as given, not a number,
   because libpq is handed the list as text; `--debug` shows it quoted.
   The number of ports is not compared with the number of hosts; libpq
-  does that when it connects.
+  does that when it connects. These parse-time checks, `--costlimit`'s
+  floor of 1 and the refusal of `db..t` are approximate by design; ADR
+  0021 lists what they let through (upper bounds, `db.schema.`,
+  `db.schema..t`, `-T ""`).
 - Test files may not contain the default port's number as a literal
   (`test_test_files_do_not_bypass_the_harness`); port tests use other
   numbers.
@@ -340,7 +344,7 @@ registration and the whole run execute at import. It cannot be imported.
 - The wait callback is process-wide in psycopg2 and changes how every query
   and connection attempt waits, not only VACUUM.
 - The default database list is every database with `datallowconn` and not
-  `datistemplate`, `postgres` included. The list is still read through a
+  `datistemplate`, `postgres` included (ADR 0020). The list is still read through a
   connection to `postgres`.
 - The default list is ordered by
   `greatest(age(datfrozenxid), mxid_age(datminmxid))`, oldest first, the
@@ -352,12 +356,13 @@ registration and the whole run execute at import. It cannot be imported.
   0012, which superseded 0003).
 - `--freezeage` is compared with one number per table, `FREEZE_AGE_SQL`: the
   greatest of the XID age and the MultiXact age of the table and of its
-  TOAST table. `--minsizemb` is compared with `pg_table_size`, in both
-  modes.
+  TOAST table, strictly (`>`: an age equal to `--freezeage`, 0 included, is
+  not selected; ADR 0012, addendum). `--minsizemb` is compared with
+  `pg_table_size`, in both modes.
 - Both selections leave out `pg_catalog`, `information_schema` and the
   temporary schemas, and neither selects partitioned tables.
   `--system-catalogs` lifts the first two for the freeze selection, and
-  only that: the condition on those two schemas becomes `true`
+  only that (ADR 0012, addendum): the condition on those two schemas becomes `true`
   (`system_schema_filter`) and the rest of the statement is untouched, so
   thresholds, order and exclusions apply to a catalog as to any table.
   Without the option the statement is byte for byte what it was before
@@ -415,7 +420,7 @@ loops break at their next test of `interrupt_signal`, closing the connection
 
 ## Where to change X
 
-- Release a version: change `__version__` in the script (the one place the
+- Release a version (ADR 0022): change `__version__` in the script (the one place the
   number is written), add a section to `CHANGELOG.md`, and change the line
   `--version` is expected to print in `tests/test_arguments.py`. The owner
   tags; nothing here does.

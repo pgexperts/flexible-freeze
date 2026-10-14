@@ -13,6 +13,8 @@ The script needs Python 3.11 or newer (it checks) and psycopg2 2.9 or later, bel
 
 which builds psycopg2 from source and so needs `pg_config` (from your PostgreSQL client development package) and a C compiler.  Where that is impractical, `pip install "psycopg2-binary>=2.9,<3"` installs a prebuilt copy of the same module as a convenience.  The psycopg2 documentation advises the source distribution for production use, because the binary package carries its own libpq and libssl, which upgrading the system's libraries does not update.  Install one of the two, not both.  The test suite uses `psycopg2-binary`; see "Running the tests", below.
 
+The current version is 0.7 (`flexible_freeze.py --version` prints it); `CHANGELOG.md` lists what changed since 0.6, and `docs/adr/` records why.
+
 /scripts/flexible_freeze.py
 ---------------------------
 
