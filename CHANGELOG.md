@@ -39,6 +39,7 @@ Everything below is relative to 0.6.  The reasons are in `docs/adr/`.
 - Freeze mode orders and thresholds tables by the greatest XID or MultiXact age of the table and its TOAST table, selects materialized views, has no 1000-table cap, and measures `--minsizemb` with `pg_table_size`.
 - `--table` ignores the age, size and dead-row thresholds, finds a table in any schema, and refuses an empty value.
 - `-T` refuses an empty or blank value with exit status 2, instead of excluding nothing (an unset variable in a cron entry left the table it was meant to protect unprotected); `--exclude-table-in-database` likewise refuses `db.schema.` and `db.schema..t`.
+- `-T`, `--table` and the table part of `--exclude-table-in-database` refuse a value with leading or trailing whitespace, with exit status 2, instead of matching nothing; the value is not stripped, and a name that really has such whitespace is given in its quoted form, as in `sales." orders"` (#102).
 - `--table` naming a view, foreign table or partitioned table says what it is and that the script cannot vacuum it, instead of saying it does not exist.
 - Tables are vacuumed by their schema-qualified name as the server prints it; `-T`, `--exclude-table-in-database` and `--table` match a bare or a `schema.table` name.
 - Without `--enforce-time` each operation is preceded by `SET statement_timeout = 0`; with it, a vacuum cancelled at the time limit is a normal stop (exit 0) that names the table.  When a table's TOAST table is vacuumed by a statement of its own, that statement gets a `statement_timeout` of its own, reckoned from the time then left, so the pair no longer gets the full remaining time twice.
@@ -51,6 +52,7 @@ Everything below is relative to 0.6.  The reasons are in `docs/adr/`.
 ### Fixes
 
 - An empty entry in `-d` (a doubled or trailing comma) no longer raises an exception.
+- `--exclude-table-in-database` accepts a quoted table name with dots in it, such as `db.public."a..b"`; the dots inside the quotes no longer count as the empty parts that were refused (#102).
 - A schema whose name merely resembles a temporary schema's (`pgxtemp`, `"pg-temp"`) is no longer left out of the selection or hidden from `--table`; the temporary schemas are matched exactly (`pg_temp_N`, `pg_toast_temp_N`).
 - With `-v`, a failed write to standard output while vacuuming a TOAST table is no longer reported as that table failing.
 - The dead-row percentage used by `--no-freeze` is calculated correctly.

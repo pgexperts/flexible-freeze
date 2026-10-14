@@ -357,6 +357,27 @@ def test_empty_exclude_table_is_rejected_before_connecting(db, cluster, run_ff, 
     assert db.frozen_since(before) == set()
 
 
+@pytest.mark.parametrize("option", ["-T", "--exclude-table", "--table", "-st"])
+@pytest.mark.parametrize("value", [" orders", "orders ", "\torders\n"])
+def test_table_name_with_surrounding_whitespace_is_rejected(
+    db, cluster, run_ff, option, value
+):
+    # Matching is exact, so a padded name would match nothing and be vacuumed
+    # without a word.  It is refused, not stripped: a table really named
+    # " orders" stays reachable through its quoted form (ADR 0021).
+    db.create_table("orders")
+    before = db.frozenxids()
+    mark = cluster.log_offset()
+
+    result = run_ff(*FREEZE_ALL, option, value)
+
+    assert_rejected(result, cluster, mark)
+    assert (
+        "argument must not have leading or trailing whitespace"
+    ) in result.stderr
+    assert db.frozen_since(before) == set()
+
+
 def test_st_is_still_accepted_for_table(db, run_ff):
     db.create_table("t")
     db.create_table("t_other")
@@ -406,6 +427,44 @@ def test_exclude_table_in_database_rejects_an_empty_schema_part(cluster, run_ff)
 def test_exclude_table_in_database_rejects_an_empty_qualified_part(cluster, run_ff, value):
     # Like 'db..t', these could match a table whose relname contains a dot;
     # they are refused for consistency (ADR 0021).
+    mark = cluster.log_offset()
+
+    result = run_ff(*FREEZE_ALL, "--exclude-table-in-database", value)
+
+    assert_rejected(result, cluster, mark)
+    assert (
+        f"invalid argument '{value}' to flag --exclude-table-in-database: "
+        "argument must be of the form DATABASE.TABLE"
+    ) in result.stderr
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["somedb. orders", "somedb.orders ", "somedb.\torders", "somedb.orders\n"],
+    ids=["leading", "trailing", "tab", "newline"],
+)
+def test_exclude_table_in_database_rejects_a_padded_table_part(
+    cluster, run_ff, value
+):
+    mark = cluster.log_offset()
+
+    result = run_ff(*FREEZE_ALL, "--exclude-table-in-database", value)
+
+    assert_rejected(result, cluster, mark)
+    assert (
+        f"invalid argument '{value}' to flag --exclude-table-in-database: "
+        "table name must not have leading or trailing whitespace"
+    ) in result.stderr
+
+
+@pytest.mark.parametrize(
+    "value",
+    ['somedb.."a..b"', 'somedb."a..b".'],
+    ids=["empty-schema", "trailing"],
+)
+def test_quoting_does_not_hide_an_empty_part(cluster, run_ff, value):
+    # The dots inside the quotes are not separators, but the dot outside
+    # them still splits off an empty part, which is refused as before.
     mark = cluster.log_offset()
 
     result = run_ff(*FREEZE_ALL, "--exclude-table-in-database", value)

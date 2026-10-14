@@ -85,3 +85,18 @@ follow the `db..t` precedent: under the bare-relname matching of ADR 0007 they
 could match a table literally named `schema.` or `schema..t`, and such an odd
 legal name is now unnameable in this option, as `.t` already was. The other
 residuals (upper bounds, the `-p`/`-H` count) stand.
+
+## Addendum (2026-10-14)
+
+`-T`, `--exclude-table` and `--table` (and its older spelling `-st`) refuse a
+value with leading or trailing whitespace, with exit 2, as they refuse an
+empty one. The value is not stripped: matching is exact, so the stripped name
+would be a different table from the one written. A table whose name really
+begins or ends with whitespace is reached through its quoted form, for example
+`sales." orders"`. The table part of `--exclude-table-in-database` is refused
+for surrounding whitespace in the same way.
+
+The empty-part check of `--exclude-table-in-database` is quote-aware: a dot
+inside a double-quoted identifier does not split the table part, so
+`db.public."a..b"` names the table `a..b` and is accepted, while `db.."a..b"`
+is still refused for its empty schema part.

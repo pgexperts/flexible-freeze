@@ -287,8 +287,9 @@ registration and the whole run execute at import. It cannot be imported.
   text ending in `/` is safe; psycopg2's own `SET datestyle` is the one
   statement without the comment; `-v` prints the VACUUM without it; a
   comment the client encoding cannot encode fails in `dbconnect()`.
-- An empty or blank `--table` is refused at argument parsing (exit 2,
-  `non_empty_table`, ADR 0007); the option is tested against `None`.
+- An empty, blank or whitespace-padded `--table` is refused at argument
+  parsing (exit 2, `non_empty_table`, ADR 0007, ADR 0021). The value is never
+  stripped, since matching is exact; the option is tested against `None`.
 - `-p` is one port or a comma-separated list, each from 1 to 65535
   (`port_list`); an empty value or entry is refused (exit 2), never read
   as the default port. `args.dbport` is the text as given, not a number,
@@ -296,9 +297,12 @@ registration and the whole run execute at import. It cannot be imported.
   The number of ports is not compared with the number of hosts; libpq
   does that when it connects. These parse-time checks, `--costlimit`'s
   floor of 1 and the refusal of an empty part in the table portion of
-  `--exclude-table-in-database` (`db..t`, `db.schema.`, `db.schema..t`)
-  are approximate by design; ADR 0021 lists what they let through (upper
-  bounds, the `-p`/`-H` count). `-T` takes `non_empty_table` like `--table`.
+  `--exclude-table-in-database` (`db..t`, `db.schema.`, `db.schema..t`;
+  the split is `split_outside_quotes`, so dots inside double quotes do not
+  split) and the refusal of surrounding whitespace in that portion are
+  approximate by design; ADR 0021 lists what they let through (upper
+  bounds, the `-p`/`-H` count). `-T` takes `non_empty_table` like `--table`,
+  with the same whitespace refusal.
 - Test files may not contain the default port's number as a literal
   (`test_test_files_do_not_bypass_the_harness`); port tests use other
   numbers.

@@ -256,6 +256,41 @@ def test_exclude_table_in_database_still_matches_the_printed_name(make_db, run_f
     assert two.frozen_since(before_two) == set(tables)
 
 
+@pytest.mark.parametrize("schema", ["sales", "public"])
+def test_exclude_table_in_database_quoted_name_with_two_dots(
+    make_db, run_ff, schema
+):
+    # The dots inside the quotes do not split the table part, so "a..b" is
+    # one name and its quoted form excludes it in this database only.
+    one, two = make_db("one"), make_db("two")
+    tables = [(schema, "a..b"), T_KEEP]
+    for database in (one, two):
+        build(database, *tables)
+    before_one, before_two = one.frozenxids(), two.frozenxids()
+
+    result = run_ff(
+        *FREEZE_ALL,
+        "--exclude-table-in-database", f'{one.name}.{schema}."a..b"',
+        "-d", f"{one.name},{two.name}",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert one.frozen_since(before_one) == {T_KEEP}
+    assert two.frozen_since(before_two) == set(tables)
+
+
+def test_exclude_table_quoted_form_reaches_a_padded_name(db, run_ff):
+    # A table named " orders" is excluded by its quoted form.  The bare
+    # spelling with the space is refused at parse time (ADR 0021).
+    build(db, ("sales", " orders"), T_KEEP)
+    before = db.frozenxids()
+
+    result = run_ff(*FREEZE_ALL, "-T", 'sales." orders"', "-d", db.name)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert db.frozen_since(before) == {T_KEEP}
+
+
 def test_exclude_table_in_database_given_twice_for_one_database(make_db, run_ff):
     # Each occurrence adds to the database's list rather than replacing it;
     # one is qualified and one bare, to show the forms can be mixed.
