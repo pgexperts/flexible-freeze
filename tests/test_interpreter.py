@@ -17,7 +17,7 @@ import pytest
 NO_SUCH_DB = "ff_no_such_database"
 
 # What the script's check and its message have to agree on.
-MINIMUM = (3, 10)
+MINIMUM = (3, 11)
 
 
 def hexversion(major, minor, micro):

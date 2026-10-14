@@ -28,8 +28,8 @@ def timestamp():
     now = time.time()
     return time.strftime("%Y-%m-%d %H:%M:%S %Z")
 
-if sys.hexversion < 0x30A0000:
-    print("At least Python 3.10 required; you have %s" % sys.version, file=sys.stderr)
+if sys.hexversion < 0x30B0000:
+    print("At least Python 3.11 required; you have %s" % sys.version, file=sys.stderr)
     exit(1)
 
 # argparse type for the options that are counts, sizes or durations.  A

@@ -11,7 +11,7 @@ This script is designed for doing VACUUM FREEZE or VACUUM ANALYZE
 runs on your database during known slow traffic periods. Takes a
 timeout so that it won't overrun your slow traffic period.
 
-Requires Python 3.10 or later (the script checks).  The test suite and CI run on Python 3.13.
+Requires Python 3.11 or later (the script checks).  The test suite and CI run on Python 3.13.
 
 Requires PostgreSQL 12 or later: every `VACUUM` is sent with `SKIP_LOCKED`, which older versions do not have.  CI tests PostgreSQL 14 through 18; versions 12 and 13 are supported but not tested.
 

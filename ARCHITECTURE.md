@@ -3,7 +3,7 @@
 flexible-freeze is one Python script, `scripts/flexible_freeze.py`, that runs
 `VACUUM ([FREEZE,] [ANALYZE,] SKIP_LOCKED)` table by table inside a time
 window. PostgreSQL 12 is the oldest server it supports (CI covers 14-18) and
-Python 3.10 the oldest interpreter. It is a
+Python 3.11 the oldest interpreter. It is a
 top-to-bottom script: there is no `main()`, and argument parsing, signal
 registration and the whole run execute at import. It cannot be imported.
 
@@ -244,7 +244,7 @@ loops break at their next test of `interrupt_signal`, closing the connection
 
 - Add or change an option: the `parser.add_argument` block; mirror it in the
   usage block of `README.md`, which is a pasted copy of `--help` (regenerate it with
-  `COLUMNS=130 python scripts/flexible_freeze.py --help` on Python 3.10 to
+  `COLUMNS=130 python scripts/flexible_freeze.py --help` on Python 3.11 or
   3.12; 3.13 prints each option's value name once, so its output differs).
 - Change which tables are selected: the two `tabquery` strings. Keep the
   three leading columns. What `--table` can find is `TABLE_LOOKUP_QUERY`.
