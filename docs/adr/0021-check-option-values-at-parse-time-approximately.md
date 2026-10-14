@@ -73,3 +73,15 @@ Residuals, accepted and documented here:
 - `-T ""` is accepted and excludes nothing.
 - A `-p` list whose length does not fit the `-H` list is found only when
   libpq connects, as a connection failure, not as exit 2.
+
+## Addendum (2026-10-13)
+
+Three of the residuals above are now refused at parse time (exit 2): `-T` /
+`--exclude-table` with an empty or blank value (it takes the same type as
+`--table`), and `--exclude-table-in-database` with an empty part anywhere in
+the table portion (`db.schema.`, `db.schema..t`). The `-T ""` case silently
+unprotects a table, as with an unset variable in a cron entry. The dotted cases
+follow the `db..t` precedent: under the bare-relname matching of ADR 0007 they
+could match a table literally named `schema.` or `schema..t`, and such an odd
+legal name is now unnameable in this option, as `.t` already was. The other
+residuals (upper bounds, the `-p`/`-H` count) stand.
