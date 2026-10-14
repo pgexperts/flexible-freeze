@@ -149,6 +149,14 @@ def test_zero_costlimit_is_rejected_before_connecting(cluster, run_ff):
     assert "argument --costlimit: must be at least 1: '0'" in result.stderr
 
 
+def test_costlimit_of_one_is_accepted(run_ff):
+    # The smallest value the server takes; 0 is the first one refused.
+    result = run_ff("--costlimit", "1", "-d", NO_SUCH_DB)
+
+    assert f"skipping database {NO_SUCH_DB} (couldn't connect: " in result.stderr
+    assert "usage:" not in result.stderr
+
+
 def test_non_integer_value_keeps_the_usual_argparse_message(cluster, run_ff):
     mark = cluster.log_offset()
 
