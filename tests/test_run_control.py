@@ -1,11 +1,13 @@
 # Characterization tests for how a run is bounded and reported: connection
 # options and failures, the time limit, the log file and debug output.
 #
-# One thing is deliberately left unpinned because it is an open question
-# (issue #40), not settled behaviour: which stream an error message goes to.
-# Such messages are looked for in stdout and stderr together (see `output`).
+# Which stream a message goes to is settled (issue #40): a report of a
+# failure is on stderr, everything else on stdout or in the log file.  The
+# tests here assert on the stream each message belongs on; the rule itself,
+# and the log file's share of the failure reports, is in
+# test_output_streams.py.
 #
-# The exit status is settled: 0 for a complete run and for one that stopped
+# The exit status is settled too: 0 for a complete run and for one that stopped
 # at its time limit, 1 when work was missed.  The cases where work is missed
 # are in test_run_outcome.py.
 
@@ -27,7 +29,7 @@ def test_unreachable_database_is_skipped_and_the_run_continues(db, run_ff):
     result = run_ff(*FREEZE_ALL, "-d", f"ff_no_such_database,{db.name}")
 
     assert result.returncode == 1
-    assert "skipping database ff_no_such_database (couldn't connect: " in output(result)
+    assert "skipping database ff_no_such_database (couldn't connect: " in result.stderr
     assert "Traceback" not in result.stderr
     assert db.frozen_since(before) == {T1}
 
@@ -102,7 +104,8 @@ def test_unwritable_logfile_is_reported_and_nothing_runs(db, run_ff, tmp_path):
     )
 
     assert result.returncode == 1
-    assert "could not open logfile: " in output(result)
+    assert "could not open logfile: " in result.stderr
+    assert result.stdout == ""
     assert db.frozen_since(before) == set()
     assert db.script_statements() == []
 
@@ -160,7 +163,8 @@ def test_failure_to_list_databases_is_fatal(cluster, run_ff):
     assert result.returncode == 1
     assert (
         "Could not list databases: connection to database postgres failed: "
-        in output(result)
+        in result.stderr
     )
+    assert result.stdout == ""
     assert "Traceback" not in result.stderr
     assert cluster.statements(since=mark) == []

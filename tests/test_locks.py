@@ -207,24 +207,67 @@ def test_locked_table_is_skipped_and_reported_and_the_run_continues(
     assert one.frozen_since(before_one) == {("public", "t_next")}
     assert two.frozen_since(before_two) == {("public", "t_other")}
 
+    # The report is a failure report and so on stderr; the progress lines
+    # stay on stdout (test_output_streams.py has the rule).
     lines = result.stdout.splitlines()
-    report = lines.index(
+    failures = result.stderr.splitlines()
+    report = failures.index(
         "VACUUMing public.t_locked drew a message from the server; "
         "not counting it as vacuumed."
     )
     # The server's own text follows, as received.  Only its presence is
     # asserted on: the wording is translated and differs between versions.
-    assert lines[report + 1].startswith("WARNING:")
-    assert '"t_locked"' in lines[report + 1]
+    assert failures[report + 1].startswith("WARNING:")
+    assert '"t_locked"' in failures[report + 1]
     # Skipped is not failed.
-    assert "VACUUMing public.t_locked failed." not in lines
-    assert "lock timeout" not in result.stdout
-    assert not [line for line in lines if line.startswith("Tables that failed")]
+    assert "VACUUMing public.t_locked failed." not in lines + failures
+    assert "lock timeout" not in result.stdout + result.stderr
+    assert not [
+        line for line in lines + failures if line.startswith("Tables that failed")
+    ]
     assert "All tables vacuumed." not in lines
+    assert_lines_in_order(
+        result.stderr,
+        [
+            "Not all tables were vacuumed.",
+            f"Tables not counted as vacuumed: public.t_locked in database {one.name}",
+        ],
+    )
     assert_lines_in_order(
         result.stdout,
         [
             "processing table public.t_locked",
+            "processing table public.t_next",
+            f"working on database {two.name}",
+            "2 tables in 2 databases",
+            "Flexible Freeze run complete",
+        ],
+    )
+
+
+def test_locked_table_is_reported_where_it_happened(make_db, run_ff):
+    # The same run with both streams on one pipe.  Two pipes cannot show
+    # where in the run the report was written: after the line for its own
+    # table and before the line for the next, and in the summary before the
+    # count.
+    one, two = make_db("one"), make_db("two")
+    one.create_table("t_locked")
+    one.create_table("t_next")
+    two.create_table("t_other")
+
+    with lock_held(one, "LOCK TABLE public.t_locked IN SHARE UPDATE EXCLUSIVE MODE"):
+        result = run_ff(
+            *FREEZE_ALL, "-v", "-d", f"{one.name},{two.name}", timeout=PROMPT,
+            merge_streams=True,
+        )
+
+    assert result.returncode == 1
+    assert_lines_in_order(
+        result.stdout,
+        [
+            "processing table public.t_locked",
+            ("VACUUMing public.t_locked drew a message from the server; "
+             "not counting it as vacuumed."),
             "processing table public.t_next",
             f"working on database {two.name}",
             "Not all tables were vacuumed.",
@@ -242,8 +285,8 @@ def test_locked_table_report_without_verbose(db, run_ff):
         result = run_ff(*FREEZE_ALL, "--no-analyze", "-d", db.name, timeout=PROMPT)
 
     assert result.returncode == 1
-    assert result.stderr == ""
-    lines = result.stdout.splitlines()
+    assert result.stdout == ""
+    lines = result.stderr.splitlines()
     # One message from the server: with ANALYZE in the statement there would
     # be a second, for the analyze it skips as well.
     assert len(lines) == 4
@@ -281,12 +324,13 @@ def test_vacuum_waiting_for_a_lock_other_than_the_tables_fails_at_the_timeout(
     # It did wait, for as long as it was told to.
     assert elapsed >= 2
     assert db.frozen_since(before) == {("public", "t_next")}
-    assert result.stdout.splitlines() == [
+    assert result.stderr.splitlines() == [
         "VACUUMing public.t_indexed failed.",
         "canceling statement due to lock timeout",
         "Not all tables were vacuumed.",
         f"Tables that failed: public.t_indexed in database {db.name}",
     ]
+    assert result.stdout == ""
 
 
 # -- the lock timeout ---------------------------------------------------------
@@ -340,15 +384,16 @@ def test_blocked_table_listing_ends_at_the_lock_timeout(make_db, run_ff):
     assert (
         f"skipping database {one.name} (couldn't list its tables: "
         "canceling statement due to lock timeout"
-    ) in result.stdout
+    ) in result.stderr
     assert_lines_in_order(
-        result.stdout,
+        result.stderr,
         [
-            f"working on database {two.name}",
             "Not all tables were vacuumed.",
             f"Databases skipped or left unfinished: {one.name}",
-            "1 tables in 1 databases",
         ],
+    )
+    assert_lines_in_order(
+        result.stdout, [f"working on database {two.name}", "1 tables in 1 databases"]
     )
 
 
@@ -409,14 +454,19 @@ def test_second_run_skips_the_database_the_first_is_working_on(
             assert one.script_vacuums(since=mark) == []
             assert two.frozen_since(before_two) == {("public", "t_other")}
             assert_lines_in_order(
+                second.stderr,
+                [
+                    skipped_as_held(one),
+                    "Not all tables were vacuumed.",
+                    f"Databases skipped or left unfinished: {one.name}",
+                ],
+            )
+            assert_lines_in_order(
                 second.stdout,
                 [
                     f"working on database {one.name}",
-                    skipped_as_held(one),
                     f"working on database {two.name}",
                     "processing table public.t_other",
-                    "Not all tables were vacuumed.",
-                    f"Databases skipped or left unfinished: {one.name}",
                     # `one` was not listed, so it is not counted.
                     "1 tables in 1 databases",
                     "Flexible Freeze run complete",
@@ -466,8 +516,8 @@ def test_database_whose_advisory_lock_is_held_is_skipped(db, run_ff):
         result = run_ff(*FREEZE_ALL, "-d", db.name, timeout=PROMPT)
 
     assert result.returncode == 1
-    assert result.stderr == ""
-    assert result.stdout.splitlines() == [
+    assert result.stdout == ""
+    assert result.stderr.splitlines() == [
         skipped_as_held(db),
         "Not all tables were vacuumed.",
         f"Databases skipped or left unfinished: {db.name}",

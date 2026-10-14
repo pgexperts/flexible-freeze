@@ -11,7 +11,7 @@ registration and the whole run execute at import. It cannot be imported.
 | Component | Responsibility | Entry points |
 |---|---|---|
 | Argument parsing | Options, defaults, the per-database exclusion map | module level, `parser`, `args`, `database_table_map` |
-| Output | Plain, verbose and debug printing; password masking | `_print`, `verbose_print`, `debug_print`, `args_for_display` |
+| Output | Progress, verbose and debug printing; failure reports, which go to stderr and to the log file; password masking | `_print`, `verbose_print`, `failure_print`, `debug_print`, `stamped`, `log_file`, `args_for_display` |
 | Connection | The only place a connection is made; sets autocommit and an empty `search_path` | `dbconnect` |
 | Name matching | Compares a user-supplied table name with a table: in Python for the exclusions, in SQL for `--table` | `table_named_in`, `TABLE_LOOKUP_QUERY` |
 | Database list | `-d`, else every connectable non-template database in `pg_database`, read via the `postgres` database | module level, `dblist` |
@@ -20,7 +20,7 @@ registration and the whole run execute at import. It cannot be imported.
 | Lock handling | `SKIP_LOCKED` on every VACUUM; the session's `lock_timeout` (`--lock-timeout`); one advisory lock per database against overlapping runs (`--no-advisory-lock`) | `ADVISORY_LOCK_KEY`, the session settings and `vacuum_options` in the database loop |
 | Run outcome | What was and was not done; the only input to the summary and the exit status | `RunOutcome`, `outcome`, the summary block at the end of the file |
 | Interruption | SIGINT and SIGTERM: the handler records the signal; the psycopg2 wait callback cancels the running statement and applies `connect_timeout`; the pause ends early; a second signal stops waiting for the server | `signal_handler`, `interrupt_signal`, `interrupt_repeated`, `wait_for_server`, `pause`, `exit_if_interrupted` |
-| Test harness | Throwaway cluster, the single launcher for the script, catalog and statement-log probes, a clock for the script that tests can move and stop, a socket that never answers | `tests/ffharness.py`, `tests/conftest.py` |
+| Test harness | Throwaway cluster, the single launcher for the script, catalog and statement-log probes, a clock for the script that tests can move and stop, a probe for the files the script left open at exit, a socket that never answers | `tests/ffharness.py`, `tests/conftest.py` |
 
 ## Invariants
 
@@ -50,6 +50,12 @@ registration and the whole run execute at import. It cannot be imported.
   block.
 - **`args.dbpass` is never printed; print `args_for_display()` instead.**
   Breaks: the password lands in stderr or the logfile.
+- **A line about something that makes the exit status non-zero is printed
+  with `failure_print`, everything else with `_print` or `verbose_print`.**
+  The rule is spelled out in the comment above `log_file`. Breaks: printed
+  with `_print`, a failure is on stdout among the progress lines, or with
+  `-l` in the log file alone, and a scheduler that mails stderr reports
+  nothing.
 - **Nothing inside the database and table loops exits; it records in
   `outcome`.** The summary and the exit status are computed once, after the
   loops. Breaks: a `sys.exit` in a loop drops every later table and database
@@ -149,8 +155,27 @@ registration and the whole run execute at import. It cannot be imported.
   by waiting.
 - Without `--enforce-time` the script sets `statement_timeout = 0` on
   purpose (ADR 0005); do not "fix" that by removing it.
-- `-l` rebinds `sys.stdout` to the logfile. Debug output and tracebacks stay
-  on stderr.
+- `-l` rebinds `sys.stdout` to the logfile, which is also kept as
+  `log_file` so that `failure_print` can write a failure report to stderr
+  and to the file. Without `-l` a failure report is on stderr only. Debug
+  output, tracebacks and command-line errors are on stderr only, and the
+  header a run writes at the top of its log is in the log only.
+- `failure_print` writes the logfile copy first. A failed write to stderr
+  (a pipe whose reader has gone) does not end the run: descriptor 2 is
+  pointed at the null device. Catching the error alone is not enough,
+  because the line stays in the stream's buffer and the interpreter's
+  flush at exit then turns the exit status into 120. That only shows when
+  Python buffers stderr, so the tests for it clear `PYTHONUNBUFFERED`. A
+  failed write to stdout or to the logfile is not caught anywhere.
+- The logfile is closed by an `atexit` handler registered where it is
+  opened, not by a close at each exit. It runs on every `sys.exit`,
+  including the two for a signal, and after an uncaught exception; the
+  signal handler itself still does no I/O.
+- Two pipes do not preserve the order of lines written to different
+  streams, so most tests assert on each stream separately;
+  `tests/test_output_streams.py` checks the combined order through the
+  logfile and through one pipe for both (`run_ff(merge_streams=True)`),
+  and the closing of the logfile through `ffharness.OpenFilesProbe`.
 - A signal is acted on by whatever it interrupted, within one wait slice:
   `wait_for_server` cancels the statement with `conn.cancel()` and keeps
   waiting for the server's answer, so the error surfaces from the
@@ -226,7 +251,12 @@ loops break at their next test of `interrupt_signal`, closing the connection
   `tests/test_connection_setup.py`.
 - Add a way for a run to fall short: a field on `RunOutcome`, its term in
   `work_was_missed()`, its line in the summary block, the exit-status table
-  in `README.md`, and `tests/test_run_outcome.py`.
+  in `README.md`, and `tests/test_run_outcome.py`. Print what reports it
+  with `failure_print` and add its scenario to
+  `tests/test_output_streams.py`.
+- Add or change a message: decide by the rule above `log_file` whether it
+  is a failure report (`failure_print`) or not (`_print`, `verbose_print`);
+  the rule is restated under "Where the output goes" in `README.md`.
 - Add a step that can block: make it a psycopg2 call (covered by the wait
   callback) or a sliced wait like `pause`, test `interrupt_signal` first in
   its error handling, and add a case to `tests/test_signals.py`.

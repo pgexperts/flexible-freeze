@@ -164,9 +164,12 @@ def test_wrong_password_is_rejected(cluster, db, make_role, run_ff, password, gi
     result = run_ff(*FREEZE_ALL, "-U", role, "-w", given)
 
     assert result.returncode == 1
-    output = result.stdout + result.stderr
-    assert "Could not list databases: connection to database postgres failed: " in output
-    assert "password authentication failed" in output
+    assert result.stdout == ""
+    assert (
+        "Could not list databases: connection to database postgres failed: "
+        in result.stderr
+    )
+    assert "password authentication failed" in result.stderr
     assert "Traceback" not in result.stderr
     assert db.frozen_since(before) == set()
     assert cluster.statements(since=mark) == []

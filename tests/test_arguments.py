@@ -129,7 +129,7 @@ def test_zero_is_accepted(run_ff, option):
     # rest of stderr is asserted on.
     result = run_ff(option, "0", "-d", NO_SUCH_DB)
 
-    assert f"skipping database {NO_SUCH_DB} (couldn't connect: " in output(result)
+    assert f"skipping database {NO_SUCH_DB} (couldn't connect: " in result.stderr
     assert "usage:" not in result.stderr
 
 

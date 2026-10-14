@@ -13,8 +13,10 @@ Note that this is the time to START a vacuum, so a large table
 may still overrun the vacuum period, unless you use the --enforce-time switch.
 '''
 
+import os
 import time
 import sys
+import atexit
 import signal
 import select
 import argparse
@@ -133,12 +135,79 @@ def verbose_print(some_message):
     if args.verbose:
         return _print(some_message)
 
-def _print(some_message):
+# Where output goes.  There are three kinds, and each message is one of them:
+#
+#   progress and information (_print, verbose_print): standard output, or
+#       the log file instead when -l is given;
+#   failure reports (failure_print): standard error, and the log file as
+#       well when -l is given;
+#   debug output (debug_print): standard error only.
+#
+# A failure report is a line about something that by itself makes the exit
+# status other than 0: a table that failed or that the server declined to
+# vacuum, a database that was skipped or left unfinished, a --table name
+# found in no database, a run that could not start, a run stopped by a
+# signal, and the lines of the closing summary that list any of those.
+# Everything else is progress or information, including what a run chose not
+# to do because it was told to (an excluded table) and a stop at the time
+# limit, which is how a run is meant to end and exits 0.
+#
+# The split is for a run under cron, which mails what a job writes to
+# standard error: with -l a failure used to be in the log alone and the mail
+# was empty; without -l it was on standard output among the progress lines,
+# where a job that discards standard output loses it.  With -l a failure
+# report goes to both places because the log is the full record of the run,
+# in order, and has to read the same whether or not anyone kept the mail.
+# Without -l it is not repeated on standard output: both streams usually
+# reach the same terminal or the same mail, and it would be seen twice.
+#
+# Errors in the command line (exit status 2) are printed straight to
+# standard error where they are found, which is before the log file is
+# opened; they never reach the log.
+
+# The log file opened for -l, or None.  sys.stdout is rebound to the same
+# object, so _print needs no test of its own.
+log_file = None
+
+def stamped(some_message):
     if args.print_timestamps:
-        print("{timestamp}: {some_message}".format(timestamp=timestamp(), some_message=some_message))
-    else:
-        print(some_message)
+        return "{timestamp}: {some_message}".format(timestamp=timestamp(), some_message=some_message)
+    return some_message
+
+def _print(some_message):
+    print(stamped(some_message))
     sys.stdout.flush()
+    return True
+
+# The line is built once, so that with --print-timestamps the two copies of
+# a report carry the same time and can be matched up.  The log file comes
+# first: it is the record, and it should have the line even if the write to
+# standard error then fails (a reader that has gone away).  Each copy is
+# flushed at once, like every other line, so that the two streams read in
+# the order of the run wherever they end up together.
+#
+# A report that cannot be written to standard error (its reader has gone
+# away, most likely) must not end the run: the tables still to come matter
+# more than the notice, and before failure reports went to standard error a
+# run with -l did not depend on that stream at all.
+#
+# Passing over the error is not enough.  The line that could not be written
+# stays in the stream's buffer, the interpreter tries again when it flushes
+# the stream at exit, and when that fails too it replaces the exit status
+# with 120: the one thing a scheduler still had to go by.  (Unless Python
+# runs unbuffered, which is how that goes unnoticed.)  So descriptor 2 is
+# pointed at the null device instead: what is buffered, and every later
+# report, then has somewhere to go, and the exit status stays the run's own.
+def failure_print(some_message):
+    line = stamped(some_message)
+    if log_file is not None:
+        print(line, file=log_file, flush=True)
+    try:
+        print(line, file=sys.stderr, flush=True)
+    except OSError:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stderr.fileno())
+        os.close(devnull)
     return True
 
 # Returns an open connection or raises; it never returns None.  Callers
@@ -209,7 +278,7 @@ def interruption_notice(signum):
 # interrupt ends it there too, with the line the summary would have led with.
 def exit_if_interrupted():
     if interrupt_signal is not None:
-        _print(interruption_notice(interrupt_signal))
+        failure_print(interruption_notice(interrupt_signal))
         sys.exit(128 + interrupt_signal)
 
 # The longest a wait goes without looking at interrupt_signal.  A handler
@@ -519,12 +588,23 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 # start logging to log file, if used
+#
+# The file is closed by an exit handler rather than at each place the script
+# ends.  There are several of those from here on (the exits before the first
+# database, the two at the bottom, an error nobody caught), and a close
+# written at each would be missing from the next one added.  The handler runs
+# on all of them, the exits for a signal included: a signal is only recorded
+# by its handler, and the run then ends through sys.exit like any other.  It
+# does not run if the process is killed outright, which loses nothing that
+# was printed, because every line is flushed as it is written.
 if args.logfile:
     try:
-        sys.stdout = open(args.logfile, 'a')
+        log_file = open(args.logfile, 'a')
     except Exception as ex:
-        _print('could not open logfile: %s' % str(ex))
+        failure_print('could not open logfile: %s' % str(ex))
         sys.exit(1)
+    sys.stdout = log_file
+    atexit.register(log_file.close)
 
     _print('')
     _print('='*40)
@@ -547,7 +627,7 @@ if args.dblist is None:
     except Exception as ex:
         # A connection attempt given up on a signal is not a failed one.
         exit_if_interrupted()
-        _print("Could not list databases: connection to database {d} failed: {e}".format(d=dbname, e=str(ex)))
+        failure_print("Could not list databases: connection to database {d} failed: {e}".format(d=dbname, e=str(ex)))
         sys.exit(1)
 
     cur = conn.cursor()
@@ -568,7 +648,7 @@ if args.dblist is None:
     # Before the test for an empty list: a signal outranks that exit status.
     exit_if_interrupted()
     if not dblist:
-        _print("no databases to vacuum, aborting")
+        failure_print("no databases to vacuum, aborting")
         sys.exit(1)
 else:
     dblist = named_dblist
@@ -609,7 +689,7 @@ for db in dblist:
         # as a skipped database or a failed table, and the run would go on.
         if interrupt_signal is not None:
             break
-        _print("skipping database {d} (couldn't connect: {e})".format(d=db, e=str(err)))
+        failure_print("skipping database {d} (couldn't connect: {e})".format(d=db, e=str(err)))
         outcome.skipped_databases.append(db)
         continue
 
@@ -720,7 +800,7 @@ for db in dblist:
             if args.advisory_lock:
                 cur.execute("SELECT pg_catalog.pg_try_advisory_lock({0})".format(ADVISORY_LOCK_KEY))
                 if not cur.fetchone()[0]:
-                    _print("skipping database {d} (another flexible_freeze run is working on it: advisory lock {k} is held there)".format(d=db, k=ADVISORY_LOCK_KEY))
+                    failure_print("skipping database {d} (another flexible_freeze run is working on it: advisory lock {k} is held there)".format(d=db, k=ADVISORY_LOCK_KEY))
                     outcome.skipped_databases.append(db)
                     continue
 
@@ -732,7 +812,7 @@ for db in dblist:
         except Exception as err:
             if interrupt_signal is not None:
                 break
-            _print("skipping database {d} (couldn't list its tables: {e})".format(d=db, e=str(err).rstrip()))
+            failure_print("skipping database {d} (couldn't list its tables: {e})".format(d=db, e=str(err).rstrip()))
             outcome.skipped_databases.append(db)
             continue
         outcome.databases_listed += 1
@@ -888,8 +968,8 @@ for db in dblist:
                     outcome.cancelled_table = (table, db)
                     break
 
-                _print("VACUUMing %s failed." % table)
-                _print(str(ex).rstrip())
+                failure_print("VACUUMing %s failed." % table)
+                failure_print(str(ex).rstrip())
                 outcome.failed_tables.append((table, db))
 
                 # One table failing says nothing about the next, so the run
@@ -897,7 +977,7 @@ for db in dblist:
                 # No reconnect is attempted: the database is recorded as
                 # unfinished and the next one is started.
                 if conn.closed:
-                    _print("skipping the rest of database {d} (connection lost)".format(d=db))
+                    failure_print("skipping the rest of database {d} (connection lost)".format(d=db))
                     outcome.skipped_databases.append(db)
                     break
             else:
@@ -908,9 +988,9 @@ for db in dblist:
                 # passed on but never examined: it is translated, and worded
                 # differently from one server version to the next.
                 if conn.notices:
-                    _print("VACUUMing %s drew a message from the server; not counting it as vacuumed." % table)
+                    failure_print("VACUUMing %s drew a message from the server; not counting it as vacuumed." % table)
                     for notice in conn.notices:
-                        _print(notice.rstrip())
+                        failure_print(notice.rstrip())
                     outcome.unvacuumed_tables.append((table, db))
                 else:
                     outcome.tables_vacuumed += 1
@@ -927,13 +1007,19 @@ outcome.interrupted_by = interrupt_signal
 
 # did we get through all tables?
 # exit, report results
+#
+# Which of these lines are failure reports follows the rule at
+# failure_print.  The headline of a run that stopped at the time limit is
+# not one, nor is the table that --enforce-time cancelled: that run exits 0
+# unless something else went wrong in it, and what did has a line of its own
+# below.
 if outcome.interrupted_by is not None:
-    _print(interruption_notice(outcome.interrupted_by))
+    failure_print(interruption_notice(outcome.interrupted_by))
     if outcome.interrupted_table and outcome.interrupt_unconfirmed:
-        _print("Work remains: VACUUM of {t} was interrupted; the server did not confirm that it was cancelled, and it may still be running there.".format(
+        failure_print("Work remains: VACUUM of {t} was interrupted; the server did not confirm that it was cancelled, and it may still be running there.".format(
             t=tables_for_display([outcome.interrupted_table])))
     elif outcome.interrupted_table:
-        _print("Work remains: VACUUM of {t} was interrupted.".format(
+        failure_print("Work remains: VACUUM of {t} was interrupted.".format(
             t=tables_for_display([outcome.interrupted_table])))
 elif outcome.time_limited:
     _print("Vacuuming halted due to timeout")
@@ -941,18 +1027,18 @@ elif outcome.time_limited:
         _print("Work remains: VACUUM of {t} was cancelled at the time limit.".format(
             t=tables_for_display([outcome.cancelled_table])))
 elif outcome.work_was_missed():
-    _print("Not all tables were vacuumed.")
+    failure_print("Not all tables were vacuumed.")
 else:
     _print("All tables vacuumed.")
 
 if outcome.failed_tables:
-    _print("Tables that failed: " + tables_for_display(outcome.failed_tables))
+    failure_print("Tables that failed: " + tables_for_display(outcome.failed_tables))
 if outcome.unvacuumed_tables:
-    _print("Tables not counted as vacuumed: " + tables_for_display(outcome.unvacuumed_tables))
+    failure_print("Tables not counted as vacuumed: " + tables_for_display(outcome.unvacuumed_tables))
 if outcome.skipped_databases:
-    _print("Databases skipped or left unfinished: " + ', '.join(outcome.skipped_databases))
+    failure_print("Databases skipped or left unfinished: " + ', '.join(outcome.skipped_databases))
 if outcome.table_found_nowhere():
-    _print("Databases where --table {t} matched no table: {d}".format(
+    failure_print("Databases where --table {t} matched no table: {d}".format(
         t=args.table, d=', '.join(outcome.table_missing_in)))
 
 if outcome.time_limited or outcome.interrupted_by is not None:
