@@ -930,6 +930,22 @@ def test_table_option_does_not_find_another_sessions_temp_table(db, run_ff):
     assert db.script_vacuums() == []
 
 
+@pytest.mark.parametrize("schema", ["pgxtemp", "pg-temp", "pg-toast-temp"])
+def test_table_option_finds_a_table_in_a_schema_that_only_looks_like_a_temp_one(
+    db, run_ff, schema
+):
+    # Issue #94: with LIKE 'pg_temp%' the "_" matched any character, and
+    # these schemas were taken for another session's temporary schema.
+    table = build(db, (schema, "t"))
+    before = db.frozenxids()
+
+    result = run_ff(*FREEZE_ALL, "--table", f"{schema}.t", "-d", db.name)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert db.frozen_since(before) == table
+    assert targets(db.script_vacuums()) == [(schema, "t")]
+
+
 def test_table_option_reaches_a_system_catalog(db, run_ff):
     # The selections leave the system schemas out; a catalog named outright
     # is looked up like any table.  Its printed name carries no schema:

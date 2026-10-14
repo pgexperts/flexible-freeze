@@ -563,6 +563,14 @@ FREEZE_AGE_SQL = """greatest(age(pg_class.relfrozenxid), mxid_age(pg_class.relmi
 # composite type, partitioned index) is reported as a name no table has,
 # exactly like a name that nothing has.
 #
+# TEMP_SCHEMA_REGEX is every selection's one definition of a temporary
+# schema: pg_temp_N and pg_toast_temp_N, N being a backend number.  It is a
+# regex and not LIKE 'pg_temp%' because "_" is a wildcard in LIKE, which
+# took a user's schema named pgxtemp or "pg-temp" for another session's and
+# hid its tables from every selection and from --table (issue #94).  Nothing
+# in it needs doubling for %-formatting or escaping for str.format.
+TEMP_SCHEMA_REGEX = "^pg_(toast_)?temp_[0-9]+$"
+
 # The temporary schemas are left out of both queries because they hold
 # other sessions' relations (this one creates none); the server passes over
 # such a table without saying so.  The system schemas are not left out,
@@ -570,14 +578,14 @@ FREEZE_AGE_SQL = """greatest(age(pg_class.relfrozenxid), mxid_age(pg_class.relmi
 # --system-catalogs): a catalog named outright is vacuumed like any table.
 #
 # The name travels as a query parameter and never as text pasted into the
-# statement.  psycopg2 %-formats a statement that has parameters, hence the
-# doubled percent signs in the LIKE patterns.
+# statement.  psycopg2 %-formats a statement that has parameters, so a
+# literal percent sign in these queries would have to be doubled; the
+# temporary-schema pattern has none.
 #
 # TABLE_NAME_MATCH_SQL is the part the two queries share, so that a name
 # cannot mean one thing when a table is looked for and another when its
 # kind is.
-TABLE_NAME_MATCH_SQL = """nspname NOT LIKE 'pg_temp%%'
-                AND nspname NOT LIKE 'pg_toast_temp%%'
+TABLE_NAME_MATCH_SQL = """nspname !~ '""" + TEMP_SCHEMA_REGEX + """'
                 AND %(name)s::text IN (pg_class.relname::text,
                     nspname::text || '.' || pg_class.relname::text,
                     pg_class.oid::regclass::text)"""
@@ -957,7 +965,9 @@ if args.logfile:
 # last ones.  A database has two horizons, and either can force the
 # anti-wraparound work, so the order goes by the greater of its transaction
 # ID age and its MultiXact age, the measure the tables are selected by
-# (FREEZE_AGE_SQL).  A list given with -d is worked through as written.
+# (FREEZE_AGE_SQL).  Databases of equal age (copies of one template) go by
+# name, so that two runs against one cluster visit them in the same order
+# (issue #94).  A list given with -d is worked through as written.
 if args.dblist is None:
     conn = None
     try:
@@ -989,7 +999,8 @@ if args.dblist is None:
         execute(cur, "SET lock_timeout = '{0}s'".format(args.lock_timeout))
         execute(cur, """SELECT datname FROM pg_database
             WHERE datallowconn AND NOT datistemplate
-            ORDER BY greatest(age(datfrozenxid), mxid_age(datminmxid)) DESC""")
+            ORDER BY greatest(age(datfrozenxid), mxid_age(datminmxid)) DESC,
+                datname""")
         for row in cur:
             dblist.append(row[0])
     except Exception as ex:
@@ -1079,8 +1090,7 @@ for db in dblist:
                     pg_table_size(relid) as table_bytes
                 FROM pg_stat_user_tables
                 WHERE n_dead_tup > 100
-                AND schemaname NOT LIKE 'pg_temp%'
-                AND schemaname NOT LIKE 'pg_toast_temp%'
+                AND schemaname !~ '{1}'
                 AND ( (now() - last_autovacuum) > INTERVAL '1 hour'
                     OR last_autovacuum IS NULL )
                 AND ( (now() - last_vacuum) > INTERVAL '1 hour'
@@ -1090,7 +1100,8 @@ for db in dblist:
             FROM deadrow_tables
             WHERE dead_pct > 0.05
             AND table_bytes >= {0} * 2 ^ 20
-            ORDER BY dead_pct DESC, table_bytes DESC""".format(args.minsizemb)
+            ORDER BY dead_pct DESC, table_bytes DESC""".format(
+                args.minsizemb, TEMP_SCHEMA_REGEX)
     else:
     # if freezing, get list of top tables to freeze, oldest first; what
     # "oldest" means is at FREEZE_AGE_SQL.
@@ -1137,7 +1148,7 @@ for db in dblist:
                 LEFT OUTER JOIN pg_class as toast
                     ON pg_class.reltoastrelid = toast.oid
             WHERE {3}
-                AND nspname NOT LIKE 'pg_temp%'
+                AND nspname !~ '{4}'
                 AND pg_class.relkind IN ('r', 'm')
             )
             SELECT full_table_name, nspname, relname, toast_table_name
@@ -1146,7 +1157,7 @@ for db in dblist:
             AND table_bytes >= {1} * 2 ^ 20
             ORDER BY freeze_age DESC, table_bytes DESC""".format(
                 args.freezeage, args.minsizemb, FREEZE_AGE_SQL,
-                system_schema_filter)
+                system_schema_filter, TEMP_SCHEMA_REGEX)
 
     # From here on the connection is closed on every way out of this
     # database: the skips below, the end of its table list, a stop at the
