@@ -22,6 +22,8 @@ T1 = ("public", "t1")
 COMMENT = "application:flexible_freeze,pganalyze:no-alert"
 SET_SEARCH_PATH = "SELECT pg_catalog.set_config('search_path', '', false)"
 ADVISORY_LOCK = "SELECT pg_catalog.pg_try_advisory_lock(7380385457142659685)"
+# What only the statement asking whether to vacuum TOAST tables apart has.
+TOAST_SPLIT = "pg_catalog.has_schema_privilege('pg_toast', 'USAGE')"
 
 # Each selects t1 by a different statement: the freeze selection, the
 # dead-row selection, and the --table lookup, which is the one statement
@@ -73,23 +75,28 @@ def test_comment_is_appended_to_every_statement(cluster, db, run_ff, mode):
         assert ";" not in statement, statement
     # Each kind of statement was among them: the database list, ...
     assert [sql for sql in everything if "FROM pg_database" in sql]
-    # ... and in the database, the search_path, the session settings and the
-    # claim on the database, the table list, and the timeout and the VACUUM.
+    # ... and in the database, the search_path, the session settings, the
+    # question whether to vacuum TOAST tables apart and the claim on the
+    # database, the table list, and the timeout and the VACUUM, which is two
+    # statements: t1 has a TOAST table and the harness runs as a superuser
+    # (test_toast.py).
     statements = db.script_statements()
-    assert statements[:6] == [
+    assert statements[:5] == [
         as_sent(SET_SEARCH_PATH),
         as_sent("SET vacuum_cost_delay = 20"),
         as_sent("SET vacuum_cost_limit = 2000"),
         as_sent("SET client_min_messages = warning"),
         as_sent("SET lock_timeout = '10s'"),
-        as_sent(ADVISORY_LOCK),
     ]
-    assert len(statements) == 9
-    assert "full_table_name" in statements[6]
-    assert statements[7] == as_sent("SET statement_timeout = 0")
+    assert TOAST_SPLIT in statements[5]
+    assert statements[6] == as_sent(ADVISORY_LOCK)
+    assert len(statements) == 11
+    assert "full_table_name" in statements[7]
+    assert statements[8] == as_sent("SET statement_timeout = 0")
     vacuums = db.script_vacuums()
     assert [vacuum.target for vacuum in vacuums] == [T1]
-    assert statements[8] == vacuums[0].sql
+    assert statements[9] == vacuums[0].sql
+    assert statements[10] == vacuums[0].toast.sql
 
 
 def test_comment_is_on_the_timeout_of_an_enforced_time_limit(db, run_ff):
@@ -98,7 +105,8 @@ def test_comment_is_on_the_timeout_of_an_enforced_time_limit(db, run_ff):
     result = run_ff(*FREEZE_ALL, "--enforce-time", "--comment", COMMENT, "-d", db.name)
 
     assert result.returncode == 0
-    timeout = db.script_statements()[-2]
+    # Before the table's two VACUUMs (t1's and its TOAST table's).
+    timeout = db.script_statements()[-3]
     assert timeout.startswith("SET statement_timeout = '")
     assert timeout.endswith(f"s' /* {COMMENT} */")
 
@@ -212,8 +220,9 @@ def test_comment_cannot_be_anything_but_a_comment(db, run_ff, value):
     assert result.stdout == "All tables vacuumed.\n"
     assert result.stderr == ""
     assert db.frozen_since(before) == {T1}
+    # The eleven of test_comment_is_appended_to_every_statement.
     statements = db.script_statements()
-    assert len(statements) == 9
+    assert len(statements) == 11
     for statement in statements:
         assert statement.endswith(f" /* {value} */"), statement
 
@@ -234,8 +243,9 @@ def test_percent_signs_in_the_comment_arrive_unchanged(db, run_ff, mode, value):
     assert result.stdout == "All tables vacuumed.\n"
     assert result.stderr == ""
     assert [vacuum.target for vacuum in db.script_vacuums()] == [T1]
+    # The eleven of test_comment_is_appended_to_every_statement.
     statements = db.script_statements()
-    assert len(statements) == 9
+    assert len(statements) == 11
     for statement in statements:
         assert statement.endswith(f" /* {value} */"), statement
 

@@ -18,6 +18,8 @@ T1 = ("public", "t1")
 SET_SEARCH_PATH = "SELECT pg_catalog.set_config('search_path', '', false)"
 # The key is part of what the script documents; test_locks.py says why.
 ADVISORY_LOCK = "SELECT pg_catalog.pg_try_advisory_lock(7380385457142659685)"
+# What only the statement asking whether to vacuum TOAST tables apart has.
+TOAST_SPLIT = "pg_catalog.has_schema_privilege('pg_toast', 'USAGE')"
 TIMESTAMPED = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[^:]*: .+")
 
 
@@ -209,18 +211,21 @@ def test_session_settings_precede_the_work(db, run_ff):
     # is noticed (test_run_outcome.py).  The lock timeout has to be in place
     # before the table list is read, which is the statement it is mainly
     # there for, and the database is claimed for this run before any work is
-    # done in it (test_locks.py for both).
-    assert statements[1:6] == [
+    # done in it (test_locks.py for both).  Between the two, the session
+    # asks whether it vacuums TOAST tables apart (test_toast.py).
+    assert statements[1:5] == [
         "SET vacuum_cost_delay = 20",
         "SET vacuum_cost_limit = 2000",
         "SET client_min_messages = warning",
         "SET lock_timeout = '10s'",
-        ADVISORY_LOCK,
     ]
+    assert TOAST_SPLIT in statements[5]
+    assert statements[6] == ADVISORY_LOCK
     # ADR 0005: without --enforce-time any inherited statement_timeout is
-    # cleared immediately before the vacuum.
-    assert statements[-2] == "SET statement_timeout = 0"
-    assert statements[-1] == db.script_vacuums()[0].sql
+    # cleared immediately before the vacuum: here two statements, t1's and
+    # its TOAST table's, since the harness's superuser splits them.
+    (vacuum,) = db.script_vacuums()
+    assert statements[-3:] == ["SET statement_timeout = 0", vacuum.sql, vacuum.toast.sql]
 
 
 def test_session_settings_precede_the_work_on_a_non_iso_datestyle(db, run_ff):
@@ -234,15 +239,17 @@ def test_session_settings_precede_the_work_on_a_non_iso_datestyle(db, run_ff):
 
     assert result.returncode == 0
     statements = db.script_statements()
-    assert statements[:6] == [
+    assert statements[:5] == [
         SET_SEARCH_PATH,
         "SET vacuum_cost_delay = 20",
         "SET vacuum_cost_limit = 2000",
         "SET client_min_messages = warning",
         "SET lock_timeout = '10s'",
-        ADVISORY_LOCK,
     ]
-    assert statements[-2:] == ["SET statement_timeout = 0", db.script_vacuums()[0].sql]
+    assert TOAST_SPLIT in statements[5]
+    assert statements[6] == ADVISORY_LOCK
+    (vacuum,) = db.script_vacuums()
+    assert statements[-3:] == ["SET statement_timeout = 0", vacuum.sql, vacuum.toast.sql]
 
 
 def test_cost_options_are_applied(db, run_ff):
@@ -271,10 +278,12 @@ def test_enforce_time_sets_statement_timeout_to_window_plus_grace(db, run_ff):
 
     assert result.returncode == 0
     # The script's statements only; see test_session_settings_precede_the_work.
+    # One timeout for the table's two statements (test_toast.py).
     statements = db.script_statements()
-    assert statements[-1] == db.script_vacuums()[0].sql
-    match = re.fullmatch(r"SET statement_timeout = '(\d+)s'", statements[-2])
-    assert match, statements[-2]
+    (vacuum,) = db.script_vacuums()
+    assert statements[-2:] == [vacuum.sql, vacuum.toast.sql]
+    match = re.fullmatch(r"SET statement_timeout = '(\d+)s'", statements[-3])
+    assert match, statements[-3]
     # Ten minutes, minus however long the run took to reach the table, plus
     # the grace period.  Anything above 600 can only come from the grace
     # period; the lower bound holds as long as the script reaches its first
