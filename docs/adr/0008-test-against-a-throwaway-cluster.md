@@ -46,3 +46,16 @@ coverage of the script is not measured, because it runs in a child process.
 Paths that need password authentication, real time limits or signals are not
 covered. If pytest is killed with SIGKILL the throwaway postmaster is left
 running and must be stopped by hand.
+
+## Addendum (2026-10-13)
+
+Several consequences no longer hold. The suite now measures line coverage of
+the script: coverage.py starts itself in each script subprocess
+(`.coveragerc`, `COVERAGE_PROCESS_START`), and CI runs the suite a second time
+with it and prints the figure, report-only. Password authentication is
+covered: one role (`ff_scram_role`) is asked for a SCRAM password by
+`pg_hba.conf`. Signals are covered (`tests/test_signals.py`). A cluster left
+running by a pytest killed with SIGKILL is swept at the start of the next
+session, but only a directory that belongs to the current user, is not
+writable by others, carries the harness marker, and whose marker is over an
+hour old, with a live server that reports that data directory.

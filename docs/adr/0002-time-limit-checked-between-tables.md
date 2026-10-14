@@ -32,3 +32,14 @@ By default a single large table can overrun the window by an arbitrary
 amount. With `--enforce-time`, a table whose vacuum is longer than the window
 is cancelled on every run and never completes. The limit is not tested during
 the pause between tables or during table listing.
+
+## Addendum (2026-10-13)
+
+Several consequences above are out of date. The pause between tables is no
+longer taken after the last table, and it is clipped to the time remaining in
+the window, so a pause does not run past the limit. A vacuum cancelled by the
+enforced limit is now a time-limited stop: the run exits 0 (record 0009) and
+the summary names the table whose vacuum was cancelled. Such a table still
+never completes and is selected first on every run, so it needs a longer
+window; no option was added for that. The limit is still not tested during
+table listing.

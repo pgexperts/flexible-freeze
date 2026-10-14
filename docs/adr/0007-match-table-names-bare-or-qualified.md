@@ -46,3 +46,14 @@ tables in other schemas, so `-T foo` excludes `sales.foo` as well as
 whose name contains a dot; both are matched. A database whose name contains a
 dot still cannot be named in `--exclude-table-in-database`. `--table` still
 chooses only among tables that pass the selection filters.
+
+## Addendum (2026-10-13)
+
+The last consequence no longer holds. `--table` no longer chooses among the
+selected tables: it is looked up in `pg_class` with the same three name forms
+(in SQL, `TABLE_LOOKUP_QUERY`, which has to stay in step with
+`table_named_in`), and the selection thresholds (age, size, dead rows) do not
+apply to it. The exclusions still do. A table is found if it is an ordinary
+table or a materialized view outside the temporary schemas, so `--table` can
+reach a system catalog. A database with no such table is mentioned only with
+`-v`; the run exits 1 only if the table is found in no database of the run.

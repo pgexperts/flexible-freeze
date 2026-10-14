@@ -29,3 +29,11 @@ No alternatives are recorded in the repository history.
 An administrator's configured timeout is deliberately overridden for this
 session. With no timeout and no `lock_timeout`, a vacuum waiting on a lock
 waits indefinitely.
+
+## Addendum (2026-10-13)
+
+The last sentence of the consequences no longer holds. Each database session
+now also sets `lock_timeout` (`--lock-timeout`, ten seconds by default), and
+every VACUUM is sent with `SKIP_LOCKED`, so a vacuum no longer waits
+indefinitely for a table lock (record 0014). `statement_timeout = 0` is
+unchanged.

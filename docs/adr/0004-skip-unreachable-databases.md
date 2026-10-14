@@ -33,3 +33,13 @@ One bad database no longer blocks the rest. The skip is not reflected in the
 exit status or the final summary, so a scheduler cannot tell that a database
 was missed. Table-level failures still abort the run; the two cases are
 handled inconsistently.
+
+## Addendum (2026-10-13)
+
+The last two consequences no longer hold (record 0009). A skipped database is
+now listed in the closing summary ("Databases skipped or left unfinished") and
+makes the run exit 1. Other reasons now put a database in the same list: its
+table list could not be read (the message reads "couldn't list its tables" and
+also covers a failure of the session settings), another run holds its advisory
+lock (record 0015), or the connection was lost part-way through it. A failed
+table no longer aborts the run; it is recorded and the run goes on.
