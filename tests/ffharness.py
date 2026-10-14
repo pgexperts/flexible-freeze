@@ -219,24 +219,37 @@ def fold_toast_vacuums(records):
     PostgreSQL 14 or later, a table with a TOAST table), it sends the
     parent's statement with PROCESS_TOAST false and then, as the very next
     statement on the same connection, a VACUUM of pg_toast.pg_toast_<oid>
-    with the same options otherwise.  Folded, that pair is the parent's
-    statement with `options` minus PROCESS_TOAST false (`sql` keeps the
-    literal text) and `toast` set to the parsed TOAST statement.  So an
-    assertion on a table's options holds for both statements of the pair,
-    and the same assertion holds whether or not the run split the VACUUM.
+    with the same options otherwise -- or, with --enforce-time, a SET
+    statement_timeout and then the TOAST statement (issue #95).  Folded,
+    that pair is the parent's statement with `options` minus PROCESS_TOAST
+    false (`sql` keeps the literal text) and `toast` set to the parsed TOAST
+    statement.  So an assertion on a table's options holds for both
+    statements of the pair, and the same assertion holds whether or not the
+    run split the VACUUM.
 
     Checked here, and a HarnessError otherwise: a TOAST statement comes
-    directly after a split parent's on the same connection, and has the
-    parent's options.  Not checked: that a split parent is followed by its
-    TOAST statement at all, since it is not when the parent drew a WARNING
-    (`toast` is then None), nor which TOAST table was named.  Tests that
-    need either look at Database.script_vacuum_statements().
+    directly after a split parent's on the same connection, or after a SET
+    statement_timeout that does, and has the parent's options.  Not
+    checked: that a split parent is followed by its TOAST statement at all,
+    since it is not when the parent drew a WARNING (`toast` is then None),
+    nor which TOAST table was named.  Tests that need either look at
+    Database.script_vacuum_statements().
     """
     folded = []
     # pid -> index in `folded` of that backend's last statement, while that
     # statement is a split parent still waiting for its TOAST statement.
     waiting = {}
+    # Backends whose waiting parent has had its SET statement_timeout.
+    timeout_set = set()
     for pid, statement in records:
+        # Leaves the parent waiting: the one statement the script sends
+        # between the pair.  Only the first, so that a second SET in a row
+        # still separates them.
+        if (pid in waiting and pid not in timeout_set
+                and statement.startswith("SET statement_timeout")):
+            timeout_set.add(pid)
+            continue
+        timeout_set.discard(pid)
         parent = waiting.pop(pid, None)
         if not statement.upper().startswith("VACUUM"):
             continue

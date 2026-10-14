@@ -278,12 +278,15 @@ def test_enforce_time_sets_statement_timeout_to_window_plus_grace(db, run_ff):
 
     assert result.returncode == 0
     # The script's statements only; see test_session_settings_precede_the_work.
-    # One timeout for the table's two statements (test_toast.py).
+    # The TOAST table's statement gets a timeout of its own, reckoned again
+    # (test_toast.py).
     statements = db.script_statements()
     (vacuum,) = db.script_vacuums()
-    assert statements[-2:] == [vacuum.sql, vacuum.toast.sql]
-    match = re.fullmatch(r"SET statement_timeout = '(\d+)s'", statements[-3])
-    assert match, statements[-3]
+    assert statements[-3] == vacuum.sql
+    assert statements[-1] == vacuum.toast.sql
+    assert statements[-2].startswith("SET statement_timeout = '")
+    match = re.fullmatch(r"SET statement_timeout = '(\d+)s'", statements[-4])
+    assert match, statements[-4]
     # Ten minutes, minus however long the run took to reach the table, plus
     # the grace period.  Anything above 600 can only come from the grace
     # period; the lower bound holds as long as the script reaches its first

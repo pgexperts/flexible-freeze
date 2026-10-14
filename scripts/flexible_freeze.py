@@ -930,6 +930,20 @@ if args.system_catalogs and args.skip_freeze:
 # set times
 halt_time = time.time() + ( args.run_min * 60 )
 
+# The statement_timeout that --enforce-time sets before a table's statement:
+# what is left of the window, plus 30 seconds' grace.  Reckoned afresh before
+# each statement that gets one (the TOAST table's too: see the per-table
+# loop), so a table's two statements together end within the window plus
+# the grace -- or, when the window closes during the parent's, within twice
+# the grace, the TOAST table's then having the grace alone.  The floor of 0
+# on the time left matters only for the TOAST table's statement, which can
+# follow a parent that ran past the end of the window; the parent is sent
+# only while time is left.  Without it the sum could come to 0, which is no
+# limit at all, or below, which the server refuses.
+def enforced_timeout_query():
+    timeout_secs = max(int(halt_time - time.time()), 0) + 30
+    return """SET statement_timeout = '%ss'""" % timeout_secs
+
 # Get set for an interrupt.  SIGTERM is what cron, systemd and a plain kill
 # send; left at its default it ends the process at once, and the VACUUM in
 # progress carries on in the server with nobody waiting for it.  The wait
@@ -1365,8 +1379,7 @@ for db in dblist:
             else:
                 # figure out statement_timeout
                 if args.enforcetime:
-                    timeout_secs = int(halt_time - time.time()) + 30
-                    timeout_query = """SET statement_timeout = '%ss'""" % timeout_secs
+                    timeout_query = enforced_timeout_query()
 
             # if not, vacuum or freeze
             #
@@ -1426,16 +1439,27 @@ for db in dblist:
                            ("VACUUM ({0}) {1}".format(', '.join(vacuum_options + ["SKIP_LOCKED"]), toast_table),
                             "the TOAST table of {t} ({x})".format(t=table, x=toast_table))]
 
-            # The TOAST table's statement is printed only if it is sent (see
-            # below).
-            verbose_print("%s in database %s" % (vacuums[0][0], db,))
+            # Both statements are printed before either is sent, outside the
+            # try below: a failed write to stdout must end the run, not be
+            # taken for a failed table.  So the TOAST table's line is there
+            # even when the parent's statement settles the table and the
+            # TOAST table's is never sent.
+            for exquery, _ in vacuums:
+                verbose_print("%s in database %s" % (exquery, db,))
 
             # The table's one or two statements are one unit of work: the
-            # time limit is checked before the first only, statement_timeout
-            # is set once for both, and the table is counted once, as
-            # vacuumed only if neither statement raised or drew a message.
-            # `vacuuming` is what the statement being sent vacuums, for the
-            # reports below.
+            # time limit is checked before the first only, and the table is
+            # counted once, as vacuumed only if neither statement raised or
+            # drew a message.  `vacuuming` is what the statement being sent
+            # vacuums, for the reports below.
+            #
+            # With --enforce-time the TOAST table's statement gets a
+            # statement_timeout of its own, reckoned from the time left once
+            # the parent's is done (issue #95): set once for both, the pair
+            # could run on to twice the time left plus twice the grace.  It
+            # is sent even if the window has closed by then, with the grace
+            # alone, as the parent's would have been at the last moment.
+            # That SET is the one statement between the two.
             vacuuming = table
             try:
                 if args.enforcetime:
@@ -1444,8 +1468,8 @@ for db in dblist:
                     execute(cur, "SET statement_timeout = 0")
 
                 for position, (exquery, vacuuming) in enumerate(vacuums):
-                    if position > 0:
-                        verbose_print("%s in database %s" % (exquery, db,))
+                    if position > 0 and args.enforcetime:
+                        execute(cur, enforced_timeout_query())
                     # Emptied so that whatever is in it afterwards was
                     # raised by this statement and by nothing earlier.
                     del conn.notices[:]

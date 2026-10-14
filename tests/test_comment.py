@@ -105,10 +105,11 @@ def test_comment_is_on_the_timeout_of_an_enforced_time_limit(db, run_ff):
     result = run_ff(*FREEZE_ALL, "--enforce-time", "--comment", COMMENT, "-d", db.name)
 
     assert result.returncode == 0
-    # Before the table's two VACUUMs (t1's and its TOAST table's).
-    timeout = db.script_statements()[-3]
-    assert timeout.startswith("SET statement_timeout = '")
-    assert timeout.endswith(f"s' /* {COMMENT} */")
+    # Before each of the table's two VACUUMs (t1's and its TOAST table's).
+    statements = db.script_statements()
+    for timeout in (statements[-4], statements[-2]):
+        assert timeout.startswith("SET statement_timeout = '")
+        assert timeout.endswith(f"s' /* {COMMENT} */")
 
 
 @MODES

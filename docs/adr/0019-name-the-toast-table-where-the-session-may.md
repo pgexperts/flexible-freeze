@@ -81,3 +81,26 @@ parent counted as vacuumed.
 A superuser session sends one more query per database and one more statement
 per table that has a TOAST table. `-v` prints each statement as it is sent.
 The test harness folds the pair into one entry per table (record 0008).
+
+## Addendum (2026-10-13)
+
+The `--enforce-time` overrun noted under Consequences is fixed (issue #95).
+`statement_timeout` is no longer set once for both statements: before the
+TOAST table's statement the script sends one more `SET statement_timeout`,
+reckoned afresh from the time left in the window plus the 30-second grace, so
+the pair ends within the window plus the grace instead of taking as much as
+twice that. It is the one statement sent between the two. If the window has closed
+by the time the parent's statement is done, the TOAST statement is still sent,
+with the grace alone as its timeout: the parent has been vacuumed, and the
+TOAST table is given what the parent would have had at the last moment. The
+pair can then end up to twice the grace after the window. The
+remaining time is floored at 0 for that, since the bare sum could come to 0,
+which disables the timeout, or below, which the server refuses.
+
+`-v` now prints both statements before the first is sent, outside the table's
+`try`, rather than each as it is sent: printed between the two, a failed write
+to stdout was caught as the TOAST table failing and the run went on, where
+such a failure is otherwise caught nowhere. So the TOAST statement's line also
+appears when the parent's statement settles the table and the TOAST statement
+is not sent. The test harness's fold of the pair passes over the one `SET
+statement_timeout` between them.

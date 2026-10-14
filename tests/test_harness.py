@@ -906,6 +906,16 @@ def test_fold_toast_vacuums_keeps_a_split_parent_without_its_toast_statement():
     assert folded.options == {"FREEZE", "ANALYZE", "SKIP_LOCKED"}
 
 
+def test_fold_toast_vacuums_passes_over_the_timeout_set_between_the_pair():
+    # --enforce-time sets the TOAST statement's timeout of its own (#95).
+    folded = ffharness.fold_toast_vacuums(
+        [(1, "SET statement_timeout = '630s'"), (1, SPLIT_PARENT),
+         (1, "SET statement_timeout = '330s' /* app:nightly */"), (1, TOAST_OF_T)]
+    )
+    (only,) = folded
+    assert only.toast.target == ("pg_toast", "pg_toast_1")
+
+
 def test_fold_toast_vacuums_goes_by_connection():
     # Another session's statement in between does not separate the pair.
     folded = ffharness.fold_toast_vacuums(
@@ -920,12 +930,14 @@ def test_fold_toast_vacuums_goes_by_connection():
         [(1, TOAST_OF_T)],
         [(1, WHOLE), (1, TOAST_OF_T)],
         [(1, SPLIT_PARENT), (1, "SET x"), (1, TOAST_OF_T)],
+        [(1, SPLIT_PARENT), (1, "SET statement_timeout = '30s'"),
+         (1, "SET statement_timeout = '30s'"), (1, TOAST_OF_T)],
         [(1, SPLIT_PARENT), (2, TOAST_OF_T)],
         [(1, SPLIT_PARENT), (1, TOAST_OF_T), (1, TOAST_OF_T)],
         [(1, SPLIT_PARENT), (1, "VACUUM (FREEZE, SKIP_LOCKED) pg_toast.pg_toast_1")],
     ],
-    ids=["alone", "after-a-whole-vacuum", "not-directly-after", "other-connection",
-         "twice", "other-options"],
+    ids=["alone", "after-a-whole-vacuum", "not-directly-after", "two-timeouts-between",
+         "other-connection", "twice", "other-options"],
 )
 def test_fold_toast_vacuums_rejects_a_toast_statement_out_of_place(records):
     with pytest.raises(HarnessError):

@@ -31,16 +31,18 @@ Everything below is relative to 0.6.  The reasons are in `docs/adr/`.
 - A table locked by another session is passed over at once (`SKIP_LOCKED`), listed in the summary as not vacuumed, and makes the exit status 1.
 - A failed table no longer ends the run; it is recorded, the run goes on, and the exit status is 1.  A lost connection ends that database only.
 - Exit status: 0 complete or stopped at the time limit, 1 work missed, 2 bad arguments, 129/130/143 stopped by SIGHUP/SIGINT/SIGTERM.
-- SIGINT and SIGTERM cancel the running VACUUM on the server and print the summary; SIGINT used to exit 0 and SIGTERM left the VACUUM running.  SIGHUP is handled the same way, unless it was already ignored (`nohup`).
+- SIGINT and SIGTERM cancel the running VACUUM on the server and print the summary; SIGINT used to exit 0 and SIGTERM left the VACUUM running.  SIGHUP is handled the same way.  A SIGHUP (`nohup`) or SIGINT (a background job of a non-interactive shell) that was already ignored when the script started stays ignored.
 - Failure reports go to standard error, and with `-l` to the log file as well; the log file is closed when the script ends.
 - A database whose advisory lock is held is skipped, and the report names each holder by process id, role and application name.
 - A failure to list the databases is reported and exits 1, instead of a traceback.
-- Without `-d`, the databases are every connectable non-template database, `postgres` included, oldest first by the greater of XID and MultiXact age.
+- Without `-d`, the databases are every connectable non-template database, `postgres` included, oldest first by the greater of XID and MultiXact age, and by name among equals.
 - Freeze mode orders and thresholds tables by the greatest XID or MultiXact age of the table and its TOAST table, selects materialized views, has no 1000-table cap, and measures `--minsizemb` with `pg_table_size`.
 - `--table` ignores the age, size and dead-row thresholds, finds a table in any schema, and refuses an empty value.
+- `-T` refuses an empty or blank value with exit status 2, instead of excluding nothing (an unset variable in a cron entry left the table it was meant to protect unprotected); `--exclude-table-in-database` likewise refuses `db.schema.` and `db.schema..t`.
 - `--table` naming a view, foreign table or partitioned table says what it is and that the script cannot vacuum it, instead of saying it does not exist.
 - Tables are vacuumed by their schema-qualified name as the server prints it; `-T`, `--exclude-table-in-database` and `--table` match a bare or a `schema.table` name.
-- Without `--enforce-time` each operation is preceded by `SET statement_timeout = 0`; with it, a vacuum cancelled at the time limit is a normal stop (exit 0) that names the table.
+- Without `--enforce-time` each operation is preceded by `SET statement_timeout = 0`; with it, a vacuum cancelled at the time limit is a normal stop (exit 0) that names the table.  When a table's TOAST table is vacuumed by a statement of its own, that statement gets a `statement_timeout` of its own, reckoned from the time then left, so the pair no longer gets the full remaining time twice.
+- A `connect_timeout` (`PGCONNECT_TIMEOUT`, or a service file) that is not a whole number of seconds is refused once, with one message and exit status 2, instead of being reported as a failed connection to every database.
 - `-p` is checked before any connection: one port or a comma-separated list for a multi-host `-H`, each an integer from 1 to 65535; an empty or malformed value is refused with exit status 2.
 - `--costlimit` must be at least 1, the server's minimum; negative values for the other numeric options, and an empty part of `--exclude-table-in-database`, are refused with exit status 2.
 - Sessions run with an empty `search_path`, and connection values are passed to libpq as parameters, not pasted into a connection string.
@@ -49,6 +51,8 @@ Everything below is relative to 0.6.  The reasons are in `docs/adr/`.
 ### Fixes
 
 - An empty entry in `-d` (a doubled or trailing comma) no longer raises an exception.
+- A schema whose name merely resembles a temporary schema's (`pgxtemp`, `"pg-temp"`) is no longer left out of the selection or hidden from `--table`; the temporary schemas are matched exactly (`pg_temp_N`, `pg_toast_temp_N`).
+- With `-v`, a failed write to standard output while vacuuming a TOAST table is no longer reported as that table failing.
 - The dead-row percentage used by `--no-freeze` is calculated correctly.
 - A TOAST table locked by another session is reported, and its table counted as not vacuumed (exit status 1), instead of being skipped in silence; this holds for runs as a superuser (a role with `USAGE` on `pg_toast`) on PostgreSQL 14 or later, which vacuum the TOAST table with a statement of its own.  Other runs still have the gap.
 
