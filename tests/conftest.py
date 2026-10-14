@@ -261,6 +261,14 @@ def kind_lookup_gate(tmp_path):
 
 
 @pytest.fixture
+def holder_lookup_gate(tmp_path):
+    """A ffharness.HolderLookupGate.  Start the script with
+    `env=holder_lookup_gate.env`; it stops just before it asks who holds the
+    advisory lock it was refused, until `holder_lookup_gate.release()`."""
+    return ffharness.HolderLookupGate(tmp_path / "holder-lookup-gate")
+
+
+@pytest.fixture
 def open_files_probe(tmp_path):
     """A ffharness.OpenFilesProbe.  Start the script with
     `env=open_files_probe.env`; once it has exited, `files_left_open()` names

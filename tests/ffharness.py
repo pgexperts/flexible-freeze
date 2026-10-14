@@ -738,6 +738,20 @@ class KindLookupGate(StatementGate):
         super().__init__(directory, "relkind IN ('p', 'f', 'v')")
 
 
+class HolderLookupGate(StatementGate):
+    """A StatementGate before the query that asks who holds the advisory
+    lock (ADVISORY_LOCK_HOLDER_QUERY), sent only when the script's
+    pg_try_advisory_lock() has come back false.
+
+    Held there, the script has been turned away and not yet looked: the
+    holder can let the lock go in between, or the query can be put in the
+    way of a lock.  The mark is the one view no other statement reads.
+    """
+
+    def __init__(self, directory):
+        super().__init__(directory, "pg_catalog.pg_locks")
+
+
 # -- which files the script left open ------------------------------------------
 
 _OPEN_FILES_VARIABLE = "FF_TEST_OPEN_FILES_REPORT"
@@ -1023,6 +1037,9 @@ class Cluster:
             # Small footprint beside whatever else runs on the machine.
             "max_connections": 20,
             "shared_buffers": "32MB",
+            # Off by default.  One test needs a prepared transaction: a lock
+            # holder that pg_locks shows with no process id.
+            "max_prepared_transactions": 2,
             # Record every statement so tests can assert on the exact SQL
             # the script sent (see Cluster.statements).
             "log_statement": "all",
