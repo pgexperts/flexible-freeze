@@ -144,7 +144,7 @@ _VACUUM = re.compile(
     r"^VACUUM\s+"
     r"(?:\((?P<paren>[^)]*)\)\s*|(?P<words>(?:(?:FULL|FREEZE|VERBOSE|ANALYZE)\s+)*))"
     rf"(?:(?P<schema>{_IDENT})\s*\.\s*)?(?P<table>{_IDENT})\s*"
-    r"(?:/\*(?:(?!\*/).)*\*/\s*)?;?\s*$",
+    r"(?:/\*(?:(?!\*/|/\*).)*\*/\s*)?;?\s*$",
     re.IGNORECASE,
 )
 
@@ -217,7 +217,8 @@ def parse_vacuum(statement):
     what the script's --comment adds; it is accepted and not reported, and
     `.sql` still has it.  Anything else is an error: a quoted value, a value
     of several words, a column list, a second table, a comment anywhere
-    else or a second one.
+    else, a second one, or one with a /* inside it (the server nests
+    comments; this does not).
 
     An entry with a value is reported as "NAME value", the value in lower
     case as the server reads a boolean word.  The meaning of a value is not

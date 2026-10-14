@@ -598,8 +598,15 @@ def test_parse_vacuum_rejects_what_it_does_not_understand():
         "VACUUM (FREEZE) t1 /* never closed",
         "VACUUM (FREEZE) t1 /* closed */ and more",
         "VACUUM (FREEZE) t1 /* two\nlines */",
+        # To the server the first is unterminated and the second is one
+        # comment; nesting is outside what the parser reads either way.
+        "VACUUM (FREEZE) t1 /* a /* b */",
+        "VACUUM (FREEZE) t1 /* a /* b */ c */",
     ],
-    ids=["two-comments", "before-the-table", "unterminated", "text-after", "line-break"],
+    ids=[
+        "two-comments", "before-the-table", "unterminated", "text-after",
+        "line-break", "opened-twice", "nested",
+    ],
 )
 def test_parse_vacuum_rejects_a_comment_outside_its_scope(statement):
     with pytest.raises(HarnessError):

@@ -233,7 +233,9 @@ def failure_print(some_message):
 
 # Every statement the script sends goes through here, and nothing else calls
 # a cursor's execute(): that is what makes --comment apply to all of them,
-# the settings and the catalog queries as much as the VACUUM.
+# the settings and the catalog queries as much as the VACUUM.  The one
+# statement it cannot reach is not the script's: psycopg2 opens a session
+# with a SET datestyle of its own on a server whose DateStyle is not ISO.
 #
 # The comment goes at the very end, with a space on either side of the text,
 # so that a text beginning or ending with "/" or "*" cannot join up with a

@@ -281,24 +281,30 @@ def test_script_sends_every_statement_through_one_function():
     # A statement sent with a cursor's execute() directly would go without
     # the comment, and a run cannot show that for a statement it happens not
     # to send, so the calls are counted in the source.
+    #
+    # Every cursor method that sends a statement is counted; a method reached
+    # under another name (an alias, getattr) is beyond what this can see.
+    senders = {
+        "execute", "executemany", "callproc",
+        "copy_expert", "copy_from", "copy_to",
+    }
+
+    def sends(node):
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in senders
+        )
+
     tree = ast.parse(SCRIPT.read_text())
-    calls = {}
-    for function in ast.walk(tree):
-        if isinstance(function, ast.FunctionDef):
-            for node in ast.walk(function):
-                if (
-                    isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "execute"
-                ):
-                    calls[node.lineno] = function.name
-    everywhere = [
-        node.lineno
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "execute"
-    ]
+    inside = {
+        node.lineno: function.name
+        for function in ast.walk(tree)
+        if isinstance(function, ast.FunctionDef)
+        for node in ast.walk(function)
+        if sends(node)
+    }
+    everywhere = [node.lineno for node in ast.walk(tree) if sends(node)]
 
     assert len(everywhere) == 1
-    assert calls == {everywhere[0]: "execute"}
+    assert inside == {everywhere[0]: "execute"}
