@@ -3,7 +3,7 @@
 flexible-freeze is one Python script, `scripts/flexible_freeze.py`, that runs
 `VACUUM ([FREEZE,] [ANALYZE,] [TRUNCATE false,] SKIP_LOCKED)` table by table inside a time
 window. PostgreSQL 12 is the oldest server it supports (CI covers 14-18) and
-Python 3.11 the oldest interpreter. It is a
+Python 3.11 the oldest interpreter (ADR 0018). It is a
 top-to-bottom script: there is no `main()`, and argument parsing, signal
 registration and the whole run execute at import. It cannot be imported.
 
@@ -14,7 +14,7 @@ registration and the whole run execute at import. It cannot be imported.
 | Argument parsing | Options, defaults, the per-database exclusion map | module level, `parser`, `args`, `database_table_map` |
 | Output | Progress, verbose and debug printing; failure reports, which go to stderr and to the log file; password masking | `_print`, `verbose_print`, `failure_print`, `debug_print`, `stamped`, `log_file`, `args_for_display` |
 | Connection | The only place a connection is made; sets autocommit and an empty `search_path` | `dbconnect` |
-| Statements | The only place a statement is sent; appends the `--comment` text, which `comment_text` has vetted at argument parsing | `execute`, `comment_text` |
+| Statements (ADR 0017) | The only place a statement is sent; appends the `--comment` text, which `comment_text` has vetted at argument parsing | `execute`, `comment_text` |
 | Name matching | Compares a user-supplied table name with a table: in Python for the exclusions, in SQL for `--table` | `table_named_in`, `TABLE_LOOKUP_QUERY` |
 | Database list (ADR 0013) | `-d`, else every connectable non-template database in `pg_database`, read via the `postgres` database | module level, `dblist` |
 | Table selection (ADR 0012) | Three queries: freeze mode (by the greater of XID and MultiXact age), `--no-freeze` mode (by dead-tuple fraction), and the `--table` lookup, which replaces either | module level, `tabquery`, `FREEZE_AGE_SQL`, `TABLE_LOOKUP_QUERY` |
@@ -55,7 +55,7 @@ registration and the whole run execute at import. It cannot be imported.
   comment because `comment_text` refuses, at argument parsing, any value
   containing `/*`, `*/`, a NUL or a line break; nothing is stripped or
   escaped except that `%` is doubled when the statement has parameters,
-  which is when psycopg2 formats it. Breaks: a statement sent directly goes
+  which is when psycopg2 formats it (ADR 0017). Breaks: a statement sent directly goes
   without the comment; a check loosened to "clean up" the value lets text
   such as `**//` close the comment and the rest reach the server as SQL; a
   semicolon puts the comment after the statement instead of in it.
@@ -171,6 +171,18 @@ registration and the whole run execute at import. It cannot be imported.
 - The window is whole minutes, so tests reach "after the deadline" by moving
   the script's clock (`script_clock` fixture, `ffharness.ScriptClock`), not
   by waiting.
+- `--comment` is vetted by refusing, never by cleaning up (ADR 0017): `**//`
+  shows why removal is unsafe. The text ends in a space-padded `*/`, so a
+  text ending in `/` is safe; psycopg2's own `SET datestyle` is the one
+  statement without the comment; `-v` prints the VACUUM without it; a
+  comment the client encoding cannot encode fails in `dbconnect()`.
+- An empty or blank `--table` is refused at argument parsing (exit 2,
+  `non_empty_table`, ADR 0007); the option is tested against `None`.
+- `--no-truncate` adds `TRUNCATE false`; without it nothing about
+  truncation is sent, so the table's `vacuum_truncate` still applies
+  (ADR 0014). `TRUNCATE true` is never sent.
+- `parse_vacuum` accepts an option with one unquoted word as its value and
+  one trailing comment on the table's line, nothing more (ADR 0008).
 - Without `--enforce-time` the script sets `statement_timeout = 0` on
   purpose (ADR 0005); do not "fix" that by removing it.
 - `-l` rebinds `sys.stdout` to the logfile, which is also kept as
@@ -270,7 +282,7 @@ loops break at their next test of `interrupt_signal`, closing the connection
   `TABLE_LOOKUP_QUERY`, together, and `tests/test_table_names.py`.
 - Change connection behaviour: `dbconnect`, and
   `tests/test_connection_setup.py`.
-- Add a statement: send it with `execute(cur, statement, params)`, without
+- Add a statement (ADR 0017): send it with `execute(cur, statement, params)`, without
   a closing semicolon; `tests/test_comment.py` counts the direct calls.
 - Add a way for a run to fall short: a field on `RunOutcome`, its term in
   `work_was_missed()`, its line in the summary block, the exit-status table

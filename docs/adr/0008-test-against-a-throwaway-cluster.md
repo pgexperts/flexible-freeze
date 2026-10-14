@@ -59,3 +59,16 @@ running by a pytest killed with SIGKILL is swept at the start of the next
 session, but only a directory that belongs to the current user, is not
 writable by others, carries the harness marker, and whose marker is over an
 hour old, with a live server that reports that data directory.
+
+## Addendum (2026-10-14)
+
+The harness's VACUUM statement parser (`ffharness.parse_vacuum`) reads two
+more forms. A parenthesised option may be an option name followed by one
+unquoted word as its value (`TRUNCATE false`, `PARALLEL 2`), reported as
+`NAME value` with the value in lower case. And one `/* ... */` comment is
+accepted after the table, as the script's `--comment` (record 0017) adds one;
+it has to be on the table's line, and it is not reported, though the
+statement's `.sql` keeps it. A quoted value, a value of several words, a
+comment anywhere else, a second comment, or a `/*` inside the comment is
+still an error. The meaning of a value is not worked out, so `TRUNCATE`,
+`TRUNCATE true` and `TRUNCATE on` stay three different entries.

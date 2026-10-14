@@ -53,3 +53,13 @@ ten seconds means a listing that is merely slow behind a lock is given up on.
 The oldest supported server is PostgreSQL 12, but CI covers 14 through 18, so
 12 and 13 are untested. `--lock-timeout` is in seconds; a patch written for
 PR #33's millisecond option will not apply as it stands.
+
+## Addendum (2026-10-14)
+
+`--no-truncate` adds `TRUNCATE false` to the option list, in both modes, so
+the statement becomes `VACUUM (FREEZE, ANALYZE, TRUNCATE false, SKIP_LOCKED)`
+(with `FREEZE` and `ANALYZE` as before). Without the flag nothing about
+truncation is sent, so the table's `vacuum_truncate` storage parameter still
+decides; `TRUNCATE true` is never sent, since it would override a table set
+never to be truncated. Like `SKIP_LOCKED`, the option exists from
+PostgreSQL 12 and only in the parenthesized form.

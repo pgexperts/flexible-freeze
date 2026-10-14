@@ -57,3 +57,10 @@ apply to it. The exclusions still do. A table is found if it is an ordinary
 table or a materialized view outside the temporary schemas, so `--table` can
 reach a system catalog. A database with no such table is mentioned only with
 `-v`; the run exits 1 only if the table is found in no database of the run.
+
+## Addendum (2026-10-14)
+
+An empty or blank `--table` value (an unset variable in a cron entry, say) is
+refused at argument parsing with exit 2, by the argparse type
+`non_empty_table`, and the option is tested against `None` afterwards. A
+blank value can therefore no longer mean "every table".

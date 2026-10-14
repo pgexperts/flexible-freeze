@@ -15,7 +15,7 @@ Requires Python 3.11 or later (the script checks).  The test suite and CI run on
 
 Requires PostgreSQL 12 or later: every `VACUUM` is sent with `SKIP_LOCKED`, which older versions do not have.  CI tests PostgreSQL 14 through 18; versions 12 and 13 are supported but not tested.
 
-Requires psycopg2
+Requires psycopg2 2.9 or later, below 3 (`scripts/requirements.txt` names `psycopg2-binary`; `requirements-dev.txt` uses the same range).
 
     usage: flexible_freeze.py [-h] [-m RUN_MIN] [-s MINSIZEMB] [-d DBLIST] [-T TABLES_TO_EXCLUDE]
                               [--exclude-table-in-database EXCLUDE_TABLE_IN_DATABASE] [--no-freeze] [--no-analyze] [--no-truncate]
@@ -118,7 +118,7 @@ You can specify `--no-analyze` to skip the ANALYZE step.
 
 Table names given to `-T`, `--exclude-table-in-database` and `--table` can be written three ways: a bare table name (`orders`), which matches a table of that name in every schema; `schema.table` (`sales.orders`), written plain without SQL quoting, which matches only that table; or the name exactly as `flexible_freeze` prints it (for example `public."Orders"`).  Names are case-sensitive.
 
-`--table` does not go through the selection: the named table is vacuumed whatever its age, its size or its dead rows, in either mode, provided it is an ordinary table or a materialized view.  `-T` and `--exclude-table-in-database` still apply to it, and an excluded table is reported as excluded.  `--table` can also name a system catalog (`--table pg_catalog.pg_statistic`), which a run without `--table` never selects.  When the name is in none of the schemas of a database, `flexible_freeze` goes on to the next database, and with `-v` says that the table does not exist there.  That is an error (exit status 1) only if the table was found in none of the databases of the run; the summary then lists the databases that were looked in.
+An empty or blank `--table` value is an error in the command line (exit status 2); it never means every table.  `--table` does not go through the selection: the named table is vacuumed whatever its age, its size or its dead rows, in either mode, provided it is an ordinary table or a materialized view.  `-T` and `--exclude-table-in-database` still apply to it, and an excluded table is reported as excluded.  `--table` can also name a system catalog (`--table pg_catalog.pg_statistic`), which a run without `--table` never selects.  When the name is in none of the schemas of a database, `flexible_freeze` goes on to the next database, and with `-v` says that the table does not exist there.  That is an error (exit status 1) only if the table was found in none of the databases of the run; the summary then lists the databases that were looked in.
 
 `flexible_freeze` runs every session with an empty `search_path`, as `vacuumdb` does, so table names in its output are schema-qualified (`public.orders`).  The one exception is a table in `pg_catalog`, which can only come up when `--table` names it: PostgreSQL searches that schema whatever the `search_path`, so such a table is printed, and vacuumed, by its bare name (`pg_statistic`).  On PostgreSQL 16 and earlier, this means the ANALYZE of a table with an expression index can fail if the index's function depends on `search_path`; give such functions an explicit `SET search_path`, or schema-qualify the names they use.
 
