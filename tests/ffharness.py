@@ -631,6 +631,127 @@ class ScriptClock:
         self._hold_file.unlink()
 
 
+# -- the script held just before one statement ----------------------------------
+
+_GATE_FILE_VARIABLE = "FF_TEST_STATEMENT_GATE_FILE"
+_GATE_MARK_VARIABLE = "FF_TEST_STATEMENT_GATE_MARK"
+_GATE_SOURCE = f'''\
+# Written by the flexible_freeze test harness (ffharness.StatementGate).
+# Gives every connection the script makes a cursor that, before it sends a
+# statement containing the marker text, waits for as long as a file exists.
+# The statement then goes out as the script wrote it.
+import os
+import time
+
+import psycopg2
+import psycopg2.extensions
+
+_hold_file = os.environ["{_GATE_FILE_VARIABLE}"]
+_held_file = _hold_file + ".held"
+_mark = os.environ["{_GATE_MARK_VARIABLE}"]
+
+
+class _GatedCursor(psycopg2.extensions.cursor):
+    def execute(self, query, vars=None):
+        if _mark in query:
+            while os.path.exists(_hold_file):
+                open(_held_file, "w").close()
+                time.sleep(0.01)
+        return super().execute(query, vars)
+
+
+_connect = psycopg2.connect
+
+
+def _gated_connect(*args, **kwargs):
+    kwargs.setdefault("cursor_factory", _GatedCursor)
+    return _connect(*args, **kwargs)
+
+
+psycopg2.connect = _gated_connect
+'''
+
+
+class StatementGate:
+    """Holds the script just before it sends one particular statement.
+
+    For a statement that nothing on the server can hold up without holding
+    up an earlier one as well: the test waits until the script is held
+    (wait_until_held), puts its obstacle in place, and lets it go
+    (release); the statement then meets the obstacle on the server like any
+    other.  Started with `env=gate.env`, the script gets its connections
+    from a psycopg2.connect that gives them a cursor which waits, before
+    any statement containing `mark`, for as long as the gate is closed.  The
+    gate is closed when it is made.
+
+    A shim like ScriptClock's (a sitecustomize module found through
+    PYTHONPATH), and so not to be combined with it or with OpenFilesProbe:
+    only one sitecustomize module is loaded.  It only delays.  The script is
+    launched by the same argv through the same checks, the connection is
+    made by the script's own call with the script's own arguments, and the
+    statement goes out unmodified.  The script's signal handlers still run
+    while it is held.  `mark` has to be text that no earlier statement
+    contains, or the script is held there instead.
+    """
+
+    def __init__(self, directory, mark):
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        (self.directory / _CLOCK_MODULE).write_text(_GATE_SOURCE)
+        self.mark = mark
+        self._hold_file = self.directory / "hold"
+        # Name fixed by the shim: the hold file's, with a suffix added.
+        self._held_file = self.directory / "hold.held"
+        self._hold_file.write_text("")
+
+    @property
+    def env(self):
+        """Environment for start_ff / run_ff that puts the shim in place."""
+        inherited = os.environ.get("PYTHONPATH")
+        path = [str(self.directory)] + ([inherited] if inherited else [])
+        return {
+            "PYTHONPATH": os.pathsep.join(path),
+            _GATE_FILE_VARIABLE: str(self._hold_file),
+            _GATE_MARK_VARIABLE: self.mark,
+        }
+
+    def wait_until_held(self, timeout=30.0):
+        wait_for(
+            self._held_file.exists, timeout=timeout,
+            what=f"the script to stop before the statement with {self.mark!r}",
+        )
+
+    def release(self):
+        """Let a held script go on, and every later statement through."""
+        self._hold_file.unlink()
+
+
+class KindLookupGate(StatementGate):
+    """A StatementGate before the --table kind lookup (TABLE_KIND_QUERY).
+
+    That query reads the same catalogs as the lookup sent just before it,
+    so a lock that held it up would have held up the first one.  The mark
+    is its list of kinds, which no other statement has.
+    """
+
+    def __init__(self, directory):
+        super().__init__(directory, "relkind IN ('p', 'f', 'v')")
+
+
+class HolderLookupGate(StatementGate):
+    """A StatementGate before the query that asks who holds the advisory
+    lock (ADVISORY_LOCK_HOLDER_QUERY), sent only when the script's
+    pg_try_advisory_lock() has come back false.
+
+    Held there, the script has been turned away and not yet looked: the
+    holder can let the lock go in between, or the query can be put in the
+    way of a lock.  The mark is the one view no other statement reads.
+    """
+
+    def __init__(self, directory):
+        super().__init__(directory, "pg_catalog.pg_locks")
+
+
 # -- which files the script left open ------------------------------------------
 
 _OPEN_FILES_VARIABLE = "FF_TEST_OPEN_FILES_REPORT"
@@ -916,6 +1037,9 @@ class Cluster:
             # Small footprint beside whatever else runs on the machine.
             "max_connections": 20,
             "shared_buffers": "32MB",
+            # Off by default.  One test needs a prepared transaction: a lock
+            # holder that pg_locks shows with no process id.
+            "max_prepared_transactions": 2,
             # Record every statement so tests can assert on the exact SQL
             # the script sent (see Cluster.statements).
             "log_statement": "all",

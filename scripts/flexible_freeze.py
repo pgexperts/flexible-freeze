@@ -321,6 +321,11 @@ def execute(cur, statement, params=None):
         statement = "{0} /* {1} */".format(statement, comment)
     cur.execute(statement, params)
 
+# The application_name of every session the script opens.  It is also how a
+# run that is refused the advisory lock tells another run holding it from
+# any other session (see ADVISORY_LOCK_HOLDER_QUERY).
+APPLICATION_NAME = 'flexible_freeze'
+
 # Returns an open connection or raises; it never returns None.  Callers
 # decide what a failure means: fatal while listing the databases, a skipped
 # database inside the run.
@@ -337,7 +342,7 @@ def dbconnect(dbname, dbuser, dbhost, dbport, dbpass):
     # option left unset so libpq applies its own default.
     conn = psycopg2.connect(dbname=dbname, host=dbhost, user=dbuser,
                             password=dbpass, port=dbport,
-                            application_name='flexible_freeze')
+                            application_name=APPLICATION_NAME)
     conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
 
     # Resolve catalog names through pg_catalog only, by running every session
@@ -622,7 +627,109 @@ TABLE_KIND_QUERY = """SELECT pg_class.oid::regclass AS full_table_name,
 # database, and small numbers are what applications pick.  In pg_locks it
 # shows as locktype 'advisory', classid 1718379896, objid 1718778469,
 # objsubid 1.
+#
+# Nothing checks who takes the key.  An advisory lock needs no privilege,
+# so any role that can connect to a database can hold this one there, by
+# accident or on purpose, and every run will then skip that database (exit
+# status 1) for as long as it does.  That is accepted (ADR 0015); a key
+# kept secret could not be the same for every copy of the script.  What a
+# run does about it is say who holds the lock, so that the operator can
+# find the session and end it, instead of blaming another run it may not
+# have had.  When the lock is refused, ADVISORY_LOCK_HOLDER_QUERY lists the
+# holders, and the skip line names each and is worded by what they are
+# (see advisory_lock_holders_report).  It is a report only: the database is
+# skipped whatever the lookup finds, or if it fails, and the lock is not
+# tried again.
 ADVISORY_LOCK_KEY = 0x666C657866727A65  # 7380385457142659685
+
+# Who holds ADVISORY_LOCK_KEY in the current database: one row of (pid,
+# role name, application name) for each holder, in either mode (several
+# sessions can hold it in share mode).  A key given as one bigint is stored
+# in pg_locks as its high and low 32 bits, in classid and objid, with
+# objsubid 1 (2 marks a key given as two integers); the halves travel as
+# parameters.  Sent only after pg_try_advisory_lock() has returned false,
+# so a run that gets the lock sends what it always did.  DISTINCT because
+# pg_locks has a row for each mode a session holds, and one session can
+# hold the key in both.
+#
+# pg_stat_activity is left-joined: pg_locks has a row with no pid for a
+# lock that a prepared transaction holds, and a session that ended between
+# the two views being read has no activity row.  The three columns asked
+# for are among those pg_stat_activity shows for every session to every
+# role; only the query, the state, the wait event and the like are hidden
+# from a role that is not the session's own or a member of
+# pg_read_all_stats.  So a run as an ordinary role names the holder as
+# fully as a superuser's.
+ADVISORY_LOCK_HOLDER_QUERY = """SELECT DISTINCT l.pid, a.usename, a.application_name
+            FROM pg_catalog.pg_locks l
+                LEFT JOIN pg_catalog.pg_stat_activity a ON a.pid = l.pid
+            WHERE l.locktype = 'advisory' AND l.granted
+                AND l.database = (SELECT oid FROM pg_catalog.pg_database
+                                  WHERE datname = pg_catalog.current_database())
+                AND l.classid = %(classid)s::oid AND l.objid = %(objid)s::oid
+                AND l.objsubid = 1
+            ORDER BY l.pid"""
+
+# What goes in the parentheses of the line for a database whose advisory
+# lock was refused, given the rows of ADVISORY_LOCK_HOLDER_QUERY.
+#
+# A holder that goes by this script's application name is taken for
+# another run: that is the overlap the lock is there to prevent, and the
+# line says so as it always did.  Any other application name is said not
+# to be flexible_freeze, in words that say what it costs: the database is
+# skipped on every run until that session lets go.  One such holder is
+# enough for that wording.  The application name is set by the client, so
+# a session can pass itself off as a run, or a run as something else; the
+# distinction is a hint for the operator and decides nothing.
+#
+# A holder without a pid is a prepared transaction.  That is never a run
+# (the script holds the key at session level and prepares nothing), and it
+# outlasts its session and a restart, so it gets the pointed wording with
+# what does end it.  A session whose application name is NULL (no activity
+# row: it has just ended) is not claimed to be either; a NULL role or
+# application name is printed as not known.  No rows: the holder let go
+# between the refusal and the lookup.
+def advisory_lock_holders_report(holders):
+    if not holders:
+        return ("advisory lock {k} was held there a moment ago, and its holder "
+                "had let it go by the time it was looked up; the lock is not "
+                "tried again in this run").format(k=ADVISORY_LOCK_KEY)
+
+    prepared = "a prepared transaction (see pg_prepared_xacts)"
+
+    def holder_text(pid, role, application):
+        if pid is None:
+            return prepared
+        return "pid {p}, role {r}, application name {a}".format(
+            p=pid, r=role if role is not None else "not known",
+            a='"%s"' % application if application is not None else "not known")
+
+    def is_other(pid, role, application):
+        return pid is None or application not in (None, APPLICATION_NAME)
+
+    listed = "; ".join(holder_text(*holder) for holder in holders)
+    if len(holders) == 1 and holders[0][0] is None:
+        return ("advisory lock {k} is held there by {p}, which is not "
+                "flexible_freeze, and every run will skip this database until "
+                "that transaction is committed or rolled back").format(
+                    k=ADVISORY_LOCK_KEY, p=prepared)
+    if any(is_other(*holder) for holder in holders):
+        if len(holders) == 1:
+            who = ("a session that does not appear to be flexible_freeze, and "
+                   "every run will skip this database until that session "
+                   "releases the lock or ends")
+        else:
+            who = ("holders not all of which appear to be flexible_freeze, and "
+                   "every run will skip this database until they let go of "
+                   "the lock")
+        return "advisory lock {k} is held there by {w}: {l}".format(
+            k=ADVISORY_LOCK_KEY, w=who, l=listed)
+    if any(application is None for _, _, application in holders):
+        return ("advisory lock {k} is held there by {l}, which cannot be "
+                "identified as flexible_freeze or not").format(
+                    k=ADVISORY_LOCK_KEY, l=listed)
+    return ("another flexible_freeze run is working on it: advisory lock {k} "
+            "is held there by {l}").format(k=ADVISORY_LOCK_KEY, l=listed)
 
 # What a run did and did not get done.  The loops below only record here;
 # the closing summary and the exit status are worked out from this record,
@@ -645,8 +752,9 @@ class RunOutcome(object):
         self.failed_tables = []
         # VACUUM returned, but the server had something to say about it.
         self.unvacuumed_tables = []
-        # Databases not worked through: could not connect, held by another
-        # run, could not list the tables, or lost the connection part-way.
+        # Databases not worked through: could not connect, advisory lock
+        # held (by another run or anything else), could not list the
+        # tables, or lost the connection part-way.
         self.skipped_databases = []
         # --table: the databases in which no table has that name, and
         # whether one has it anywhere.  A miss in one database is expected
@@ -1023,7 +1131,23 @@ for db in dblist:
             if args.advisory_lock:
                 execute(cur, "SELECT pg_catalog.pg_try_advisory_lock({0})".format(ADVISORY_LOCK_KEY))
                 if not cur.fetchone()[0]:
-                    failure_print("skipping database {d} (another flexible_freeze run is working on it: advisory lock {k} is held there)".format(d=db, k=ADVISORY_LOCK_KEY))
+                    # Refused: say who has it; see ADVISORY_LOCK_KEY.  The
+                    # lookup has a handler of its own, because what is
+                    # known when it fails is that the lock is held, not
+                    # that the tables could not be listed.  As in every
+                    # handler here, an interrupt is tested first.
+                    try:
+                        execute(cur, ADVISORY_LOCK_HOLDER_QUERY,
+                                {'classid': ADVISORY_LOCK_KEY >> 32,
+                                 'objid': ADVISORY_LOCK_KEY & 0xFFFFFFFF})
+                        holders = cur.fetchall()
+                    except Exception as err:
+                        if interrupt_signal is not None:
+                            break
+                        failure_print("skipping database {d} (advisory lock {k} is held there; who holds it could not be determined: {e})".format(d=db, k=ADVISORY_LOCK_KEY, e=str(err).rstrip()))
+                        outcome.skipped_databases.append(db)
+                        continue
+                    failure_print("skipping database {d} ({r})".format(d=db, r=advisory_lock_holders_report(holders)))
                     outcome.skipped_databases.append(db)
                     continue
 

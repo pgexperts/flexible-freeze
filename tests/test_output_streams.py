@@ -28,7 +28,7 @@ import re
 import signal
 
 import pytest
-from ffharness import FREEZE_ALL, assert_lines_in_order, wait_for
+from ffharness import FREEZE_ALL, HARNESS_APP, assert_lines_in_order, wait_for
 
 NO_SUCH_DB = "ff_no_such_database"
 TIMESTAMPED = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[^:]*: .+")
@@ -151,13 +151,20 @@ def unreachable_database(db, make_role, stack):
 
 
 def database_held_by_another_run(db, make_role, stack):
+    # The holder is the harness's own session, which the report names and
+    # does not take for a run of the script (test_locks.py has the cases).
     conn = db.connect()
     stack.callback(conn.close)
     with conn.cursor() as cur:
         cur.execute("SELECT pg_advisory_lock(%s)", (ADVISORY_KEY,))
+        cur.execute("SELECT pg_backend_pid()")
+        pid = cur.fetchone()[0]
     return ("-d", db.name), [
-        (f"skipping database {db.name} (another flexible_freeze run is working "
-        f"on it: advisory lock {ADVISORY_KEY} is held there)"),
+        (f"skipping database {db.name} (advisory lock {ADVISORY_KEY} is held "
+         "there by a session that does not appear to be flexible_freeze, and "
+         "every run will skip this database until that session releases the "
+         f"lock or ends: pid {pid}, role {db.cluster.superuser}, application "
+         f'name "{HARNESS_APP}")'),
         "Not all tables were vacuumed.",
         f"Databases skipped or left unfinished: {db.name}",
     ]

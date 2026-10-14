@@ -19,10 +19,10 @@ registration and the whole run execute at import. It cannot be imported.
 | Database list (ADR 0013) | `-d`, in the order given, else every connectable non-template database in `pg_database`, by the greater of XID and MultiXact age, read via the `postgres` database in a session with the run's `lock_timeout`; a failure to connect or to read the list is reported with `failure_print` and ends the run (exit 1) | module level, `dblist` |
 | Table selection (ADR 0012) | Three queries: freeze mode (by the greater of XID and MultiXact age; with `--system-catalogs` the system schemas too), `--no-freeze` mode (by dead-tuple fraction), and the `--table` lookup, which replaces either; when that lookup finds no table, a second one asks whether the name is a partitioned table, a foreign table or a view, for the message only | module level, `tabquery`, `system_schema_filter`, `FREEZE_AGE_SQL`, `TABLE_LOOKUP_QUERY`, `TABLE_KIND_QUERY`, `UNVACUUMABLE_KINDS` |
 | Vacuum loop | Exclusions, pause, time check, `statement_timeout`, VACUUM, server messages | module level, `for db in dblist` |
-| Lock handling (ADR 0014, 0015) | `SKIP_LOCKED` on every VACUUM; the session's `lock_timeout` (`--lock-timeout`); one advisory lock per database against overlapping runs (`--no-advisory-lock`) | `ADVISORY_LOCK_KEY`, the session settings and `vacuum_options` in the database loop |
+| Lock handling (ADR 0014, 0015) | `SKIP_LOCKED` on every VACUUM; the session's `lock_timeout` (`--lock-timeout`); one advisory lock per database against overlapping runs (`--no-advisory-lock`), and when it is refused a lookup that names its holders | `ADVISORY_LOCK_KEY`, `ADVISORY_LOCK_HOLDER_QUERY`, `advisory_lock_holders_report`, `APPLICATION_NAME`, the session settings and `vacuum_options` in the database loop |
 | Run outcome (ADR 0009) | What was and was not done; the only input to the summary and the exit status | `RunOutcome`, `outcome`, the summary block at the end of the file |
 | Interruption (ADR 0011) | SIGINT, SIGTERM and SIGHUP (the last only if it was not already ignored when the script started): the handler records the signal; the psycopg2 wait callback cancels the running statement and applies `connect_timeout`; the pause ends early; a second signal stops waiting for the server | `signal_handler`, `interrupt_signal`, `interrupt_repeated`, `wait_for_server`, `pause`, `exit_if_interrupted` |
-| Test harness | Throwaway cluster (and a sweep of clusters a killed session left), the single launcher for the script, catalog and statement-log probes, a clock for the script that tests can move and stop, a probe for the files the script left open at exit, a socket that never answers, a start with SIGHUP ignored (`start_ff(ignore_sighup=True)`), a SCRAM role for password tests, per-subprocess coverage (`.coveragerc`) | `tests/ffharness.py`, `tests/conftest.py` |
+| Test harness | Throwaway cluster (and a sweep of clusters a killed session left), the single launcher for the script, catalog and statement-log probes, a clock for the script that tests can move and stop, a gate that stops the script just before one statement (`StatementGate`; `KindLookupGate`, `HolderLookupGate`), a probe for the files the script left open at exit, a socket that never answers, a start with SIGHUP ignored (`start_ff(ignore_sighup=True)`), a SCRAM role for password tests, per-subprocess coverage (`.coveragerc`) | `tests/ffharness.py`, `tests/conftest.py` |
 
 ## Invariants
 
@@ -154,10 +154,29 @@ registration and the whole run execute at import. It cannot be imported.
   works through every database. Never run it by hand to "try something".
 - A failed table and a database that cannot be connected to or listed (ADR
   0004) do not stop the run; each is recorded and makes the exit status 1.
-- A database in which another run holds the advisory lock is one more
+- A database in which another session holds the advisory lock is one more
   skipped database: same list in the summary, same exit status 1, with the
-  reason in the line printed when it is skipped. The lock is never released
-  by the script; closing the connection does it.
+  reason in the line printed when it is skipped. Any role that can connect
+  can hold the key; nothing checks (ADR 0015). So when
+  `pg_try_advisory_lock` returns false, and only then,
+  `ADVISORY_LOCK_HOLDER_QUERY` asks `pg_locks` (left join
+  `pg_stat_activity`) for the holders, and the line names each: pid, role,
+  application name. A holder whose application name is the script's
+  (`APPLICATION_NAME`) is "another flexible_freeze run"; any other name
+  gets the line saying it does not appear to be flexible_freeze and that
+  every run will skip the database until it lets go; one such holder
+  decides the wording. The distinction is client-set and spoofable, and
+  decides nothing but the words. No rows means the holder let go in
+  between ("held a moment ago"); the lock is never tried twice. The lookup
+  has its own `except`: a failure there is still reported as the lock
+  held, with why the holder is not known, never as "couldn't list its
+  tables". Any role sees pid, role and application name of every session
+  in `pg_stat_activity`. A NULL pid is a prepared transaction, which is
+  never a run and gets the pointed line (until committed or rolled back);
+  a NULL role or application name (a session just gone) is "not known",
+  and a NULL application name is never read as "not flexible_freeze". The
+  query is `DISTINCT`: one session can hold the key in both modes. The lock is
+  never released by the script; closing the connection does it.
 - A locked table is "not vacuumed" (`outcome.unvacuumed_tables`), not
   "failed", and costs no wait. A lock timeout during a VACUUM is "failed".
   A lock timeout during the listing skips the database.
@@ -174,9 +193,11 @@ registration and the whole run execute at import. It cannot be imported.
   query and the fetch share one `try`; the message for both says "query".
   Nothing there is left to an uncaught exception, whose traceback would
   reach stderr and not the log file.
-- A failure in the session settings, the advisory-lock call or the listing
-  query is reported as "couldn't list its tables" and skips the database;
-  the message names only the last.
+- A failure in the session settings, the advisory-lock call, the listing
+  query or the `--table` kind lookup (`TABLE_KIND_QUERY`) is reported as
+  "couldn't list its tables" and skips the database; the message names
+  only the listing. The advisory-lock holder lookup is the exception (see
+  above).
 - A lost connection ends that database only (recorded as unfinished, exit
   status 1), and there is no reconnect.
 - A `--table` name that no table in a database has is recorded, and
@@ -336,7 +357,7 @@ registration and the whole run execute at import. It cannot be imported.
 Parse arguments → build the database list (`-d` as written, or `pg_database` ordered by
 the greater of `age(datfrozenxid)` and `mxid_age(datminmxid)`, read after `SET lock_timeout`; a failure there exits 1) → for each database: `dbconnect` → set cost limits,
 `client_min_messages` and `lock_timeout` → take the advisory lock, or skip
-the database if another run holds it → run the selection query, or with
+the database if any session holds it, naming the holders → run the selection query, or with
 `--table` the lookup of that name → apply exclusions → for each table: pause
 if a vacuum came before → time check → set `statement_timeout` → VACUUM →
 record the result in `outcome` → close the connection, which releases the
@@ -366,7 +387,9 @@ loops break at their next test of `interrupt_signal`, closing the connection
 - Change the VACUUM statement: where `vacuum_options` and `exquery` are
   built in the loop. `SKIP_LOCKED` stays; see the invariant.
 - Change what a run does about locks: the session settings at the top of
-  the database loop, `ADVISORY_LOCK_KEY`, and `tests/test_locks.py`. Tests
+  the database loop, `ADVISORY_LOCK_KEY` (and, for what a refused run
+  reports, `ADVISORY_LOCK_HOLDER_QUERY` and `advisory_lock_holders_report`),
+  and `tests/test_locks.py`. Tests
   elsewhere that need a VACUUM to be running hold it up with a pinned page
   (`vacuum_held_up`), since a lock no longer holds it.
 - Change how names match: `table_named_in` and the three forms in

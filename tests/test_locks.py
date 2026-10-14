@@ -8,7 +8,8 @@
 #     query's above all, and the wait of the query that lists the databases;
 #   * a run takes an advisory lock in each database while it works there,
 #     and a second run skips a database it finds taken (--no-advisory-lock
-#     turns that off).
+#     turns that off), naming whoever holds the lock and saying whether
+#     that looks like another run or something else (issue #61).
 #
 # The first two are deliberately tested apart, because each covers what the
 # other cannot: SKIP_LOCKED says nothing about the listing query or about a
@@ -23,10 +24,17 @@
 # suite.
 
 import contextlib
+import threading
 import time
 
 import pytest
-from ffharness import FREEZE_ALL, SCRIPT_APP, assert_lines_in_order, wait_for
+from ffharness import (
+    FREEZE_ALL,
+    HARNESS_APP,
+    SCRIPT_APP,
+    assert_lines_in_order,
+    wait_for,
+)
 
 # The key of the advisory lock, written out rather than imported or computed:
 # it is part of what the script documents to its users, who look for it in
@@ -37,6 +45,11 @@ ADVISORY_KEY = 7380385457142659685
 # How the bigint above appears in pg_locks, split into two halves.
 ADVISORY_CLASSID, ADVISORY_OBJID = 1718379896, 1718778469
 TRY_ADVISORY_LOCK = f"SELECT pg_catalog.pg_try_advisory_lock({ADVISORY_KEY})"
+# Text that only the statement asking who holds the lock contains (it is
+# also what ffharness.HolderLookupGate stops the script in front of).
+HOLDER_LOOKUP = "pg_catalog.pg_locks"
+# An application name that is not the script's.
+OTHER_APP = "nightly_report"
 
 # How long a run that is expected not to wait is given.  Far more than it
 # needs, and far less than the harness's default: a run that does wait
@@ -48,11 +61,54 @@ def targets(vacuums):
     return [vacuum.target for vacuum in vacuums]
 
 
-def skipped_as_held(db):
-    """The line a run prints for a database another run is working on."""
+def named(pid, role, application):
+    """How the skip line names one session that holds the lock."""
+    return f'pid {pid}, role {role}, application name "{application}"'
+
+
+def skipped_as_held_by_a_run(db, *holders):
+    """The line for a database that another flexible_freeze run is working
+    on, going by the application name of every holder."""
     return (
         f"skipping database {db.name} (another flexible_freeze run is working "
-        f"on it: advisory lock {ADVISORY_KEY} is held there)"
+        f"on it: advisory lock {ADVISORY_KEY} is held there by "
+        + "; ".join(holders) + ")"
+    )
+
+
+def skipped_as_held_by_another_session(db, *holders):
+    """The line for a database in which a holder of the lock does not go by
+    the script's application name."""
+    if len(holders) == 1:
+        who = ("a session that does not appear to be flexible_freeze, and "
+               "every run will skip this database until that session releases "
+               "the lock or ends")
+    else:
+        who = ("holders not all of which appear to be flexible_freeze, and "
+               "every run will skip this database until they let go of the "
+               "lock")
+    return (
+        f"skipping database {db.name} (advisory lock {ADVISORY_KEY} is held "
+        f"there by {who}: " + "; ".join(holders) + ")"
+    )
+
+
+def skipped_as_held_a_moment_ago(db):
+    """The line for a database whose lock was gone again by the time the
+    script asked who held it."""
+    return (
+        f"skipping database {db.name} (advisory lock {ADVISORY_KEY} was held "
+        "there a moment ago, and its holder had let it go by the time it was "
+        "looked up; the lock is not tried again in this run)"
+    )
+
+
+def skipped_holder_unknown(db, error):
+    """The start of the line for a database whose lock was held and whose
+    holder could not be looked up; `error` is the start of the server's."""
+    return (
+        f"skipping database {db.name} (advisory lock {ADVISORY_KEY} is held "
+        f"there; who holds it could not be determined: {error}"
     )
 
 
@@ -70,18 +126,36 @@ def lock_held(db, statement):
 
 
 @contextlib.contextmanager
-def advisory_lock_held(db):
+def advisory_lock_held(db, *, user=None, application=None, shared=False):
     """Hold the script's advisory lock in `db`, as a run working there does.
 
     Session level, like the script's: it goes when the connection closes.
+    The session is the harness's, as `user` (the superuser by default),
+    under the harness's application name unless `application` is given.
+    That is set last, so that no statement of this session is logged under
+    the script's name, which the statement log goes by.  `shared` takes the
+    lock in share mode, which several sessions can hold at once.
+
+    Yields the process id of the session's backend.
     """
-    conn = db.connect()
+    conn = db.connect(user=user)
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT pg_advisory_lock(%s)", (ADVISORY_KEY,))
-        yield conn
+            take = "pg_advisory_lock_shared" if shared else "pg_advisory_lock"
+            cur.execute(f"SELECT {take}(%s)", (ADVISORY_KEY,))
+            cur.execute("SELECT pg_backend_pid()")
+            pid = cur.fetchone()[0]
+            if application is not None:
+                cur.execute("SELECT set_config('application_name', %s, false)",
+                            (application,))
+        yield pid
     finally:
         conn.close()
+
+
+def holder_lookups(db, since=0):
+    """The script's statements in `db` that ask who holds the lock."""
+    return [sql for sql in db.script_statements(since=since) if HOLDER_LOOKUP in sql]
 
 
 def advisory_lock_holders(db):
@@ -506,14 +580,21 @@ def test_second_run_skips_the_database_the_first_is_working_on(
 
             assert second.returncode == 1
             assert "Traceback" not in second.stderr
-            # In `one` the second run asked for the lock and went no further.
-            assert one.script_statements(since=mark)[-1] == TRY_ADVISORY_LOCK
+            # In `one` the second run asked for the lock, then who had it,
+            # and went no further.
+            statements = one.script_statements(since=mark)
+            assert statements[-2] == TRY_ADVISORY_LOCK
+            assert HOLDER_LOOKUP in statements[-1]
             assert one.script_vacuums(since=mark) == []
             assert two.frozen_since(before_two) == {("public", "t_other")}
+            # The holder is the first run: its backend, its role, and the
+            # application name every run of the script connects with.
             assert_lines_in_order(
                 second.stderr,
                 [
-                    skipped_as_held(one),
+                    skipped_as_held_by_a_run(
+                        one, named(backend, cluster.superuser, SCRIPT_APP)
+                    ),
                     "Not all tables were vacuumed.",
                     f"Databases skipped or left unfinished: {one.name}",
                 ],
@@ -563,24 +644,358 @@ def test_second_run_skips_the_database_the_first_is_working_on(
 
 
 def test_database_whose_advisory_lock_is_held_is_skipped(db, run_ff):
-    # The same, with the test's own session standing in for the other run,
-    # which pins the key and the form of the lock: a session-level lock on
-    # the documented key, taken as one bigint.
+    # The same, with the test's own session holding the lock, which pins the
+    # key and the form of the lock: a session-level lock on the documented
+    # key, taken as one bigint.  That session goes by the harness's
+    # application name, not the script's, so it is not reported as another
+    # run; the next test has more on that.
     db.create_table("t1")
     before = db.frozenxids()
 
-    with advisory_lock_held(db):
+    with advisory_lock_held(db) as pid:
         result = run_ff(*FREEZE_ALL, "-d", db.name, timeout=PROMPT)
 
     assert result.returncode == 1
     assert result.stdout == ""
     assert result.stderr.splitlines() == [
-        skipped_as_held(db),
+        skipped_as_held_by_another_session(
+            db, named(pid, db.cluster.superuser, HARNESS_APP)
+        ),
         "Not all tables were vacuumed.",
         f"Databases skipped or left unfinished: {db.name}",
     ]
-    assert db.script_statements()[-1] == TRY_ADVISORY_LOCK
+    statements = db.script_statements()
+    assert statements[-2] == TRY_ADVISORY_LOCK
+    assert HOLDER_LOOKUP in statements[-1]
     assert db.frozen_since(before) == set()
+
+
+# -- who holds the lock (issue #61) --------------------------------------------
+#
+# The key is fixed and documented, and an advisory lock is checked against
+# no privilege, so any role that can connect can hold it and make every run
+# skip the database.  A run that is refused the lock therefore looks the
+# holder up and names it, and tells a holder that goes by the script's
+# application name (another run, as far as can be seen) from any other.
+
+
+def test_lock_held_by_something_else_is_named_and_reported_as_such(
+    make_db, make_role, run_ff
+):
+    # Another role, another application: not a run of the script.  The
+    # database is skipped as before, with the same exit status, and the
+    # other database is worked through.
+    one, two = make_db("one"), make_db("two")
+    one.create_table("t1")
+    two.create_table("t_other")
+    before_one, before_two = one.frozenxids(), two.frozenxids()
+    other = make_role("other")
+
+    with advisory_lock_held(one, user=other, application=OTHER_APP) as pid:
+        result = run_ff(
+            *FREEZE_ALL, "-v", "-d", f"{one.name},{two.name}", timeout=PROMPT
+        )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "Traceback" not in result.stderr
+    assert result.stderr.splitlines() == [
+        skipped_as_held_by_another_session(one, named(pid, other, OTHER_APP)),
+        "Not all tables were vacuumed.",
+        f"Databases skipped or left unfinished: {one.name}",
+    ]
+    assert one.script_vacuums() == []
+    assert one.frozen_since(before_one) == set()
+    assert two.frozen_since(before_two) == {("public", "t_other")}
+    assert_lines_in_order(
+        result.stdout,
+        [
+            f"working on database {one.name}",
+            f"working on database {two.name}",
+            "processing table public.t_other",
+            "1 tables in 1 databases",
+        ],
+    )
+
+
+def test_holder_is_named_to_a_role_without_the_right_to_read_all_statistics(
+    db, make_role, run_ff
+):
+    # pg_stat_activity hides most of another role's session from a role
+    # that is neither that role nor a member of pg_read_all_stats (its
+    # query, state and wait event), but not its process id, role and
+    # application name, which are all the lookup asks for.  So a run as an
+    # ordinary role names the holder as fully as a superuser's does.
+    runner, other = make_role("runner"), make_role("other")
+
+    with advisory_lock_held(db, user=other, application=OTHER_APP) as pid:
+        result = run_ff(*FREEZE_ALL, "-U", runner, "-d", db.name, timeout=PROMPT)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert result.stderr.splitlines() == [
+        skipped_as_held_by_another_session(db, named(pid, other, OTHER_APP)),
+        "Not all tables were vacuumed.",
+        f"Databases skipped or left unfinished: {db.name}",
+    ]
+    statements = db.script_statements(user=runner)
+    assert statements[-2] == TRY_ADVISORY_LOCK
+    assert HOLDER_LOOKUP in statements[-1]
+
+
+def test_every_holder_is_named_and_one_that_is_not_a_run_decides_the_wording(
+    db, run_ff
+):
+    # Several sessions can hold the key at once, in share mode.  One of
+    # them goes by the script's application name, the other does not; the
+    # report names both, and is the one for a holder that is not a run.
+    with contextlib.ExitStack() as stack:
+        as_run = stack.enter_context(
+            advisory_lock_held(db, application=SCRIPT_APP, shared=True)
+        )
+        as_other = stack.enter_context(
+            advisory_lock_held(db, application=OTHER_APP, shared=True)
+        )
+        # In the order of the process ids, which is the report's.
+        holders = sorted([(as_run, SCRIPT_APP), (as_other, OTHER_APP)])
+        mark = db.cluster.log_offset()
+        result = run_ff(*FREEZE_ALL, "-d", db.name, timeout=PROMPT)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert result.stderr.splitlines()[0] == skipped_as_held_by_another_session(
+        db, *(named(pid, db.cluster.superuser, app) for pid, app in holders)
+    )
+    assert db.script_vacuums(since=mark) == []
+
+
+def test_lock_held_by_a_prepared_transaction(db, run_ff):
+    # A prepared transaction can hold the key (at transaction level) and
+    # outlive the session that prepared it, and a restart.  pg_locks then
+    # has no process id for the holder and pg_stat_activity no row.  It is
+    # never a run (the script holds the key at session level and prepares
+    # nothing), so the report is the pointed one, with what ends it.
+    conn = db.connect(autocommit=False)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (ADVISORY_KEY,))
+            cur.execute("PREPARE TRANSACTION 'ff_holds_the_key'")
+        conn.commit()
+        result = run_ff(*FREEZE_ALL, "-d", db.name, timeout=PROMPT)
+    finally:
+        # Out of any transaction a failed statement above left open.
+        conn.rollback()
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT gid FROM pg_prepared_xacts WHERE gid = 'ff_holds_the_key'"
+            )
+            if cur.fetchall():
+                cur.execute("ROLLBACK PREPARED 'ff_holds_the_key'")
+        conn.close()
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert result.stderr.splitlines() == [
+        (f"skipping database {db.name} (advisory lock {ADVISORY_KEY} is held "
+         "there by a prepared transaction (see pg_prepared_xacts), which is not "
+         "flexible_freeze, and every run will skip this database until that "
+         "transaction is committed or rolled back)"),
+        "Not all tables were vacuumed.",
+        f"Databases skipped or left unfinished: {db.name}",
+    ]
+
+
+def test_only_holders_of_the_key_in_this_database_are_named(
+    make_db, run_ff
+):
+    # What the lookup must leave out: the same key held in another
+    # database, a session still waiting for the key, and a lock on two
+    # integer keys that happen to be the key's halves (objsubid 2, not 1).
+    # And what it must name once: a session holding the key in both modes,
+    # which pg_locks lists twice.
+    one, two = make_db("one"), make_db("two")
+    sessions = []
+
+    def session(database):
+        conn = database.connect()
+        sessions.append(conn)
+        return conn.cursor()
+
+    waiter = None
+    try:
+        both_modes = session(one)
+        both_modes.execute("SELECT pg_advisory_lock(%s)", (ADVISORY_KEY,))
+        both_modes.execute("SELECT pg_advisory_lock_shared(%s)", (ADVISORY_KEY,))
+        both_modes.execute("SELECT pg_backend_pid()")
+        (pid,) = both_modes.fetchone()
+        session(two).execute("SELECT pg_advisory_lock(%s)", (ADVISORY_KEY,))
+        session(one).execute(
+            "SELECT pg_advisory_lock(%s, %s)", (ADVISORY_CLASSID, ADVISORY_OBJID)
+        )
+        waiting = session(one)
+        waiter = threading.Thread(
+            target=waiting.execute,
+            args=("SELECT pg_advisory_lock(%s)", (ADVISORY_KEY,)),
+        )
+        waiter.start()
+        wait_for(
+            lambda: one.cluster.execute(
+                "postgres",
+                "SELECT count(*) FROM pg_locks l JOIN pg_database d "
+                "ON d.oid = l.database WHERE d.datname = %s "
+                "AND l.locktype = 'advisory' AND NOT l.granted",
+                (one.name,),
+            )[0][0] == 1,
+            what="a second session to wait for the key",
+        )
+
+        result = run_ff(*FREEZE_ALL, "-d", one.name, timeout=PROMPT)
+    finally:
+        # The holders first, so that the waiter gets the key and returns;
+        # its own connection only once it has.
+        for conn in sessions[:-1]:
+            conn.close()
+        if waiter is not None:
+            waiter.join(timeout=PROMPT)
+        sessions[-1].close()
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert result.stderr.splitlines()[0] == skipped_as_held_by_another_session(
+        one, named(pid, one.cluster.superuser, HARNESS_APP)
+    )
+
+
+def test_lock_released_before_the_holder_is_looked_up(db, start_ff, holder_lookup_gate):
+    # The script is refused the lock, and stopped before it asks who has it
+    # (holder_lookup_gate); the holder lets go, and only then is the script
+    # let on.  It finds nobody, says so, and skips the database all the
+    # same: it does not try the lock a second time.
+    db.create_table("t1")
+    before = db.frozenxids()
+
+    with advisory_lock_held(db) as pid:
+        proc = start_ff(*FREEZE_ALL, "-d", db.name, env=holder_lookup_gate.env)
+        holder_lookup_gate.wait_until_held()
+        assert advisory_lock_holders(db) == [pid]
+    # The holder's connection is closed; the server drops the lock when the
+    # backend has gone, a moment later.
+    wait_for(
+        lambda: not advisory_lock_holders(db),
+        what=f"the advisory lock in {db.name} to be released",
+    )
+    holder_lookup_gate.release()
+    stdout, stderr = proc.communicate(timeout=PROMPT)
+
+    assert proc.returncode == 1, stdout + stderr
+    assert stdout == ""
+    assert stderr.splitlines() == [
+        skipped_as_held_a_moment_ago(db),
+        "Not all tables were vacuumed.",
+        f"Databases skipped or left unfinished: {db.name}",
+    ]
+    statements = db.script_statements()
+    assert statements.count(TRY_ADVISORY_LOCK) == 1
+    assert statements[-2] == TRY_ADVISORY_LOCK
+    assert HOLDER_LOOKUP in statements[-1]
+    assert db.frozen_since(before) == set()
+
+
+def test_holder_that_cannot_be_looked_up_still_skips_the_database_as_held(
+    make_db, make_role, run_ff
+):
+    # A lookup that fails is not a failure to list the tables: the lock is
+    # known to be held, and that is what is reported, with why the holder
+    # is not named.  Here the role the script runs as may not read pg_locks
+    # in `one` (the view's privileges are per database); in `two` it may,
+    # and the run goes on there.
+    runner = make_role("runner")
+    one, two = make_db("one"), make_db("two")
+    one.execute("REVOKE SELECT ON pg_catalog.pg_locks FROM PUBLIC")
+    two.create_table("t_mine", owner=runner)
+    before_two = two.frozenxids()
+
+    with advisory_lock_held(one):
+        result = run_ff(
+            *FREEZE_ALL, "-v", "-U", runner, "-d", f"{one.name},{two.name}",
+            timeout=PROMPT,
+        )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "Traceback" not in result.stderr
+    assert "couldn't list its tables" not in result.stderr
+    assert result.stderr.splitlines() == [
+        skipped_holder_unknown(one, "permission denied for view pg_locks") + ")",
+        "Not all tables were vacuumed.",
+        f"Databases skipped or left unfinished: {one.name}",
+    ]
+    assert one.script_vacuums() == []
+    assert two.frozen_since(before_two) == {("public", "t_mine")}
+    assert "1 tables in 1 databases" in result.stdout.splitlines()
+
+
+def test_holder_lookup_that_runs_into_the_lock_timeout(
+    make_db, start_ff, holder_lookup_gate
+):
+    # The other way a lookup fails here: a lock on the pg_locks view of the
+    # one database (a relation of that database, so nothing else is held
+    # up), put in place while the script is stopped in front of the lookup.
+    one, two = make_db("one"), make_db("two")
+    two.create_table("t_other")
+    before_two = two.frozenxids()
+
+    with advisory_lock_held(one):
+        proc = start_ff(
+            *FREEZE_ALL, "--lock-timeout", "1", "-d", f"{one.name},{two.name}",
+            env=holder_lookup_gate.env,
+        )
+        try:
+            holder_lookup_gate.wait_until_held()
+            with lock_held(one, "LOCK TABLE pg_catalog.pg_locks IN ACCESS EXCLUSIVE MODE"):
+                holder_lookup_gate.release()
+                stdout, stderr = proc.communicate(timeout=PROMPT)
+        finally:
+            proc.kill()
+
+    assert proc.returncode == 1, stdout + stderr
+    assert "Traceback" not in stderr
+    assert "couldn't list its tables" not in stderr
+    assert stderr.startswith(
+        skipped_holder_unknown(one, "canceling statement due to lock timeout")
+    )
+    assert_lines_in_order(
+        stderr,
+        [
+            "Not all tables were vacuumed.",
+            f"Databases skipped or left unfinished: {one.name}",
+        ],
+    )
+    assert one.script_vacuums() == []
+    assert two.frozen_since(before_two) == {("public", "t_other")}
+
+
+def test_holder_lookup_carries_the_comment_and_the_key_as_values(db, run_ff):
+    # The lookup has parameters, so a percent sign in the comment is
+    # doubled for the driver and has to arrive single.  The key travels as
+    # the two halves pg_locks shows it in.
+    with advisory_lock_held(db):
+        result = run_ff(
+            *FREEZE_ALL, "--comment", "50% of nightly", "-d", db.name, timeout=PROMPT
+        )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    (lookup,) = holder_lookups(db)
+    assert lookup.endswith(" /* 50% of nightly */")
+    assert f"l.classid = {ADVISORY_CLASSID}::oid" in lookup
+    assert f"l.objid = {ADVISORY_OBJID}::oid" in lookup
+    assert "%%" not in lookup
+
+
+def test_no_holder_lookup_when_the_lock_is_free(db, run_ff):
+    # A run that gets the lock sends what it always sent.
+    db.create_table("t1")
+
+    result = run_ff(*FREEZE_ALL, "-d", db.name, timeout=PROMPT)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert TRY_ADVISORY_LOCK in db.script_statements()
+    assert holder_lookups(db) == []
 
 
 def test_advisory_lock_held_in_another_database_does_not_matter(make_db, run_ff):

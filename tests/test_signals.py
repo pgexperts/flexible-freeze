@@ -29,6 +29,11 @@
 # * during the table-listing query: another session holds a lock the query
 #   needs, the script is run with --lock-timeout 0 so that the wait does not
 #   end by itself, and the test waits for the backend to show up as waiting;
+#   for the --table kind lookup, which no lock can hold up without holding
+#   up the lookup before it, the script is first stopped just before the
+#   statement (kind_lookup_gate) and let go once the lock is in place; the
+#   lookup of who holds the advisory lock is reached the same way
+#   (holder_lookup_gate);
 # * during a connection attempt: the script is pointed at a socket that
 #   accepts and never answers (silent_server), and the test waits for the
 #   accept;
@@ -607,6 +612,105 @@ def test_signal_during_the_table_listing_ends_the_run(
     assert one.script_vacuums() == []
     assert two.script_statements() == []
     assert one.frozen_since(before_one) == set()
+    assert two.frozen_since(before_two) == set()
+
+
+@EACH_SIGNAL
+def test_signal_during_the_kind_lookup_ends_the_run(
+    make_db, start_ff, kind_lookup_gate, signum, status
+):
+    # The --table lookup's second statement, which asks what a name that
+    # is no table is (a view, here).  It reads the same catalogs as the
+    # first, so the script is stopped just before it (kind_lookup_gate),
+    # pg_class of that database is locked, and then the script is let go
+    # into the wait.
+    one, two = make_db("one"), make_db("two")
+    for database in (one, two):
+        database.create_schema("sales")
+    one.create_table("items", schema="sales")
+    one.execute("CREATE VIEW sales.orders AS SELECT * FROM sales.items")
+    two.create_table("orders", schema="sales")
+    before_two = two.frozenxids()
+
+    proc = start_ff(
+        *FREEZE_ALL, "-v", *WAIT_FOR_LOCKS, "--table", "orders",
+        "-d", f"{one.name},{two.name}", env=kind_lookup_gate.env,
+    )
+    kind_lookup_gate.wait_until_held()
+    blocker = one.connect(autocommit=False)
+    try:
+        with blocker.cursor() as cur:
+            cur.execute(f"LOCK TABLE pg_catalog.pg_class IN {BLOCKS_LISTING} MODE")
+        kind_lookup_gate.release()
+        wait_until_blocked(one, A_LOCK)
+        proc.send_signal(signum)
+        code, stdout, stderr = finish(proc)
+        # While the lock is still held: an abandoned statement would be there.
+        assert_no_backend_left(one.cluster)
+    finally:
+        blocker.close()
+
+    assert code == status, stdout + stderr
+    # Not a skipped database, not a missing table: the statement was
+    # cancelled on request and the run does not go on.
+    assert stderr.splitlines() == [
+        f"Vacuuming interrupted by {signal.Signals(signum).name}"
+    ]
+    assert "specified single table" not in stdout
+    assert "after vacuuming 0 tables in 0 databases" in stdout.splitlines()
+    assert one.script_vacuums() == []
+    assert two.script_statements() == []
+    assert two.frozen_since(before_two) == set()
+
+
+# -- while looking up who holds the advisory lock -----------------------------
+
+
+@EACH_SIGNAL
+def test_signal_during_the_advisory_lock_holder_lookup_ends_the_run(
+    make_db, start_ff, holder_lookup_gate, signum, status
+):
+    # A run refused the advisory lock asks who holds it.  The script is
+    # stopped just before it asks (holder_lookup_gate), the pg_locks view of
+    # that database is locked, and the script is let go into the wait.  The
+    # signal must end the run as anywhere else: not the database reported
+    # as skipped, with or without a holder, and no further database.
+    one, two = make_db("one"), make_db("two")
+    one.create_table("t1")
+    two.create_table("t_other")
+    before_two = two.frozenxids()
+
+    holder = one.connect()
+    try:
+        with holder.cursor() as cur:
+            cur.execute("SELECT pg_advisory_lock(7380385457142659685)")
+        proc = start_ff(
+            *FREEZE_ALL, "-v", *WAIT_FOR_LOCKS, "-d", f"{one.name},{two.name}",
+            env=holder_lookup_gate.env,
+        )
+        holder_lookup_gate.wait_until_held()
+        blocker = one.connect(autocommit=False)
+        try:
+            with blocker.cursor() as cur:
+                cur.execute(f"LOCK TABLE pg_catalog.pg_locks IN {BLOCKS_LISTING} MODE")
+            holder_lookup_gate.release()
+            wait_until_blocked(one, A_LOCK)
+            proc.send_signal(signum)
+            code, stdout, stderr = finish(proc)
+            # While the lock is still held: an abandoned statement would be there.
+            assert_no_backend_left(one.cluster)
+        finally:
+            blocker.close()
+    finally:
+        holder.close()
+
+    assert code == status, stdout + stderr
+    assert stderr.splitlines() == [
+        f"Vacuuming interrupted by {signal.Signals(signum).name}"
+    ]
+    assert "after vacuuming 0 tables in 0 databases" in stdout.splitlines()
+    assert one.script_vacuums() == []
+    assert two.script_statements() == []
     assert two.frozen_since(before_two) == set()
 
 
