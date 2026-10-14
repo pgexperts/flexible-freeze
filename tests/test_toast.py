@@ -29,6 +29,7 @@
 # create_table pads with one repeated letter, which compresses to nothing.
 
 import contextlib
+import re
 import signal
 import threading
 
@@ -604,4 +605,136 @@ def test_enforced_time_cancel_during_the_toast_statement_is_a_time_limited_stop(
     # Both statements of the one table, and nothing for t_later.
     assert [v.table for v in db.script_vacuum_statements()] == [
         "t_held", toast.removeprefix("pg_toast."),
+    ]
+
+
+# -- the TOAST statement's timeout and -v line (issue #95) --------------------------
+
+
+@contextlib.contextmanager
+def parent_page_pinned(db, name):
+    """Keep a freezing VACUUM of public.<name> waiting on its first page,
+    until the block ends: the pin of vacuum_held_up in test_signals.py.
+    The TOAST table is not pinned, so its statement then runs at once."""
+    conn = db.connect(autocommit=False)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f'DECLARE ff_pin NO SCROLL CURSOR FOR SELECT id FROM public."{name}"')
+            cur.execute("FETCH 1 FROM ff_pin")
+        yield conn
+    finally:
+        conn.close()
+
+
+def run_with_the_clock_moved_during_the_parent(db, start_ff, script_clock, name, seconds):
+    """Run --enforce-time -m 10 and move the script's clock `seconds` on
+    while the parent's statement waits on a pinned page; returns the
+    finished Popen and its (stdout, stderr)."""
+    with parent_page_pinned(db, name):
+        proc = start_ff(
+            *FREEZE_ALL, "--enforce-time", "-m", "10", "-d", db.name,
+            env=script_clock.env,
+        )
+        wait_for(
+            lambda: db.execute(
+                "SELECT 1 FROM pg_stat_activity WHERE application_name = %s "
+                "AND wait_event_type = 'BufferPin' AND query LIKE %s",
+                (SCRIPT_APP, "%PROCESS_TOAST false%"),
+            ),
+            what="the parent's VACUUM to wait for the pinned page",
+        )
+        script_clock.advance(seconds)
+    return proc, proc.communicate(timeout=PROMPT)
+
+
+def timeouts_before_the_pair(db):
+    """The statement_timeout seconds set before the parent's statement and
+    before the TOAST table's, asserting that each SET directly precedes its
+    statement."""
+    statements = db.script_statements()
+    parent, toast_vacuum = db.script_vacuum_statements()
+    assert statements[-3] == parent.sql
+    assert statements[-1] == toast_vacuum.sql
+    seconds = []
+    for timeout in (statements[-4], statements[-2]):
+        match = re.fullmatch(r"SET statement_timeout = '(\d+)s'", timeout)
+        assert match, timeout
+        seconds.append(int(match.group(1)))
+    return seconds
+
+
+def test_enforced_time_sets_the_toast_statements_timeout_from_the_time_left(
+    db, start_ff, script_clock
+):
+    # The TOAST statement gets what is left of the window when it is sent,
+    # not the timeout reckoned before the parent's: otherwise the pair could
+    # take twice the time left plus twice the grace.
+    # The parent's statement is held while the script's clock moves five
+    # minutes on, so that the second timeout is five minutes shorter.
+    db.create_table("t_held")
+
+    proc, (stdout, stderr) = run_with_the_clock_moved_during_the_parent(
+        db, start_ff, script_clock, "t_held", 300
+    )
+
+    assert proc.returncode == 0, stdout + stderr
+    assert stderr == ""
+    parent_timeout, toast_timeout = timeouts_before_the_pair(db)
+    # Ten minutes, less the time the run took to reach the statement, plus
+    # the 30-second grace (as in test_vacuum_run.py); then five minutes
+    # less.
+    assert 600 < parent_timeout <= 630
+    assert 300 <= toast_timeout < 330
+    assert toast_timeout <= parent_timeout - 270
+
+
+def test_enforced_time_still_sends_the_toast_statement_after_the_window_closed(
+    db, start_ff, script_clock
+):
+    # The window closes while the parent's statement runs (the clock moves
+    # an hour on): the TOAST statement is sent all the same, with the
+    # 30-second grace as its whole timeout -- never 0, which would be no
+    # limit at all, nor a negative value, which the server refuses.
+    db.create_table("t_held")
+    toast_before = toast_relfrozenxid(db, "t_held")
+
+    proc, (stdout, stderr) = run_with_the_clock_moved_during_the_parent(
+        db, start_ff, script_clock, "t_held", 3600
+    )
+
+    assert proc.returncode == 0, stdout + stderr
+    assert stderr == ""
+    parent_timeout, toast_timeout = timeouts_before_the_pair(db)
+    assert 600 < parent_timeout <= 630
+    assert toast_timeout == 30
+    assert toast_relfrozenxid(db, "t_held") > toast_before
+
+
+def test_stdout_reader_gone_during_a_split_vacuum_is_no_failed_table(
+    db, start_ff, tmp_path
+):
+    # A failed write to stdout is caught nowhere (ARCHITECTURE.md,
+    # Landmines), and the TOAST statement's -v line is no exception: it used
+    # to be printed inside the table's try, so a reader that had gone away
+    # made the TOAST table "fail" and the run go on.  The script is held
+    # just before the parent's statement, after its -v lines, and the
+    # reader of stdout goes away there.
+    toast = create_toasted_table(db, "t_wide")
+    gate = StatementGate(tmp_path / "gate", "PROCESS_TOAST false")
+
+    proc = start_ff(*FREEZE_ALL, "-v", "-d", db.name, env=gate.env)
+    try:
+        gate.wait_until_held()
+        proc.stdout.close()
+    finally:
+        gate.release()
+    proc.wait(timeout=PROMPT)
+    stderr = proc.stderr.read()
+
+    # It dies of the write, after the table, and reports no failure.
+    assert proc.returncode != 0
+    assert "BrokenPipeError" in stderr
+    assert "failed" not in stderr
+    assert [vacuum.target for vacuum in db.script_vacuum_statements()] == [
+        ("public", "t_wide"), ("pg_toast", toast.removeprefix("pg_toast.")),
     ]

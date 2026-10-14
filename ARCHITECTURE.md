@@ -107,8 +107,10 @@ registration and the whole run execute at import. It cannot be imported.
   lock_timeout`) returns true: server 14 or later and `USAGE` on schema
   `pg_toast`, in practice a superuser (ADR 0019).** The parent's statement
   gets `PROCESS_TOAST false`, and the TOAST table's (`pg_toast.pg_toast_NNNN`)
-  follows it with the same options otherwise; nothing is sent between them,
-  and none is sent after a parent that drew a message. Otherwise the single
+  follows it with the same options otherwise; nothing is sent between them
+  except, with `--enforce-time`, a `SET statement_timeout` reckoned afresh
+  from the time left (issue #95), and none is sent after a parent that drew
+  a message. Otherwise the single
   statement, unchanged. Breaks: `SKIP_LOCKED` warns only about a relation the
   statement names, so without the second statement a locked TOAST table is
   skipped in silence; split for a role without the privilege, every TOAST
@@ -211,9 +213,14 @@ registration and the whole run execute at import. It cannot be imported.
   server passes over a locked TOAST table without a message and the parent
   counts as vacuumed. In a split run the parent's pages are vacuumed (its
   `relfrozenxid` moves) even when its TOAST table is then skipped, so the
-  catalog alone does not show the miss. `--enforce-time`'s
-  `statement_timeout` is set once and applies to each of the two
-  statements.
+  catalog alone does not show the miss. `--enforce-time` sets
+  `statement_timeout` before each of the two statements
+  (`enforced_timeout_query`): set once, the pair could take twice the
+  time left plus twice the grace. The TOAST statement is sent even after the window
+  has closed, with the 30-second grace as its timeout; the floor at the
+  grace keeps the sum from reaching 0 (no limit) or going negative. `-v`
+  prints both statements before the first is sent, outside the table's
+  `try`, so a failed write to stdout is never taken for a failed table.
 - `LOCK TABLE` refuses a TOAST table. Tests hold one with another session's
   VACUUM of it, stopped on a pinned page (`tests/test_toast.py`,
   `toast_vacuum_running`); an open `REINDEX TABLE pg_toast...` also works,
