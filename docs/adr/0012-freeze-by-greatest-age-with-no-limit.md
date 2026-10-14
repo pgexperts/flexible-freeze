@@ -53,3 +53,35 @@ old cluster produces a long list and a first query that sizes every candidate
 (bounded by `lock_timeout`, record 0014). The `pg_catalog` tables are still
 never selected, and partitioned parents are not selected or analyzed, only
 their partitions. Foreign and temporary tables are left out.
+
+## Addendum (2026-10-13)
+
+**System catalogs, on request** (issue #66, item a). The default is unchanged:
+the system catalogs are left to autovacuum, and without the new option the
+freeze statement is byte for byte what it was. `--system-catalogs` replaces the
+condition that leaves out `pg_catalog` and `information_schema` with `true`
+and changes nothing else, so a catalog is held to the same age and size
+thresholds, order, exclusions and time window as any table. It applies to
+freeze mode only: with `--no-freeze` (or `--vacuum`) it is refused at argument
+parsing (exit 2, before the log file is opened or any connection made),
+because that mode selects from `pg_stat_user_tables`, which lists no catalog.
+With `--table` it is accepted and has no effect. No privilege is checked; a
+role that may not vacuum a catalog draws the server's WARNING, reported under
+record 0010. Shared catalogs (`pg_database`, `pg_authid`) are not
+de-duplicated across databases: each database's `pg_class` holds its own
+`relfrozenxid` for them, and a VACUUM moves only the copy in the database it
+ran in (verified), so a shared catalog is selected, and vacuumed, in every
+database in which it is old enough. The consequence above that "the
+`pg_catalog` tables are still never selected" now holds only without the
+option.
+
+**Database order.** "The order of databases by `age(datfrozenxid)` is
+unchanged" no longer holds: without `-d`, databases are ordered by
+`greatest(age(datfrozenxid), mxid_age(datminmxid))` (record 0020, which
+supersedes record 0013).
+
+**A freeze age of exactly 0** (issue #66, item d) — declined. The comparison
+stays `>`, as documented in `--help` and the README: a table whose age is
+exactly `--freezeage` is not selected, so even `--freezeage 0` does not select
+a table whose age is 0. Switching to `>=` would change what the test suite's
+freeze-everything setting selects.

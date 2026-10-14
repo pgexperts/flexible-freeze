@@ -45,3 +45,13 @@ not vacuumed although it was. The opposite gap remains: the server passes
 over a locked TOAST table with no message at all, so the parent still counts
 as vacuumed. Because the setting is made by the script, a database or role
 default of `error` cannot hide the warnings.
+
+## Addendum (2026-10-13)
+
+Record 0019 closes the locked-TOAST gap named in the consequences above for
+sessions on PostgreSQL 14 or later that may use schema `pg_toast` (in practice
+a superuser): such a session vacuums a table's TOAST table in a statement of
+its own, so a locked TOAST table draws a WARNING, and this record's rule
+reports it against the parent. The rule itself is unchanged. For every other
+run the gap remains as stated. Record 0019 rejects confirming from the catalog
+again, for this case.

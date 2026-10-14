@@ -72,3 +72,26 @@ statement's `.sql` keeps it. A quoted value, a value of several words, a
 comment anywhere else, a second comment, or a `/*` inside the comment is
 still an error. The meaning of a value is not worked out, so `TRUNCATE`,
 `TRUNCATE true` and `TRUNCATE on` stay three different entries.
+
+## Addendum (2026-10-13)
+
+The launcher's port may now be text (issue #62). A number is a port the harness
+chose and is checked as before (`check_target`). A string is a test's own text
+for the script's `-p` and is handed over exactly as given (a port list, an
+empty value, something that is no port at all), so that the script's own
+checking of `-p` (record 0021) can be tested. `-H` stays pinned to the
+throwaway cluster's private socket directory (`check_host`), and with the host
+pinned libpq uses the port only to choose a socket inside that directory, so no
+port text can take a run to another server. Port text that argparse would read
+as a host or port option, or that carries a host or port connection keyword
+(`_DSN_REDIRECT`), is still refused, and every refusal on the host side is
+unchanged. A test's own port text may say 5432; the harness still never
+chooses that port itself.
+
+Other additions in the same batch: the statement log is read with the two
+statements of a table whose TOAST table is vacuumed separately (record 0019)
+folded into one entry per table (`fold_toast_vacuums`); `start_ff(ignore_sighup=True)`
+starts the script with SIGHUP ignored, as `nohup` does (record 0011); and
+`StatementGate` (with `KindLookupGate` and `HolderLookupGate`) holds the script
+just before it sends one particular statement, so that a test can put a lock in
+that statement's way.

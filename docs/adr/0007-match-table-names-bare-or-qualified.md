@@ -64,3 +64,25 @@ An empty or blank `--table` value (an unset variable in a cron entry, say) is
 refused at argument parsing with exit 2, by the argparse type
 `non_empty_table`, and the option is tested against `None` afterwards. A
 blank value can therefore no longer mean "every table".
+
+## Addendum (2026-10-13)
+
+A `--table` name that matches no ordinary table or materialized view in a
+database, but does match a partitioned table, a foreign table or a view there,
+is now named for what it is (issue #66, item c). With `-v` each such relation
+gets a line, by its schema-qualified name: `specified single table T exists in
+database D but is a <kind> and cannot be vacuumed by this script`, with `; name
+its partitions with --table instead` for a partitioned table. The kind comes
+from a second query, `TABLE_KIND_QUERY`, sent only when `TABLE_LOOKUP_QUERY`
+has returned nothing; the two share their name-matching SQL
+(`TABLE_NAME_MATCH_SQL`), so a name cannot mean one thing in one and another
+in the other. A failure of the second query is a failure to list the
+database's tables, as for the first. A partitioned table is not expanded into
+its partitions. Any other kind of relation (index, sequence, TOAST table and
+so on) is still reported as not existing. The database is still recorded as
+not having the table, so the summary and the exit status are unchanged.
+
+Residual: the second query is sent whenever the first finds nothing, with or
+without `-v`, although only `-v` prints what it finds. A run without `-v`
+therefore sends one extra catalog query in each database that has no table of
+the name.
