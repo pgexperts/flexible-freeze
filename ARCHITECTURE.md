@@ -307,7 +307,7 @@ registration and the whole run execute at import. It cannot be imported.
   floor of 1 and the refusal of an empty part in the table portion of
   `--exclude-table-in-database` (`db..t`, `db.schema.`, `db.schema..t`;
   the split is `split_outside_quotes`, so dots inside double quotes do not
-  split) and the refusal of surrounding whitespace in that portion are
+  split) and the refusal of surrounding whitespace in either part are
   approximate by design; ADR 0021 lists what they let through (upper
   bounds, the `-p`/`-H` count). `-T` takes `non_empty_table` like `--table`,
   with the same whitespace refusal.

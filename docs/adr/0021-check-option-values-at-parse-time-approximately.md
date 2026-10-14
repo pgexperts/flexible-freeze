@@ -93,8 +93,11 @@ value with leading or trailing whitespace, with exit 2, as they refuse an
 empty one. The value is not stripped: matching is exact, so the stripped name
 would be a different table from the one written. A table whose name really
 begins or ends with whitespace is reached through its quoted form, for example
-`sales." orders"`. The table part of `--exclude-table-in-database` is refused
-for surrounding whitespace in the same way.
+`sales." orders"`. Both parts of `--exclude-table-in-database` are refused
+for surrounding whitespace in the same way (the database part since #112),
+although `-d` strips its names. The database part has no quoted form, so a
+database whose name really begins or ends with whitespace cannot be named
+in this option; that is a residual, and `-T` still excludes its tables.
 
 The empty-part check of `--exclude-table-in-database` is quote-aware: a dot
 inside a double-quoted identifier does not split the table part, so
