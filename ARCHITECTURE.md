@@ -2,7 +2,8 @@
 
 flexible-freeze is one Python script, `scripts/flexible_freeze.py`, that runs
 `VACUUM ([FREEZE,] [ANALYZE,] [TRUNCATE false,] SKIP_LOCKED)` table by table inside a time
-window. PostgreSQL 12 is the oldest server it supports (CI covers 14-18) and
+window (as a superuser on PostgreSQL 14 or later, a table's TOAST table by a
+statement of its own; see the invariants). PostgreSQL 12 is the oldest server it supports (CI covers 14-18) and
 Python 3.11 the oldest interpreter (ADR 0018). It is a
 top-to-bottom script: there is no `main()`, and argument parsing, signal
 registration and the whole run execute at import. It cannot be imported.
@@ -18,11 +19,11 @@ registration and the whole run execute at import. It cannot be imported.
 | Name matching | Compares a user-supplied table name with a table: in Python for the exclusions, in SQL for `--table` | `table_named_in`, `TABLE_NAME_MATCH_SQL` (in `TABLE_LOOKUP_QUERY` and `TABLE_KIND_QUERY`) |
 | Database list (ADR 0013) | `-d`, in the order given, else every connectable non-template database in `pg_database`, by the greater of XID and MultiXact age, read via the `postgres` database in a session with the run's `lock_timeout`; a failure to connect or to read the list is reported with `failure_print` and ends the run (exit 1) | module level, `dblist` |
 | Table selection (ADR 0012) | Three queries: freeze mode (by the greater of XID and MultiXact age; with `--system-catalogs` the system schemas too), `--no-freeze` mode (by dead-tuple fraction), and the `--table` lookup, which replaces either; when that lookup finds no table, a second one asks whether the name is a partitioned table, a foreign table or a view, for the message only | module level, `tabquery`, `system_schema_filter`, `FREEZE_AGE_SQL`, `TABLE_LOOKUP_QUERY`, `TABLE_KIND_QUERY`, `UNVACUUMABLE_KINDS` |
-| Vacuum loop | Exclusions, pause, time check, `statement_timeout`, VACUUM, server messages | module level, `for db in dblist` |
+| Vacuum loop | Exclusions, pause, time check, `statement_timeout`, VACUUM (one statement, or the table's and its TOAST table's: issue #64), server messages | module level, `for db in dblist`, `TOAST_SPLIT_QUERY`, `vacuums` |
 | Lock handling (ADR 0014, 0015) | `SKIP_LOCKED` on every VACUUM; the session's `lock_timeout` (`--lock-timeout`); one advisory lock per database against overlapping runs (`--no-advisory-lock`), and when it is refused a lookup that names its holders | `ADVISORY_LOCK_KEY`, `ADVISORY_LOCK_HOLDER_QUERY`, `advisory_lock_holders_report`, `APPLICATION_NAME`, the session settings and `vacuum_options` in the database loop |
 | Run outcome (ADR 0009) | What was and was not done; the only input to the summary and the exit status | `RunOutcome`, `outcome`, the summary block at the end of the file |
 | Interruption (ADR 0011) | SIGINT, SIGTERM and SIGHUP (the last only if it was not already ignored when the script started): the handler records the signal; the psycopg2 wait callback cancels the running statement and applies `connect_timeout`; the pause ends early; a second signal stops waiting for the server | `signal_handler`, `interrupt_signal`, `interrupt_repeated`, `wait_for_server`, `pause`, `exit_if_interrupted` |
-| Test harness | Throwaway cluster (and a sweep of clusters a killed session left), the single launcher for the script, catalog and statement-log probes, a clock for the script that tests can move and stop, a gate that stops the script just before one statement (`StatementGate`; `KindLookupGate`, `HolderLookupGate`), a probe for the files the script left open at exit, a socket that never answers, a start with SIGHUP ignored (`start_ff(ignore_sighup=True)`), a SCRAM role for password tests, per-subprocess coverage (`.coveragerc`) | `tests/ffharness.py`, `tests/conftest.py` |
+| Test harness | Throwaway cluster (and a sweep of clusters a killed session left), the single launcher for the script, catalog and statement-log probes, a clock for the script that tests can move and stop, a gate that stops the script just before one statement (`StatementGate`; `KindLookupGate`, `HolderLookupGate`), a probe for the files the script left open at exit, a socket that never answers, a start with SIGHUP ignored (`start_ff(ignore_sighup=True)`), a SCRAM role for password tests, per-subprocess coverage (`.coveragerc`), the fold of a TOAST table's VACUUM into its parent's (`fold_toast_vacuums`) | `tests/ffharness.py`, `tests/conftest.py` |
 
 ## Invariants
 
@@ -35,10 +36,13 @@ registration and the whole run execute at import. It cannot be imported.
 - **Connection values are passed to `psycopg2.connect` as keyword arguments,
   never formatted into a connection string.** Breaks: database names come
   from `pg_database` and would be parsed as connection keywords.
-- **A table is a row `(regclass text, nspname, relname)`.** The regclass text
+- **A table is a row `(regclass text, nspname, relname, TOAST regclass text
+  or NULL)`.** The regclass text
   is printed and is the VACUUM target, verbatim. Breaks: quoting or otherwise
   rewriting it produces a wrong or malformed target. `nspname` and `relname`
-  are for matching only.
+  are for matching only; the fourth column only builds the TOAST table's
+  VACUUM. All three table queries (both selections, `TABLE_LOOKUP_QUERY`)
+  return all four.
 - **Exclusion names are compared with `table_named_in`; the `--table` name
   is matched by `TABLE_NAME_MATCH_SQL`, which spells out the same three
   forms** and is the one copy of them in SQL: `TABLE_LOOKUP_QUERY` and
@@ -85,7 +89,10 @@ registration and the whole run execute at import. It cannot be imported.
 - **A VACUUM that returns is counted only if `conn.notices` is empty (ADR
   0010).** The
   session sets `client_min_messages = warning` and the list is emptied before
-  each VACUUM. Breaks: the server skips a table it will not vacuum with a
+  each VACUUM statement. A table vacuumed with two statements (next
+  invariant but one) is counted once, only if both return with no message;
+  a message on either makes it "not vacuumed", recorded and reported under
+  the parent's name. Breaks: the server skips a table it will not vacuum with a
   WARNING and a successful return, and the table is counted as done. The
   message text is never matched; it is translated and version-dependent.
 - **Every VACUUM carries `SKIP_LOCKED` (ADR 0014), and a skipped table is found
@@ -94,6 +101,18 @@ registration and the whole run execute at import. It cannot be imported.
   as its holder takes, with no time check; and a skip that is recognised by
   its message text instead stops being recognised on a server with another
   language or version.
+- **A table with a TOAST table is vacuumed with two statements exactly when
+  `TOAST_SPLIT_QUERY` (sent once per database session, after `SET
+  lock_timeout`) returns true: server 14 or later and `USAGE` on schema
+  `pg_toast`, in practice a superuser (issue #64).** The parent's statement
+  gets `PROCESS_TOAST false`, and the TOAST table's (`pg_toast.pg_toast_NNNN`)
+  follows it with the same options otherwise; nothing is sent between them,
+  and none is sent after a parent that drew a message. Otherwise the single
+  statement, unchanged. Breaks: `SKIP_LOCKED` warns only about a relation the
+  statement names, so without the second statement a locked TOAST table is
+  skipped in silence; split for a role without the privilege, every TOAST
+  statement fails with "permission denied for schema pg_toast"; a time check
+  or a count between the two makes half a table a unit of work.
 - **Each session sets `lock_timeout`, before the table list is read and
   whatever the value (0 too).** It is what bounds the listing query, whose
   size functions wait behind an `ACCESS EXCLUSIVE` lock on any candidate,
@@ -180,9 +199,23 @@ registration and the whole run execute at import. It cannot be imported.
 - A locked table is "not vacuumed" (`outcome.unvacuumed_tables`), not
   "failed", and costs no wait. A lock timeout during a VACUUM is "failed".
   A lock timeout during the listing skips the database.
-- `SKIP_LOCKED` reports a skipped table with a WARNING, but not a skipped
-  TOAST table: the server passes over a locked TOAST table without a
-  message and the parent still counts as vacuumed.
+- `SKIP_LOCKED` reports a skipped table with a WARNING, but not a TOAST
+  table skipped along with its parent. Superuser runs on 14 or later name
+  the TOAST table in a statement of its own and so see the WARNING; the
+  report line names both, and the parent is what is recorded. Every other
+  run (any other role, or a server before 14) still has the gap: the
+  server passes over a locked TOAST table without a message and the parent
+  counts as vacuumed. In a split run the parent's pages are vacuumed (its
+  `relfrozenxid` moves) even when its TOAST table is then skipped, so the
+  catalog alone does not show the miss. `--enforce-time`'s
+  `statement_timeout` is set once and applies to each of the two
+  statements.
+- `LOCK TABLE` refuses a TOAST table. Tests hold one with another session's
+  VACUUM of it, stopped on a pinned page (`tests/test_toast.py`,
+  `toast_vacuum_running`); an open `REINDEX TABLE pg_toast...` also works,
+  but only for `--table`: it takes `ACCESS EXCLUSIVE` on the TOAST index,
+  which `pg_table_size()` in both selections opens, so a selection waits
+  for it and the database is skipped.
 - `lock_timeout` is set per database session, with the cost settings, and
   in the session that reads the database list. A lock timeout there ends
   the run before it has begun (exit 1); in a database's table listing it
@@ -348,6 +381,16 @@ registration and the whole run execute at import. It cannot be imported.
 - Tests assert on the parsed VACUUM statement (`ffharness.parse_vacuum`), not
   on its literal text. Keep it that way when the statement's spelling
   changes.
+- `Database.script_vacuums()` is one entry per table: a split pair is
+  folded (`ffharness.fold_toast_vacuums`) into the parent's entry, with
+  `PROCESS_TOAST false` left out of `.options` and the TOAST statement in
+  `.toast`, so the same assertion holds for a split and an unsplit run. The
+  fold refuses a TOAST statement that does not directly follow a split
+  parent on the same connection or has other options; it cannot tell a
+  missing TOAST statement from a parent that drew a WARNING.
+  `Database.script_vacuum_statements()` is every VACUUM as sent. Most
+  tables the harness makes have a TOAST table, so as the superuser most
+  runs split; tests that count raw statements count two per table.
 - `ruff` runs with default rules on `tests/` but only syntax and
   undefined-name rules on `scripts/`; the script has older style debt that is
   tracked separately.
@@ -356,10 +399,12 @@ registration and the whole run execute at import. It cannot be imported.
 
 Parse arguments → build the database list (`-d` as written, or `pg_database` ordered by
 the greater of `age(datfrozenxid)` and `mxid_age(datminmxid)`, read after `SET lock_timeout`; a failure there exits 1) → for each database: `dbconnect` → set cost limits,
-`client_min_messages` and `lock_timeout` → take the advisory lock, or skip
+`client_min_messages` and `lock_timeout` → ask whether to vacuum TOAST tables
+apart (`TOAST_SPLIT_QUERY`) → take the advisory lock, or skip
 the database if any session holds it, naming the holders → run the selection query, or with
 `--table` the lookup of that name → apply exclusions → for each table: pause
-if a vacuum came before → time check → set `statement_timeout` → VACUUM →
+if a vacuum came before → time check → set `statement_timeout` → VACUUM (and,
+when split and the parent drew no message, the TOAST table's VACUUM) →
 record the result in `outcome` → close the connection, which releases the
 advisory lock → summary and exit status from `outcome`.
 
@@ -393,8 +438,9 @@ loops break at their next test of `interrupt_signal`, closing the connection
   the list. `tests/test_selection.py` builds two databases that differ in
   both ages (`databases_behind_on_different_horizons`); databases made the
   usual way are the same age and show nothing about the order.
-- Change the VACUUM statement: where `vacuum_options` and `exquery` are
-  built in the loop. `SKIP_LOCKED` stays; see the invariant.
+- Change the VACUUM statement: where `vacuum_options` and `vacuums` are
+  built in the loop, for both the single and the split form. `SKIP_LOCKED`
+  stays; see the invariant. `tests/test_toast.py` covers the split.
 - Change what a run does about locks: the session settings at the top of
   the database loop, `ADVISORY_LOCK_KEY` (and, for what a refused run
   reports, `ADVISORY_LOCK_HOLDER_QUERY` and `advisory_lock_holders_report`),

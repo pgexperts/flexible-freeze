@@ -51,6 +51,7 @@ Everything below is relative to 0.6.  The reasons are in `docs/adr/`.
 - `--vacuum` did nothing; it now means `--no-freeze`.
 - An empty entry in `-d` (a doubled or trailing comma) no longer raises an exception.
 - The dead-row percentage used by `--no-freeze` is calculated correctly.
+- A TOAST table locked by another session is reported, and its table counted as not vacuumed (exit status 1), instead of being skipped in silence; this holds for runs as a superuser (a role with `USAGE` on `pg_toast`) on PostgreSQL 14 or later, which vacuum the TOAST table with a statement of its own.  Other runs still have the gap.
 
 ## 0.6
 

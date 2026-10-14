@@ -879,6 +879,59 @@ def test_parse_vacuum_rejects_an_option_outside_its_scope(option):
         parse_vacuum(f"VACUUM (FREEZE, {option}) t1")
 
 
+# -- folding a TOAST table's VACUUM into its parent's (issue #64) ------------------
+
+SPLIT_PARENT = "VACUUM (FREEZE, ANALYZE, PROCESS_TOAST false, SKIP_LOCKED) public.t"
+TOAST_OF_T = "VACUUM (FREEZE, ANALYZE, SKIP_LOCKED) pg_toast.pg_toast_1"
+WHOLE = "VACUUM (FREEZE, ANALYZE, SKIP_LOCKED) public.u"
+
+
+def test_fold_toast_vacuums_folds_a_pair_and_passes_a_single_statement():
+    folded = ffharness.fold_toast_vacuums(
+        [(1, "SET statement_timeout = 0"), (1, SPLIT_PARENT), (1, TOAST_OF_T),
+         (1, "SET statement_timeout = 0"), (1, WHOLE)]
+    )
+    assert [vacuum.target for vacuum in folded] == [("public", "t"), ("public", "u")]
+    # The pair reads like the single statement, apart from its text.
+    assert folded[0].options == folded[1].options == {"FREEZE", "ANALYZE", "SKIP_LOCKED"}
+    assert folded[0].sql == SPLIT_PARENT
+    assert folded[0].toast.target == ("pg_toast", "pg_toast_1")
+    assert folded[1].toast is None
+
+
+def test_fold_toast_vacuums_keeps_a_split_parent_without_its_toast_statement():
+    # As after a parent that drew a WARNING.
+    (folded,) = ffharness.fold_toast_vacuums([(1, SPLIT_PARENT), (1, "SET x")])
+    assert folded.toast is None
+    assert folded.options == {"FREEZE", "ANALYZE", "SKIP_LOCKED"}
+
+
+def test_fold_toast_vacuums_goes_by_connection():
+    # Another session's statement in between does not separate the pair.
+    folded = ffharness.fold_toast_vacuums(
+        [(1, SPLIT_PARENT), (2, "SET x"), (1, TOAST_OF_T)]
+    )
+    assert folded[0].toast.target == ("pg_toast", "pg_toast_1")
+
+
+@pytest.mark.parametrize(
+    "records",
+    [
+        [(1, TOAST_OF_T)],
+        [(1, WHOLE), (1, TOAST_OF_T)],
+        [(1, SPLIT_PARENT), (1, "SET x"), (1, TOAST_OF_T)],
+        [(1, SPLIT_PARENT), (2, TOAST_OF_T)],
+        [(1, SPLIT_PARENT), (1, TOAST_OF_T), (1, TOAST_OF_T)],
+        [(1, SPLIT_PARENT), (1, "VACUUM (FREEZE, SKIP_LOCKED) pg_toast.pg_toast_1")],
+    ],
+    ids=["alone", "after-a-whole-vacuum", "not-directly-after", "other-connection",
+         "twice", "other-options"],
+)
+def test_fold_toast_vacuums_rejects_a_toast_statement_out_of_place(records):
+    with pytest.raises(HarnessError):
+        ffharness.fold_toast_vacuums(records)
+
+
 # -- against the running cluster ---------------------------------------------
 
 

@@ -499,10 +499,12 @@ def pause(seconds):
             break
         time.sleep(min(remaining, WAIT_SLICE_SECS))
 
-# Tables are carried around as rows of (regclass text, schema name, table name).
-# The regclass text is what gets printed and what goes into the VACUUM
-# statement, but it changes with search_path and quoting (orders, sales.orders,
-# "Orders"), so a name given on the command line is also compared with the
+# Tables are carried around as rows of (regclass text, schema name, table name,
+# TOAST table's regclass text or None); the last is used only to build the
+# VACUUM (see TOAST_SPLIT_QUERY).  The regclass text is what gets printed and
+# what goes into the VACUUM statement, but it changes with search_path and
+# quoting (orders, sales.orders, "Orders"), so a name given on the command
+# line is also compared with the
 # plain catalog names.  A name matches a table if it is:
 #   - the regclass text, exactly as the script prints it; or
 #   - the bare table name, which matches that table in every schema; or
@@ -510,7 +512,9 @@ def pause(seconds):
 # Used for --exclude-table and --exclude-table-in-database.  --table goes by
 # the same three forms, but in SQL: see TABLE_LOOKUP_QUERY.
 def table_named_in(names, tabrow):
-    regclass_text, nspname, relname = tabrow
+    # A row has a fourth column, the TOAST table (see TOAST_SPLIT_QUERY),
+    # which plays no part in matching.
+    regclass_text, nspname, relname = tabrow[:3]
     forms = (regclass_text, relname, "%s.%s" % (nspname, relname))
     return any(name in forms for name in names)
 
@@ -577,9 +581,11 @@ TABLE_NAME_MATCH_SQL = """nspname NOT LIKE 'pg_temp%%'
                     pg_class.oid::regclass::text)"""
 
 # Oldest first, as in a freezing run, so that a name present in many schemas
-# is worked through in order of need inside the time window.
+# is worked through in order of need inside the time window.  The last
+# column is the TOAST table, or NULL; see TOAST_SPLIT_QUERY.
 TABLE_LOOKUP_QUERY = """SELECT pg_class.oid::regclass AS full_table_name,
-                nspname, pg_class.relname
+                nspname, pg_class.relname,
+                toast.oid::regclass AS toast_table_name
             FROM pg_class JOIN pg_namespace ON pg_class.relnamespace = pg_namespace.oid
                 LEFT OUTER JOIN pg_class as toast
                     ON pg_class.reltoastrelid = toast.oid
@@ -609,6 +615,31 @@ TABLE_KIND_QUERY = """SELECT pg_class.oid::regclass AS full_table_name,
             ORDER BY nspname, pg_class.relname""".format(
                 kinds=', '.join("'%s'" % kind for kind in UNVACUUMABLE_KINDS),
                 name_match=TABLE_NAME_MATCH_SQL)
+
+# A locked TOAST table (issue #64).  A table's VACUUM also vacuums its TOAST
+# table, but SKIP_LOCKED reports a skip only for a relation the statement
+# names: a TOAST table on which another session holds a conflicting lock (an
+# autovacuum of it, say) is passed over without a word, and the parent was
+# then counted as vacuumed while the TOAST table's relfrozenxid stayed where
+# it was.  So where it can, the run names the TOAST table itself: the
+# parent's VACUUM is sent with PROCESS_TOAST false, and is followed by a
+# VACUUM of the TOAST table by its schema-qualified name, with the same
+# options otherwise.  A locked TOAST table then draws the ordinary WARNING,
+# which the check on conn.notices reports against the parent.
+#
+# "Where it can" is a session in which both of these hold: the server is
+# PostgreSQL 14 or later, where PROCESS_TOAST first exists, and the role may
+# use schema pg_toast.  Naming a TOAST table needs that privilege even of the
+# table's owner, the database's owner and members of pg_maintain, which get
+# "permission denied for schema pg_toast" for it; in practice only a
+# superuser has it.  Everywhere else the VACUUM is the single statement it
+# always was, and a locked TOAST table still goes unreported there.
+#
+# Asked once per database session, right after the session settings, and
+# returns one boolean.  Both conditions are in the query so that every
+# server is sent the same statements up to the VACUUMs.
+TOAST_SPLIT_QUERY = """SELECT pg_catalog.current_setting('server_version_num')::integer >= 140000
+                AND pg_catalog.has_schema_privilege('pg_toast', 'USAGE')"""
 
 # One run per database at a time.  Two runs in the same database (a nightly
 # run still going when the next one starts, a second cron entry) select the
@@ -1037,6 +1068,8 @@ for db in dblist:
         tabquery = """WITH deadrow_tables AS (
                 SELECT relid::regclass as full_table_name,
                     schemaname as nspname, relname,
+                    (SELECT NULLIF(reltoastrelid, 0)::regclass FROM pg_class
+                        WHERE pg_class.oid = relid) as toast_table_name,
                     n_dead_tup::numeric / NULLIF(n_dead_tup + n_live_tup, 0) as dead_pct,
                     pg_table_size(relid) as table_bytes
                 FROM pg_stat_user_tables
@@ -1048,7 +1081,7 @@ for db in dblist:
                 AND ( (now() - last_vacuum) > INTERVAL '1 hour'
                     OR last_vacuum IS NULL )
             )
-            SELECT full_table_name, nspname, relname
+            SELECT full_table_name, nspname, relname, toast_table_name
             FROM deadrow_tables
             WHERE dead_pct > 0.05
             AND table_bytes >= {0} * 2 ^ 20
@@ -1092,6 +1125,7 @@ for db in dblist:
         tabquery = """WITH tabfreeze AS (
                 SELECT pg_class.oid::regclass AS full_table_name,
                 nspname, pg_class.relname,
+                toast.oid::regclass AS toast_table_name,
                 {2} as freeze_age,
                 pg_table_size(pg_class.oid) as table_bytes
             FROM pg_class JOIN pg_namespace ON pg_class.relnamespace = pg_namespace.oid
@@ -1101,7 +1135,7 @@ for db in dblist:
                 AND nspname NOT LIKE 'pg_temp%'
                 AND pg_class.relkind IN ('r', 'm')
             )
-            SELECT full_table_name, nspname, relname
+            SELECT full_table_name, nspname, relname, toast_table_name
             FROM tabfreeze
             WHERE freeze_age > {0}
             AND table_bytes >= {1} * 2 ^ 20
@@ -1136,6 +1170,12 @@ for db in dblist:
             # which is what "without limit" has to mean.
             execute(cur, "SET lock_timeout = '{0}s'".format(args.lock_timeout))
 
+            # Whether this session's VACUUMs name the TOAST table separately;
+            # see TOAST_SPLIT_QUERY.  After lock_timeout, like every other
+            # statement here.
+            execute(cur, TOAST_SPLIT_QUERY)
+            split_toast = cur.fetchone()[0]
+
             # Claim the database; see ADVISORY_LOCK_KEY.  Before the table
             # list is read, so that a run that is turned away has done no
             # work here, and after the settings, so that nothing is left to
@@ -1166,7 +1206,8 @@ for db in dblist:
             execute(cur, tabquery, tabparams)
             verbose_print("getting list of tables")
 
-            # rows of (regclass text, schema name, table name); see table_named_in()
+            # rows of (regclass text, schema name, table name, TOAST table's
+            # regclass text or None); see table_named_in() and TOAST_SPLIT_QUERY
             tablist = cur.fetchall()
 
             # --table found no table to vacuum.  Before that is put down
@@ -1289,6 +1330,9 @@ for db in dblist:
             # is made between tables only.  The server reports the skip
             # with a WARNING and a successful return; the check on
             # conn.notices below is what records the table as not vacuumed.
+            # It does so only for a relation the statement names, which a
+            # TOAST table vacuumed with its parent is not: see
+            # TOAST_SPLIT_QUERY.
             # lock_timeout alone would not do: every locked table would
             # cost the full timeout and be reported as a failure.
             #
@@ -1307,27 +1351,62 @@ for db in dblist:
             # PostgreSQL 12 and only in the parenthesized list.
             if args.skip_truncate:
                 vacuum_options.append("TRUNCATE false")
-            vacuum_options.append("SKIP_LOCKED")
+
+            # The table's TOAST table is vacuumed by a statement of its own
+            # when this session can name it (see TOAST_SPLIT_QUERY), and
+            # then only, so that every other run sends exactly the one
+            # statement it always did.  A table without a TOAST table has
+            # nothing to split (the column is NULL).
+            toast_table = tabrow[3] if split_toast else None
 
             # The regclass text is already valid SQL for this session: the server
             # schema-qualifies it when the schema is not on the search_path and
             # double-quotes each part that needs it.  It must go in unmodified;
             # wrapping it in quotes again turns sales.orders into a single
-            # (nonexistent) name and "Orders" into an invalid identifier.
-            exquery = "VACUUM ({0}) {1}".format(', '.join(vacuum_options), table)
+            # (nonexistent) name and "Orders" into an invalid identifier.  The
+            # TOAST table's regclass text goes in the same way.
+            #
+            # Each entry: the statement, and what it vacuums as a report
+            # names it.  The TOAST table's statement has the parent's
+            # options apart from PROCESS_TOAST, which is meaningless there.
+            if toast_table is None:
+                vacuums = [("VACUUM ({0}) {1}".format(', '.join(vacuum_options + ["SKIP_LOCKED"]), table),
+                            table)]
+            else:
+                vacuums = [("VACUUM ({0}) {1}".format(', '.join(vacuum_options + ["PROCESS_TOAST false", "SKIP_LOCKED"]), table),
+                            table),
+                           ("VACUUM ({0}) {1}".format(', '.join(vacuum_options + ["SKIP_LOCKED"]), toast_table),
+                            "the TOAST table of {t} ({x})".format(t=table, x=toast_table))]
 
-            verbose_print("%s in database %s" % (exquery, db,))
+            # The TOAST table's statement is printed only if it is sent (see
+            # below).
+            verbose_print("%s in database %s" % (vacuums[0][0], db,))
 
+            # The table's one or two statements are one unit of work: the
+            # time limit is checked before the first only, statement_timeout
+            # is set once for both, and the table is counted once, as
+            # vacuumed only if neither statement raised or drew a message.
+            # `vacuuming` is what the statement being sent vacuums, for the
+            # reports below.
+            vacuuming = table
             try:
                 if args.enforcetime:
                     execute(cur, timeout_query)
                 else:
                     execute(cur, "SET statement_timeout = 0")
 
-                # Emptied so that whatever is in it afterwards was raised by
-                # this table's VACUUM and by nothing earlier.
-                del conn.notices[:]
-                execute(cur, exquery)
+                for position, (exquery, vacuuming) in enumerate(vacuums):
+                    if position > 0:
+                        verbose_print("%s in database %s" % (exquery, db,))
+                    # Emptied so that whatever is in it afterwards was
+                    # raised by this statement and by nothing earlier.
+                    del conn.notices[:]
+                    execute(cur, exquery)
+                    # A message settles the table, and `vacuuming` keeps
+                    # naming what drew it.  After the parent's (it was
+                    # locked, say) the TOAST table is left alone.
+                    if conn.notices:
+                        break
             except Exception as ex:
                 # An interrupt first (see the note at the connection attempt
                 # above).  The error is then almost always the cancellation
@@ -1358,7 +1437,7 @@ for db in dblist:
                     outcome.cancelled_table = (table, db)
                     break
 
-                failure_print("VACUUMing %s failed." % table)
+                failure_print("VACUUMing %s failed." % vacuuming)
                 failure_print(str(ex).rstrip())
                 outcome.failed_tables.append((table, db))
 
@@ -1377,8 +1456,15 @@ for db in dblist:
                 # is therefore taken to mean "not vacuumed".  Its text is
                 # passed on but never examined: it is translated, and worded
                 # differently from one server version to the next.
+                #
+                # conn.notices holds what the last statement sent drew: the
+                # parent's, or the TOAST table's (see TOAST_SPLIT_QUERY).  A
+                # message about the TOAST table is reported, and recorded,
+                # against the parent: the TOAST table is part of it, and a
+                # parent whose TOAST table was skipped has not been vacuumed.
                 if conn.notices:
-                    failure_print("VACUUMing %s drew a message from the server; not counting it as vacuumed." % table)
+                    failure_print("VACUUMing {v} drew a message from the server; not counting {t} as vacuumed.".format(
+                        v=vacuuming, t="it" if vacuuming == table else table))
                     for notice in conn.notices:
                         failure_print(notice.rstrip())
                     outcome.unvacuumed_tables.append((table, db))
