@@ -11,9 +11,9 @@ This script is designed for doing VACUUM FREEZE or VACUUM ANALYZE
 runs on your database during known slow traffic periods. Takes a
 timeout so that it won't overrun your slow traffic period.
 
-Tested on Python 3.8, but should work on any supported Python 3.
+Requires Python 3.6 or later (the script checks).  The test suite and CI run on Python 3.13.
 
-Requires PostgreSQL 12 or later: every `VACUUM` is sent with `SKIP_LOCKED`, which older versions do not have.
+Requires PostgreSQL 12 or later: every `VACUUM` is sent with `SKIP_LOCKED`, which older versions do not have.  CI tests PostgreSQL 14 through 18; versions 12 and 13 are supported but not tested.
 
 Requires psycopg2
 
@@ -23,7 +23,7 @@ Requires psycopg2
                               [--enforce-time] [--lock-timeout LOCK_TIMEOUT] [--no-advisory-lock] [-l LOGFILE] [-v] [--debug]
                               [-U DBUSER] [-H DBHOST] [-p DBPORT] [-w DBPASS] [--table TABLE]
 
-    optional arguments:
+    options:
       -h, --help            show this help message and exit
       -m RUN_MIN, --minutes RUN_MIN
                             Number of minutes to run before halting. Defaults to 2 hours
@@ -45,8 +45,8 @@ Requires psycopg2
       --vacuum              Same as --no-freeze (deprecated spelling; use --no-freeze instead)
       --pause PAUSE_TIME    seconds to pause between vacuums. Default is 10.
       --freezeage FREEZEAGE
-                            freeze tables older than this many XIDs. A table's age is the greatest of its transaction ID age and
-                            its MultiXact ID age, and those of its TOAST table; a table whose age is exactly this is not selected.
+                            freeze tables older than this many XIDs. A table's age is the greatest of its transaction ID age and its
+                            MultiXact ID age, and those of its TOAST table; a table whose age is exactly this is not selected.
                             Default 10m XIDs. Ignored with --no-freeze
       --costdelay COSTDELAY
                             vacuum_cost_delay setting in ms. Default 20
@@ -56,8 +56,8 @@ Requires psycopg2
       --enforce-time        enforce time limit by terminating vacuum
       --lock-timeout LOCK_TIMEOUT
                             seconds to wait for a lock before giving up (set as the session's lock_timeout). A database whose table
-                            list cannot be read in that time is skipped, a table whose VACUUM runs into it is reported as failed, and
-                            the run goes on. 0 means wait without limit. Default is 10.
+                            list cannot be read in that time is skipped, a table whose VACUUM runs into it is reported as failed,
+                            and the run goes on. 0 means wait without limit. Default is 10.
       --no-advisory-lock    Do not guard against overlapping runs. By default a run takes an advisory lock in each database while it
                             works there, and skips a database in which another run holds that lock.
       -l LOGFILE, --log LOGFILE
@@ -70,8 +70,8 @@ Requires psycopg2
       -p DBPORT, --port DBPORT
                             database port
       -w DBPASS, --password DBPASS
-                            database password. Visible to other local users in the process list for the whole run; prefer PGPASSWORD,
-                            a .pgpass file or PGSERVICE
+                            database password. Visible to other local users in the process list for the whole run; prefer
+                            PGPASSWORD, a .pgpass file or PGSERVICE
       --table TABLE, -st TABLE
                             only process tables with this name: a bare name matches in every schema, SCHEMA.TABLE only that table.
                             The table is vacuumed whatever its age, size or dead rows: --freezeage, --minsizemb and the --no-freeze
@@ -79,11 +79,11 @@ Requires psycopg2
 
 Notes:
 
-The minutes time limit is normally only enforced at the start of vacuuming each table, allowing vacuums to continue past the end of the time window.  If you set `--enforce-time`, however, it uses statement_timeout to terminate a running vacuum at the end of the time window (plus 30 seconds grace period).  A vacuum terminated that way is not a failure: the run ends as it does for any other stop at the time limit, and the summary names the table whose vacuum was cancelled.  The work done on that table is lost, and it will be selected first again on the next run, so a table that needs longer than the time window to vacuum needs a longer window.
+The minutes time limit is normally only enforced at the start of vacuuming each table, allowing vacuums to continue past the end of the time window.  If you set `--enforce-time`, however, it uses statement_timeout to terminate a running vacuum at the end of the time window (plus 30 seconds grace period).  A vacuum terminated that way is not a failure: the run ends as it does for any other stop at the time limit, and the summary names the table whose vacuum was cancelled.  Pages that vacuum had already frozen stay frozen, but the table's `relfrozenxid` is not advanced, so it will be selected first again on the next run, so a table that needs longer than the time window to vacuum needs a longer window.
 
 `--pause` is a pause between vacuums.  There is none after the last table, and a pause never runs past the end of the time window.
 
-If you do not specify a `--enforce_time`, `flexible_freeze` will issue a `SET statement_timeout = 0` statement before each operation
+If you do not specify `--enforce-time`, `flexible_freeze` will issue a `SET statement_timeout = 0` statement before each operation
 to avoid cancellation by a system- or role-wide `statement_timeout` value.
 
 `flexible_freeze` does not wait for a table that another session has locked.  Each statement is sent as `VACUUM (FREEZE, ANALYZE, SKIP_LOCKED)` (without `FREEZE` or `ANALYZE` according to `--no-freeze` and `--no-analyze`), so a table held by an anti-wraparound autovacuum, a `CREATE INDEX` or anything else that conflicts with `VACUUM` is passed over at once.  The server reports that with a warning, and the table is then treated like any other the server declined to vacuum: its message is printed, the table is listed in the summary as not vacuumed, and the exit status is 1.  The table is selected again on the next run.
@@ -152,7 +152,7 @@ Exit status:
 
 libpq's `PGPASSWORD`, `~/.pgpass` and `PGSERVICE` are honoured, so `-w` is not needed to authenticate.  A password given with `-w` is visible to other local users in the process list for the whole run; prefer one of those instead.
 
-CTRL-C (SIGINT) stops a run, and so does SIGTERM, which is what cron, systemd and `kill` send.  `flexible_freeze` cancels the vacuum in progress on the server, starts no further table or database, and prints its usual summary, which says that the run was interrupted and names the table whose vacuum was cut short.  That table is not counted as failed; as with a vacuum cancelled by `--enforce-time`, the work done on it is lost and it will be selected again on the next run.  A signal is also acted on while `flexible_freeze` is connecting, listing tables, or pausing between vacuums.
+CTRL-C (SIGINT) stops a run, and so does SIGTERM, which is what cron, systemd and `kill` send.  `flexible_freeze` cancels the vacuum in progress on the server, starts no further table or database, and prints its usual summary, which says that the run was interrupted and names the table whose vacuum was cut short.  That table is not counted as failed; as with a vacuum cancelled by `--enforce-time`, the table's `relfrozenxid` is not advanced (pages already frozen stay frozen) and it will be selected again on the next run.  A signal is also acted on while `flexible_freeze` is connecting, listing tables, or pausing between vacuums.
 
 After a signal `flexible_freeze` waits for the server to confirm that the vacuum was cancelled.  If that does not come (the server is not responding, or something between the two drops the cancel request), a second signal ends the wait; so does a cancel request that cannot be delivered at all.  The summary then says that the vacuum was not confirmed cancelled and may still be running on the server; check `pg_stat_activity`.  SIGKILL cannot be handled: it ends `flexible_freeze` at once, and the vacuum it was running carries on in the server until it is done.
 
@@ -168,6 +168,12 @@ The test suite runs the script against a throwaway PostgreSQL cluster that it cr
     ruff check tests
     ruff check --select E9,F63,F7,F82 scripts
 
-The same checks run in GitHub Actions against PostgreSQL 14 through 18 (`.github/workflows/ci.yml`).  The workflow is started manually from the Actions tab.
+To measure the script's line coverage (it runs as a subprocess, so coverage.py starts itself in each run; needs `coverage` 7.13 or later from `requirements-dev.txt`):
+
+    COVERAGE_PROCESS_START=$PWD/.coveragerc python -m pytest
+    python -m coverage combine
+    python -m coverage report
+
+The same checks run in GitHub Actions against PostgreSQL 14 through 18 (`.github/workflows/ci.yml`), followed by the coverage run, which only reports and never fails the job.  The workflow is started manually from the Actions tab.  If a pytest run is killed outright, the next session stops and removes the throwaway cluster it left behind, provided the directory is the current user's and its marker is over an hour old.
 
 

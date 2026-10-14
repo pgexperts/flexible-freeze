@@ -2,7 +2,8 @@
 
 flexible-freeze is one Python script, `scripts/flexible_freeze.py`, that runs
 `VACUUM ([FREEZE,] [ANALYZE,] SKIP_LOCKED)` table by table inside a time
-window. PostgreSQL 12 is the oldest server it supports. It is a
+window. PostgreSQL 12 is the oldest server it supports (CI covers 14-18) and
+Python 3.6 the oldest interpreter. It is a
 top-to-bottom script: there is no `main()`, and argument parsing, signal
 registration and the whole run execute at import. It cannot be imported.
 
@@ -14,13 +15,13 @@ registration and the whole run execute at import. It cannot be imported.
 | Output | Progress, verbose and debug printing; failure reports, which go to stderr and to the log file; password masking | `_print`, `verbose_print`, `failure_print`, `debug_print`, `stamped`, `log_file`, `args_for_display` |
 | Connection | The only place a connection is made; sets autocommit and an empty `search_path` | `dbconnect` |
 | Name matching | Compares a user-supplied table name with a table: in Python for the exclusions, in SQL for `--table` | `table_named_in`, `TABLE_LOOKUP_QUERY` |
-| Database list | `-d`, else every connectable non-template database in `pg_database`, read via the `postgres` database | module level, `dblist` |
-| Table selection | Three queries: freeze mode (by the greater of XID and MultiXact age), `--no-freeze` mode (by dead-tuple fraction), and the `--table` lookup, which replaces either | module level, `tabquery`, `FREEZE_AGE_SQL`, `TABLE_LOOKUP_QUERY` |
+| Database list (ADR 0013) | `-d`, else every connectable non-template database in `pg_database`, read via the `postgres` database | module level, `dblist` |
+| Table selection (ADR 0012) | Three queries: freeze mode (by the greater of XID and MultiXact age), `--no-freeze` mode (by dead-tuple fraction), and the `--table` lookup, which replaces either | module level, `tabquery`, `FREEZE_AGE_SQL`, `TABLE_LOOKUP_QUERY` |
 | Vacuum loop | Exclusions, pause, time check, `statement_timeout`, VACUUM, server messages | module level, `for db in dblist` |
-| Lock handling | `SKIP_LOCKED` on every VACUUM; the session's `lock_timeout` (`--lock-timeout`); one advisory lock per database against overlapping runs (`--no-advisory-lock`) | `ADVISORY_LOCK_KEY`, the session settings and `vacuum_options` in the database loop |
-| Run outcome | What was and was not done; the only input to the summary and the exit status | `RunOutcome`, `outcome`, the summary block at the end of the file |
-| Interruption | SIGINT and SIGTERM: the handler records the signal; the psycopg2 wait callback cancels the running statement and applies `connect_timeout`; the pause ends early; a second signal stops waiting for the server | `signal_handler`, `interrupt_signal`, `interrupt_repeated`, `wait_for_server`, `pause`, `exit_if_interrupted` |
-| Test harness | Throwaway cluster, the single launcher for the script, catalog and statement-log probes, a clock for the script that tests can move and stop, a probe for the files the script left open at exit, a socket that never answers | `tests/ffharness.py`, `tests/conftest.py` |
+| Lock handling (ADR 0014, 0015) | `SKIP_LOCKED` on every VACUUM; the session's `lock_timeout` (`--lock-timeout`); one advisory lock per database against overlapping runs (`--no-advisory-lock`) | `ADVISORY_LOCK_KEY`, the session settings and `vacuum_options` in the database loop |
+| Run outcome (ADR 0009) | What was and was not done; the only input to the summary and the exit status | `RunOutcome`, `outcome`, the summary block at the end of the file |
+| Interruption (ADR 0011) | SIGINT and SIGTERM: the handler records the signal; the psycopg2 wait callback cancels the running statement and applies `connect_timeout`; the pause ends early; a second signal stops waiting for the server | `signal_handler`, `interrupt_signal`, `interrupt_repeated`, `wait_for_server`, `pause`, `exit_if_interrupted` |
+| Test harness | Throwaway cluster (and a sweep of clusters a killed session left), the single launcher for the script, catalog and statement-log probes, a clock for the script that tests can move and stop, a probe for the files the script left open at exit, a socket that never answers, a SCRAM role for password tests, per-subprocess coverage (`.coveragerc`) | `tests/ffharness.py`, `tests/conftest.py` |
 
 ## Invariants
 
@@ -52,21 +53,22 @@ registration and the whole run execute at import. It cannot be imported.
   Breaks: the password lands in stderr or the logfile.
 - **A line about something that makes the exit status non-zero is printed
   with `failure_print`, everything else with `_print` or `verbose_print`.**
-  The rule is spelled out in the comment above `log_file`. Breaks: printed
+  The rule is spelled out in the comment above `log_file` (ADR 0016). Breaks: printed
   with `_print`, a failure is on stdout among the progress lines, or with
   `-l` in the log file alone, and a scheduler that mails stderr reports
   nothing.
 - **Nothing inside the database and table loops exits; it records in
-  `outcome`.** The summary and the exit status are computed once, after the
+  `outcome` (ADR 0009).** The summary and the exit status are computed once, after the
   loops. Breaks: a `sys.exit` in a loop drops every later table and database
   without a summary, and a problem that is only printed never reaches the
   exit status.
-- **A VACUUM that returns is counted only if `conn.notices` is empty.** The
+- **A VACUUM that returns is counted only if `conn.notices` is empty (ADR
+  0010).** The
   session sets `client_min_messages = warning` and the list is emptied before
   each VACUUM. Breaks: the server skips a table it will not vacuum with a
   WARNING and a successful return, and the table is counted as done. The
   message text is never matched; it is translated and version-dependent.
-- **Every VACUUM carries `SKIP_LOCKED`, and a skipped table is found
+- **Every VACUUM carries `SKIP_LOCKED` (ADR 0014), and a skipped table is found
   through `conn.notices` like any other the server declines.** Breaks:
   without the option a VACUUM queues behind a conflicting lock for as long
   as its holder takes, with no time check; and a skip that is recognised by
@@ -78,14 +80,14 @@ registration and the whole run execute at import. It cannot be imported.
   and every lock a VACUUM waits for other than its table's. Breaks: moved
   after the listing, or left out for 0, the listing waits without limit or
   under a database default the operator asked to override.
-- **`ADVISORY_LOCK_KEY` never changes, and the lock is taken per database,
+- **`ADVISORY_LOCK_KEY` never changes (ADR 0015), and the lock is taken per database,
   at session level, inside the `try` that closes the connection.** Breaks:
   two copies of the script with different keys do not see each other; a
   transaction-level lock is gone at once under autocommit; a lock taken
   outside that `try` can outlive the database's work.
 - **The signal handler only assigns `interrupt_signal` and
-  `interrupt_repeated`.** It can run between any two bytecodes. Breaks: printing from it can re-enter a print in
-  progress, exiting from it skips the summary, and closing the connection
+  `interrupt_repeated`.** It can run between any two bytecodes (ADR 0011).
+  Breaks: printing from it can re-enter a print in progress, exiting from it skips the summary, and closing the connection
   from it leaves the VACUUM running in the server.
 - **Every wait on the server goes through `wait_for_server`,** the psycopg2
   wait callback, installed before the first connection. Breaks: inside a
@@ -128,7 +130,11 @@ registration and the whole run execute at import. It cannot be imported.
   message and the parent still counts as vacuumed.
 - `lock_timeout` is set per database session, with the cost settings. The
   connection that reads the database list does not have it.
-  A lost connection ends that database only, and there is no reconnect.
+- A failure in the session settings, the advisory-lock call or the listing
+  query is reported as "couldn't list its tables" and skips the database;
+  the message names only the last.
+- A lost connection ends that database only (recorded as unfinished, exit
+  status 1), and there is no reconnect.
 - A `--table` name that no table in a database has is recorded, and
   printed for that database with `-v` only; it makes the exit status 1 only
   when the name
@@ -203,7 +209,8 @@ registration and the whole run execute at import. It cannot be imported.
 - The default database list is every database with `datallowconn` and not
   `datistemplate`, `postgres` included. The list is still read through a
   connection to `postgres`.
-- Neither selection caps its list; the time window is the only bound.
+- Neither selection caps its list; the time window is the only bound (ADR
+  0012, which superseded 0003).
 - `--freezeage` is compared with one number per table, `FREEZE_AGE_SQL`: the
   greatest of the XID age and the MultiXact age of the table and of its
   TOAST table. `--minsizemb` is compared with `pg_table_size`, in both
@@ -236,7 +243,9 @@ loops break at their next test of `interrupt_signal`, closing the connection
 ## Where to change X
 
 - Add or change an option: the `parser.add_argument` block; mirror it in the
-  usage block of `README.md`, which is a hand-maintained copy of `--help`.
+  usage block of `README.md`, which is a pasted copy of `--help` (regenerate it with
+  `COLUMNS=130 python scripts/flexible_freeze.py --help` on Python 3.10 to
+  3.12; 3.13 prints each option's value name once, so its output differs).
 - Change which tables are selected: the two `tabquery` strings. Keep the
   three leading columns. What `--table` can find is `TABLE_LOOKUP_QUERY`.
 - Change the VACUUM statement: where `vacuum_options` and `exquery` are

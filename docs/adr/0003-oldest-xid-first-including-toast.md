@@ -2,7 +2,8 @@
 id: 0003
 title: Freeze tables oldest-XID first, counting TOAST age
 date: 2015-07-06
-status: Accepted
+status: Superseded
+superseded_by: 0012
 summary: Freeze mode orders tables by the greater of the heap and TOAST relfrozenxid age, descending.
 ---
 
