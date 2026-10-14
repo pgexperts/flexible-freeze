@@ -44,6 +44,7 @@ Everything below is relative to 0.6.  The reasons are in `docs/adr/`.
 - Tables are vacuumed by their schema-qualified name as the server prints it; `-T`, `--exclude-table-in-database` and `--table` match a bare or a `schema.table` name.
 - Without `--enforce-time` each operation is preceded by `SET statement_timeout = 0`; with it, a vacuum cancelled at the time limit is a normal stop (exit 0) that names the table.  When a table's TOAST table is vacuumed by a statement of its own, that statement gets a `statement_timeout` of its own, reckoned from the time then left, so the pair no longer gets the full remaining time twice.
 - A `connect_timeout` (`PGCONNECT_TIMEOUT`, or a service file) that is not a whole number of seconds is refused once, with one message and exit status 2, instead of being reported as a failed connection to every database.
+- A `connect_timeout` of any length is judged by libpq's rule: leading zeros do not count, and a value outside the range of a C int is refused as above (issue #103).
 - `-p` is checked before any connection: one port or a comma-separated list for a multi-host `-H`, each an integer from 1 to 65535; an empty or malformed value is refused with exit status 2.
 - `--costlimit` must be at least 1, the server's minimum; negative values for the other numeric options, and an empty part of `--exclude-table-in-database`, are refused with exit status 2.
 - Sessions run with an empty `search_path`, and connection values are passed to libpq as parameters, not pasted into a connection string.

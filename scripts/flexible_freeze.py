@@ -478,9 +478,20 @@ CANCEL_RETRY_SECS = 2
 # value means no timeout, as in libpq.
 LIBPQ_INTEGER = re.compile(r'[ \t\n\v\f\r]*([+-]?[0-9]+)[ \t\n\v\f\r]*')
 
+# Leading zeros are dropped before int() is called, and the digit count is
+# tested first: int() raises ValueError on a digit string of more than 4300
+# characters, and libpq (strtol) accepts any number of leading zeros.  Ten
+# significant digits cover every C int.
 def connect_timeout_seconds(value):
     match = LIBPQ_INTEGER.fullmatch(value)
-    seconds = int(match.group(1)) if match else None
+    seconds = None
+    if match:
+        text = match.group(1)
+        digits = text.lstrip("+-0")
+        if len(digits) <= 10:
+            seconds = int(digits or "0")
+            if text.startswith("-"):
+                seconds = -seconds
     if seconds is None or not -2**31 <= seconds < 2**31:
         failure_print('connect_timeout is {v}, not a whole number of seconds'.format(v=json.dumps(value)))
         sys.exit(2)
@@ -493,6 +504,11 @@ def wait_for_server(waiting_conn):
                                              psycopg2.extensions.STATUS_BEGIN)
     give_up_at = None
     if connecting:
+        # libpq 12 to 16 raise a connect_timeout of 1 to 2 seconds
+        # (fe-connect.c: `if (timeout < 2) timeout = 2;`); libpq 17 and
+        # later apply 1 as given.  The script applies the value as written,
+        # so a setting means the same wait whichever libpq is installed.
+        # A value of 1 is the one case where the two differ.
         configured = waiting_conn.get_dsn_parameters().get('connect_timeout')
         connect_timeout = 0 if configured is None else connect_timeout_seconds(configured)
         if connect_timeout > 0:

@@ -102,3 +102,24 @@ status of a bad argument; the value can come from a service file, so it cannot
 be checked at parse time (record 0021). What libpq accepts is accepted: an
 optional sign and ASCII digits with white space around them, a negative value
 meaning no timeout.
+
+## Addendum (2026-10-14)
+
+The `connect_timeout` check in the wait callback (issue #103) counts digits
+before it converts them. Python's `int()` refuses a digit string of more than
+4300 characters, which escaped the callback as a `ValueError` and was reported
+as a failure of every database. Leading zeros are dropped first, since libpq
+reads the value with `strtol` and accepts any number of them; more than ten
+significant digits is out of the range of a C int and is refused with the
+existing message and status 2.
+
+libpq does not clamp a `connect_timeout` of 1 the same way across versions.
+libpq 12 to 16 raise a value of 1 to 2 seconds (`fe-connect.c`:
+`if (timeout < 2) timeout = 2;`); libpq 17 and later apply 1 as given. The
+script keeps applying the value as written, so the wait does not depend on the
+installed libpq. A `connect_timeout` of 1 is the only case where the two
+differ, and it is recorded in a comment at `wait_for_server`, not mirrored.
+
+The value can also come from a service file, which reaches the same read as
+`PGCONNECT_TIMEOUT`. The harness does not pass `PGSERVICEFILE` through, so only
+the environment-variable source is tested, by design of the harness.
