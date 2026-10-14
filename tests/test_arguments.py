@@ -342,6 +342,21 @@ def test_empty_table_name_is_rejected_before_connecting(db, cluster, run_ff, opt
     assert db.frozen_since(before) == set()
 
 
+@pytest.mark.parametrize("option", ["-T", "--exclude-table"])
+@pytest.mark.parametrize("value", ["", " \t "])
+def test_empty_exclude_table_is_rejected_before_connecting(db, cluster, run_ff, option, value):
+    # '-T "$VAR"' with VAR unset would otherwise protect nothing, silently.
+    db.create_table("t")
+    before = db.frozenxids()
+    mark = cluster.log_offset()
+
+    result = run_ff(*FREEZE_ALL, option, value)
+
+    assert_rejected(result, cluster, mark)
+    assert "argument must name a table" in result.stderr
+    assert db.frozen_since(before) == set()
+
+
 def test_st_is_still_accepted_for_table(db, run_ff):
     db.create_table("t")
     db.create_table("t_other")
@@ -383,6 +398,21 @@ def test_exclude_table_in_database_rejects_an_empty_schema_part(cluster, run_ff)
     assert_rejected(result, cluster, mark)
     assert (
         "invalid argument 'somedb..t' to flag --exclude-table-in-database: "
+        "argument must be of the form DATABASE.TABLE"
+    ) in result.stderr
+
+
+@pytest.mark.parametrize("value", ["somedb.sch.", "somedb.sch..t"], ids=["trailing", "middle"])
+def test_exclude_table_in_database_rejects_an_empty_qualified_part(cluster, run_ff, value):
+    # Like 'db..t', these could match a table whose relname contains a dot;
+    # they are refused for consistency (ADR 0021).
+    mark = cluster.log_offset()
+
+    result = run_ff(*FREEZE_ALL, "--exclude-table-in-database", value)
+
+    assert_rejected(result, cluster, mark)
+    assert (
+        f"invalid argument '{value}' to flag --exclude-table-in-database: "
         "argument must be of the form DATABASE.TABLE"
     ) in result.stderr
 

@@ -86,9 +86,11 @@ def comment_text(text):
         raise argparse.ArgumentTypeError("must not contain a NUL or a line break: %r" % text)
     return text
 
-# argparse type for --table.  The option is tested against None further on, but
-# an empty or blank value (an unset variable in a cron entry, say) names no
-# table and must not come to mean "every table", so it is refused here.
+# argparse type for --table and -T.  --table is tested against None further on,
+# but an empty or blank value (an unset variable in a cron entry, say) names no
+# table and must not come to mean "every table", so it is refused here.  For -T
+# the same value would match nothing, so the table the cron line meant to
+# protect would be vacuumed without a word.
 def non_empty_table(text):
     if not text.strip():
         raise argparse.ArgumentTypeError("argument must name a table")
@@ -133,7 +135,7 @@ parser.add_argument("-s", "--minsizemb", dest="minsizemb",
                     help="Minimum table size to vacuum/freeze (in MB).  The size is the table's data including its TOAST table, without its indexes.  Default is 0.")
 parser.add_argument("-d", "--databases", dest="dblist",
                     help="Comma-separated list of databases to vacuum, if not all of them")
-parser.add_argument("-T", "--exclude-table", action="append", dest="tables_to_exclude",
+parser.add_argument("-T", "--exclude-table", action="append", dest="tables_to_exclude", type=non_empty_table,
                     help="Exclude any table with this name (in any database).  A bare name matches in every schema; SCHEMA.TABLE matches only that table. You can pass this option multiple times to exclude multiple tables.")
 parser.add_argument("--exclude-table-in-database", action="append", dest="exclude_table_in_database",
                     help="Argument is of form 'DATABASENAME.TABLENAME' or 'DATABASENAME.SCHEMANAME.TABLENAME': exclude the named table, but only when processing the named database. You can pass this option multiple times.")
@@ -852,9 +854,12 @@ if args.exclude_table_in_database:
         # An empty database or table part ('.t', 'db.') has the right shape
         # but can never match anything, so the table it was meant to protect
         # would be vacuumed; it is rejected like a value with no dot at all.
-        # The same holds for 'db..t', whose table part '.t' is a qualified
-        # name with an empty schema.
-        if len(parts) != 2 or not parts[0] or not parts[1] or parts[1].startswith("."):
+        # The same holds for 'db..t' and its kin ('db.schema.',
+        # 'db.schema..t'): an empty part anywhere in the table portion.
+        # Under bare-relname matching (ADR 0007) these could name a table
+        # whose relname holds a dot, and that table becomes unnameable here;
+        # rejecting the whole family keeps the rule uniform (ADR 0021).
+        if len(parts) != 2 or not parts[0] or any(not part for part in parts[1].split(".")):
             print("invalid argument '{arg}' to flag --exclude-table-in-database: argument must be of the form DATABASE.TABLE or DATABASE.SCHEMA.TABLE".format(arg=elem), file=sys.stderr)
             exit(2)
         else:

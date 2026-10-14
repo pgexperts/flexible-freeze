@@ -284,9 +284,10 @@ registration and the whole run execute at import. It cannot be imported.
   because libpq is handed the list as text; `--debug` shows it quoted.
   The number of ports is not compared with the number of hosts; libpq
   does that when it connects. These parse-time checks, `--costlimit`'s
-  floor of 1 and the refusal of `db..t` are approximate by design; ADR
-  0021 lists what they let through (upper bounds, `db.schema.`,
-  `db.schema..t`, `-T ""`).
+  floor of 1 and the refusal of an empty part in the table portion of
+  `--exclude-table-in-database` (`db..t`, `db.schema.`, `db.schema..t`)
+  are approximate by design; ADR 0021 lists what they let through (upper
+  bounds, the `-p`/`-H` count). `-T` takes `non_empty_table` like `--table`.
 - Test files may not contain the default port's number as a literal
   (`test_test_files_do_not_bypass_the_harness`); port tests use other
   numbers.
