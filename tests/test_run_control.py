@@ -228,6 +228,30 @@ def test_failure_to_list_databases_is_fatal(cluster, run_ff):
     assert report.endswith('role "ff_no_such_role" does not exist')
 
 
+def test_database_listing_connects_with_the_port_text(db, cluster, run_ff):
+    # dbconnect's first call site: no -d, so the databases are listed over a
+    # connection made with the same port text.  The leading zero shows it is
+    # the text that was given and not a number made from it.
+    db.create_table("t1")
+    before = db.frozenxids()
+
+    result = run_ff(*FREEZE_ALL, "--debug", port=f"0{cluster.port}")
+
+    assert result.returncode == 0
+    assert f"dbport='0{cluster.port}'" in result.stderr
+    assert T1 in db.frozen_since(before)
+
+
+def test_database_listing_with_a_port_list_is_a_reported_failure(cluster, run_ff):
+    # One pinned host and two ports: libpq refuses, and the script reports
+    # the listing as failed instead of raising.
+    result = run_ff(port=f"{cluster.port},{cluster.port}")
+
+    assert result.returncode == 1
+    assert "Traceback" not in result.stderr
+    assert "Could not list databases" in result.stderr
+
+
 @pytest.mark.parametrize(
     "ended_by, reason",
     [
