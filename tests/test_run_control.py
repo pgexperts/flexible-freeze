@@ -21,6 +21,11 @@ T1 = ("public", "t1")
 # How long a script whose statement was ended from outside is given to exit.
 PROMPT = 15.0
 
+# A database name that is not valid UTF-8.  It can only be given from a
+# SQL_ASCII database, where the server takes the bytes as they come.
+ASCII_DB = "ff_sql_ascii"
+UNDECODABLE_NAME = b"ff_undecodable\xff"
+
 
 def output(result):
     return result.stdout + result.stderr
@@ -271,3 +276,60 @@ def test_failed_database_listing_query_is_fatal(
     assert logfile.read_text().endswith("\n" + stderr)
     assert db.script_statements() == []
     assert db.frozen_since(before) == set()
+
+
+def test_database_list_that_cannot_be_fetched_is_fatal(cluster, db, run_ff, tmp_path):
+    # The query succeeds and the failure is in the loop that fetches its
+    # rows: pg_database is shared, so the session in postgres (UTF8) is sent
+    # the undecodable name's bytes unconverted, and the driver fails to
+    # decode that row when the script iterates over the cursor.
+    #
+    # That database is copied from one that was just frozen, so its
+    # datfrozenxid is younger than that of a copy of template0 and the
+    # script's ORDER BY age(datfrozenxid) DESC puts at least one good row
+    # before it.  The loop has therefore run before it fails, which is the
+    # case in which the loop variable must not be the name the message uses.
+    logfile = tmp_path / "ff.log"
+    db.create_table("t1")
+    db.execute("VACUUM (FREEZE)")
+    cluster.execute(
+        "postgres",
+        f"CREATE DATABASE {ASCII_DB} TEMPLATE template0 ENCODING 'SQL_ASCII'",
+    )
+    maker = cluster.connect(ASCII_DB)
+    try:
+        with maker.cursor() as cur:
+            cur.execute(
+                b'CREATE DATABASE "' + UNDECODABLE_NAME + b'" TEMPLATE '
+                + db.name.encode()
+            )
+            try:
+                # The premise: a database that can be listed is older.
+                cur.execute(
+                    "SELECT datname::text::bytea = %s, age(datfrozenxid) "
+                    "FROM pg_database WHERE datallowconn AND NOT datistemplate",
+                    (UNDECODABLE_NAME,),
+                )
+                ages = cur.fetchall()
+                (bad_age,) = [age for is_bad, age in ages if is_bad]
+                assert bad_age < max(age for is_bad, age in ages if not is_bad)
+
+                result = run_ff(*FREEZE_ALL, "-l", str(logfile), timeout=PROMPT)
+            finally:
+                cur.execute(
+                    b'DROP DATABASE "' + UNDECODABLE_NAME + b'" WITH (FORCE)'
+                )
+    finally:
+        maker.close()
+        cluster.drop_database(ASCII_DB)
+
+    assert result.returncode == 1
+    assert "Traceback" not in result.stderr
+    assert result.stdout == ""
+    (report,) = result.stderr.splitlines()
+    assert report.startswith(
+        "Could not list databases: query in database postgres failed: "
+    )
+    assert "codec can't decode byte 0xff" in report
+    # The log file has the header of the run and then the same report.
+    assert logfile.read_text().endswith("\n" + result.stderr)
