@@ -420,6 +420,30 @@ def test_system_catalogs_and_no_freeze_are_rejected_with_table_too(cluster, run_
     assert "invalid combination of flags --system-catalogs and --no-freeze" in result.stderr
 
 
+@pytest.mark.parametrize("option", ["--no-freeze", "--vacuum"])
+def test_system_catalogs_with_no_freeze_is_rejected_before_the_log_file(
+    run_ff, tmp_path, option
+):
+    # Refused after parsing, but before the log file is opened and before
+    # any connection is tried.  Nothing listens on port 1, so a connection
+    # attempt would end the run with exit status 1.
+    log = tmp_path / "ff.log"
+
+    result = run_ff("--system-catalogs", option, "-l", str(log), "-d", "x", port="1")
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == (
+        "invalid combination of flags --system-catalogs and --no-freeze: "
+        "system catalogs are selected only when freezing\n"
+    )
+    assert not log.exists()
+    # The same command without --system-catalogs gets as far as both.
+    control = run_ff(option, "-l", str(log), "-d", "x", port="1")
+    assert control.returncode == 1
+    assert log.exists()
+
+
 # -- the script source --------------------------------------------------------
 
 
