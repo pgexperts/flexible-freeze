@@ -114,7 +114,7 @@ If no `-d` is given, `flexible_freeze` works on every database that accepts conn
 
 Limitations: partitioned tables themselves are never selected, only their partitions.  Autovacuum does not analyze a partitioned table either, so the statistics kept for the parent as a whole go stale unless you run `ANALYZE` on it yourself.  Foreign tables are not selected, and neither are temporary tables, which only the session that owns them can vacuum.
 
-`--minutes`, `--minsizemb`, `--pause`, `--freezeage`, `--costdelay`, `--costlimit` and `--lock-timeout` take whole numbers and may not be negative.  Empty entries in the `-d` list are ignored, so a doubled or trailing comma is harmless, but a `-d` that names no database at all is an error.
+`--minutes`, `--minsizemb`, `--pause`, `--freezeage`, `--costdelay`, `--costlimit` and `--lock-timeout` take whole numbers and may not be negative; `--costlimit` must be at least 1, the smallest `vacuum_cost_limit` the server accepts.  Empty entries in the `-d` list are ignored, so a doubled or trailing comma is harmless, but a `-d` that names no database at all is an error.
 
 You can specify `--no-analyze` to skip the ANALYZE step. 
 
