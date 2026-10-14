@@ -40,3 +40,7 @@ beside it. The floor (3.11) is lower than what CI runs (3.13), so 3.11 and
 3.12 are supported but not tested in CI. The usage block in `README.md` is a
 copy of `--help` and has to be regenerated on 3.11 or 3.12, because 3.13
 prints each option's value name once and its output differs.
+
+## Addendum (2026-10-14)
+
+CI now also runs the suite on Python 3.11, against PostgreSQL 18 only (the job "PostgreSQL 18 / Python 3.11" in `ci.yml`), so the 3.11 floor is tested. The statements above that CI runs 3.13 only, and that 3.11 is untested there, no longer hold for 3.11; 3.12 is still untested.

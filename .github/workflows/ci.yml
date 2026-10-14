@@ -1,6 +1,8 @@
 # CI: lint, and run the test suite against each supported PostgreSQL major
-# version.  Lint and the tests decide the result; the script's line coverage
-# is printed for information and cannot fail a job.
+# version, on Python 3.13; PostgreSQL 18 also runs on Python 3.11, the floor
+# the script checks for (ADR 0018).  Lint and the tests decide the result;
+# the script's line coverage is printed for information and cannot fail a
+# job.
 #
 # Manual trigger only: the pipeline is run at the end of a block of work,
 # not on every push.  (GitHub offers the "Run workflow" button, and
@@ -38,22 +40,24 @@ jobs:
       - name: Install development requirements
         run: python -m pip install -r requirements-dev.txt
 
-      - name: Lint the tests
-        run: ruff check tests
-
-      # The script predates the linter; only errors that would stop it from
-      # running (syntax errors, undefined names) are enforced there.
-      - name: Lint the script
-        run: ruff check --select E9,F63,F7,F82 scripts
+      # The rules are the ones in ruff.toml, the same for both paths.
+      - name: Lint the tests and the script
+        run: ruff check scripts tests
 
   test:
-    name: PostgreSQL ${{ matrix.postgres }}
+    name: PostgreSQL ${{ matrix.postgres }} / Python ${{ matrix.python }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         postgres: [14, 15, 16, 17, 18]
+        python: ["3.13"]
+        # The floor (ADR 0018) is exercised on the newest server only: one
+        # extra job, not a second row of the whole matrix.
+        include:
+          - postgres: 18
+            python: "3.11"
     env:
       PG_MAJOR: ${{ matrix.postgres }}
       PG_BINDIR: /usr/lib/postgresql/${{ matrix.postgres }}/bin
@@ -62,7 +66,7 @@ jobs:
 
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.13"
+          python-version: ${{ matrix.python }}
           cache: pip
           cache-dependency-path: requirements-dev.txt
 

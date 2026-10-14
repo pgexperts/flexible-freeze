@@ -59,6 +59,10 @@ Everything below is relative to 0.6.  The reasons are in `docs/adr/`.
 - The dead-row percentage used by `--no-freeze` is calculated correctly.
 - A TOAST table locked by another session is reported, and its table counted as not vacuumed (exit status 1), instead of being skipped in silence; this holds for runs as a superuser (a role with `USAGE` on `pg_toast`) on PostgreSQL 14 or later, which vacuum the TOAST table with a statement of its own.  Other runs still have the gap.
 
+### Development
+
+- Part of #51: `ruff` is pinned to 0.17.0 and its rules are named in `ruff.toml`; CI lints `scripts` and `tests` with one command in place of the two narrowed checks. The one finding under those rules, an unused variable in `timestamp()`, is removed. CI runs the suite on Python 3.11 against PostgreSQL 18 as well as on 3.13 against 14 through 18.
+
 ## 0.6
 
 The baseline: the script as it stood before this changelog began.

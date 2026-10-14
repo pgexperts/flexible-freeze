@@ -104,3 +104,7 @@ such a failure is otherwise caught nowhere. So the TOAST statement's line also
 appears when the parent's statement settles the table and the TOAST statement
 is not sent. The test harness's fold of the pair passes over the one `SET
 statement_timeout` between them.
+
+## Addendum (2026-10-14)
+
+Residual: the `server_version_num >= 140000` arm of `TOAST_SPLIT_QUERY` (`scripts/flexible_freeze.py`, line 674), the part that makes the answer false on PostgreSQL 12 and 13, is never run in CI, which covers PostgreSQL 14 through 18 only.

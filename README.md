@@ -22,7 +22,7 @@ This script is designed for doing VACUUM FREEZE or VACUUM ANALYZE
 runs on your database during known slow traffic periods. Takes a
 timeout so that it won't overrun your slow traffic period.
 
-Requires Python 3.11 or later (the script checks).  The test suite and CI run on Python 3.13.
+Requires Python 3.11 or later (the script checks).  The test suite and CI run on Python 3.13, and CI also runs it on 3.11 against PostgreSQL 18.
 
 Requires PostgreSQL 12 or later: every `VACUUM` is sent with `SKIP_LOCKED`, which older versions do not have.  CI tests PostgreSQL 14 through 18; versions 12 and 13 are supported but not tested.
 
@@ -211,8 +211,7 @@ The test suite runs the script against a throwaway PostgreSQL cluster that it cr
 
     pip install -r requirements-dev.txt
     pytest
-    ruff check tests
-    ruff check --select E9,F63,F7,F82 scripts
+    ruff check scripts tests
 
 To measure the script's line coverage (it runs as a subprocess, so coverage.py starts itself in each run; needs `coverage` 7.13 or later from `requirements-dev.txt`):
 
@@ -220,6 +219,6 @@ To measure the script's line coverage (it runs as a subprocess, so coverage.py s
     python -m coverage combine
     python -m coverage report
 
-The same checks run in GitHub Actions against PostgreSQL 14 through 18 (`.github/workflows/ci.yml`), followed by the coverage run, which only reports and never fails the job.  The workflow is started manually from the Actions tab.  If a pytest run is killed outright, the next session stops and removes the throwaway cluster it left behind, provided the directory is the current user's and its marker is over an hour old.
+The same checks run in GitHub Actions against PostgreSQL 14 through 18 on Python 3.13, and PostgreSQL 18 on Python 3.11 (`.github/workflows/ci.yml`), followed by the coverage run, which only reports and never fails the job.  The workflow is started manually from the Actions tab.  If a pytest run is killed outright, the next session stops and removes the throwaway cluster it left behind, provided the directory is the current user's and its marker is over an hour old.
 
 

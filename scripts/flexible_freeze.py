@@ -34,7 +34,6 @@ import datetime
 __version__ = "0.7"
 
 def timestamp():
-    now = time.time()
     return time.strftime("%Y-%m-%d %H:%M:%S %Z")
 
 if sys.hexversion < 0x30B0000:

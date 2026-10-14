@@ -23,7 +23,7 @@ registration and the whole run execute at import. It cannot be imported.
 | Lock handling (ADR 0014, 0015) | `SKIP_LOCKED` on every VACUUM; the session's `lock_timeout` (`--lock-timeout`); one advisory lock per database against overlapping runs (`--no-advisory-lock`), and when it is refused a lookup that names its holders | `ADVISORY_LOCK_KEY`, `ADVISORY_LOCK_HOLDER_QUERY`, `advisory_lock_holders_report`, `APPLICATION_NAME`, the session settings and `vacuum_options` in the database loop |
 | Run outcome (ADR 0009) | What was and was not done; the only input to the summary and the exit status | `RunOutcome`, `outcome`, the summary block at the end of the file |
 | Interruption (ADR 0011) | SIGINT, SIGTERM and SIGHUP (SIGINT and SIGHUP only if not already ignored when the script started; SIGTERM always): the handler records the signal; the psycopg2 wait callback cancels the running statement and applies `connect_timeout`; the pause ends early; a second signal stops waiting for the server | `signal_handler`, `interrupt_signal`, `interrupt_repeated`, `wait_for_server`, `pause`, `exit_if_interrupted` |
-| Test harness | Throwaway cluster (and a sweep of clusters a killed session left), the single launcher for the script, catalog and statement-log probes, a clock for the script that tests can move and stop, a gate that stops the script just before one statement (`StatementGate`; `KindLookupGate`, `HolderLookupGate`), a probe for the files the script left open at exit, a socket that never answers, a start with chosen signals ignored (`start_ff(ignore_signals=(signal.SIGHUP,))`), a SCRAM role for password tests, per-subprocess coverage (`.coveragerc`), the fold of a TOAST table's VACUUM into its parent's (`fold_toast_vacuums`) | `tests/ffharness.py`, `tests/conftest.py` |
+| Test harness | Throwaway cluster (and a sweep of clusters a killed session left), the single launcher for the script, catalog and statement-log probes, a clock for the script that tests can move and stop, a gate that stops the script just before one statement (`StatementGate`; `KindLookupGate`, `HolderLookupGate`), a probe for the files the script left open at exit, a socket that never answers, a start with chosen signals ignored (`start_ff(ignore_signals=(signal.SIGHUP,))`), a SCRAM role for password tests, per-subprocess coverage (`.coveragerc`), the fold of a TOAST table's VACUUM into its parent's (`fold_toast_vacuums`); CI runs no PostgreSQL 12 or 13, so the 12/13 arm of `TOAST_SPLIT_QUERY` is never run there (ADR 0019 addendum) | `tests/ffharness.py`, `tests/conftest.py` |
 
 ## Invariants
 
@@ -421,9 +421,9 @@ registration and the whole run execute at import. It cannot be imported.
   `Database.script_vacuum_statements()` is every VACUUM as sent. Most
   tables the harness makes have a TOAST table, so as the superuser most
   runs split; tests that count raw statements count two per table.
-- `ruff` runs with default rules on `tests/` but only syntax and
-  undefined-name rules on `scripts/`; the script has older style debt that is
-  tracked separately.
+- `ruff check scripts tests` applies the rules named in `ruff.toml` (E4, E7,
+  E9, F), not ruff's own default, which is much wider. The script's style debt,
+  which the wider rules would flag, is tracked in #44.
 
 ## Flow
 
