@@ -140,10 +140,18 @@ _IDENT = r'(?:"(?:[^"]|"")*"|[A-Za-z_][A-Za-z0-9_$]*)'
 # One entry of a parenthesised option list: a name, alone or followed by one
 # unquoted word as its value.
 _VACUUM_OPTION = re.compile(r"(?P<name>[A-Za-z_]+)(?:\s+(?P<value>[A-Za-z0-9_]+))?")
+# The characters str.splitlines() ends a line at, written for a regular
+# expression's character class.  "." would not do in their place: it leaves
+# out the first of them only.
+_LINE_BREAKS = r"\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"
 _VACUUM = re.compile(
     r"^VACUUM\s+"
     r"(?:\((?P<paren>[^)]*)\)\s*|(?P<words>(?:(?:FULL|FREEZE|VERBOSE|ANALYZE)\s+)*))"
-    rf"(?:(?P<schema>{_IDENT})\s*\.\s*)?(?P<table>{_IDENT})\s*;?\s*$",
+    rf"(?:(?P<schema>{_IDENT})\s*\.\s*)?(?P<table>{_IDENT})"
+    # The comment: [ \t] and not \s before it, which would let it start on a
+    # later line than the table.
+    rf"(?:[ \t]*/\*(?:(?!\*/|/\*)[^{_LINE_BREAKS}])*\*/)?"
+    r"\s*;?\s*$",
     re.IGNORECASE,
 )
 
@@ -211,9 +219,15 @@ def parse_vacuum(statement):
     the name (FULL, FREEZE, VERBOSE, ANALYZE) or as a parenthesised list in
     which each entry is an option name, alone or followed by one unquoted
     word as its value (`TRUNCATE false`, `PARALLEL 2`).  An empty entry, or
-    an empty list, is passed over, although the server refuses both.
-    Anything else is an error: a quoted value, a value of several words, a
-    column list, a second table.
+    an empty list, is passed over, although the server refuses both.  After
+    the table there may be one /* ... */ comment, which is what the script's
+    --comment adds.  It has to be on the table's line: nothing but spaces
+    and tabs between the two, and no line break inside it, a line break
+    being any character str.splitlines() ends a line at.  It is accepted and
+    not reported, and `.sql` still has it.  Anything else is an error: a
+    quoted value, a value of several words, a column list, a second table,
+    a comment anywhere else, a second one, or one with a /* inside it (the
+    server nests comments; this does not).
 
     An entry with a value is reported as "NAME value", the value in lower
     case as the server reads a boolean word.  The meaning of a value is not
@@ -641,8 +655,6 @@ class SilentServer:
         self._listener.settimeout(timeout)
         try:
             client, _ = self._listener.accept()
-        # socket.timeout before Python 3.10, where it is not yet the same class
-        # and would simply propagate.
         except TimeoutError:
             raise AssertionError(
                 f"timed out after {timeout}s waiting for a connection attempt"
