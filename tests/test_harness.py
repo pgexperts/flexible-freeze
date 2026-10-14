@@ -567,6 +567,13 @@ def test_test_files_do_not_bypass_the_harness():
         # Empty entries are passed over, which the server would not do.
         ("VACUUM (FREEZE,, ANALYZE,) t1", {"FREEZE", "ANALYZE"}, ("public", "t1")),
         ("VACUUM () t1", set(), ("public", "t1")),
+        # A comment after the table, as --comment adds it, is passed over.
+        (
+            "VACUUM (FREEZE, SKIP_LOCKED) public.t1 /* app:nightly, 100% */",
+            {"FREEZE", "SKIP_LOCKED"},
+            ("public", "t1"),
+        ),
+        ('VACUUM "a/*b" /**/', set(), ("public", "a/*b")),
     ],
 )
 def test_parse_vacuum(statement, options, target):
@@ -581,6 +588,22 @@ def test_parse_vacuum_rejects_what_it_does_not_understand():
         parse_vacuum("VACUUM")
     with pytest.raises(HarnessError):
         parse_vacuum('VACUUM FREEZE "t1", "t2"')
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "VACUUM (FREEZE) t1 /* one */ /* two */",
+        "VACUUM (FREEZE) /* before */ t1",
+        "VACUUM (FREEZE) t1 /* never closed",
+        "VACUUM (FREEZE) t1 /* closed */ and more",
+        "VACUUM (FREEZE) t1 /* two\nlines */",
+    ],
+    ids=["two-comments", "before-the-table", "unterminated", "text-after", "line-break"],
+)
+def test_parse_vacuum_rejects_a_comment_outside_its_scope(statement):
+    with pytest.raises(HarnessError):
+        parse_vacuum(statement)
 
 
 @pytest.mark.parametrize(

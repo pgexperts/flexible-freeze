@@ -237,3 +237,9 @@ def test_help_describes_the_options_as_they_behave(run_ff):
     # --no-truncate: what it leaves out and what that is for
     assert "--no-truncate Do not truncate empty pages off the end of each table" in text
     assert "ACCESS EXCLUSIVE lock" in text
+    # --comment: where the text goes and what it may not contain
+    # (how the two spellings are listed differs between Python versions)
+    assert "[-c COMMENT]" in text
+    assert "--comment COMMENT text to append as a comment" in text
+    assert "/* COMMENT */, to every statement sent to the server" in text
+    assert "It may not contain /* or */, a NUL or a line break" in text

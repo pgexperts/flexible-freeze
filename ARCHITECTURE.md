@@ -14,6 +14,7 @@ registration and the whole run execute at import. It cannot be imported.
 | Argument parsing | Options, defaults, the per-database exclusion map | module level, `parser`, `args`, `database_table_map` |
 | Output | Progress, verbose and debug printing; failure reports, which go to stderr and to the log file; password masking | `_print`, `verbose_print`, `failure_print`, `debug_print`, `stamped`, `log_file`, `args_for_display` |
 | Connection | The only place a connection is made; sets autocommit and an empty `search_path` | `dbconnect` |
+| Statements | The only place a statement is sent; appends the `--comment` text, which `comment_text` has vetted at argument parsing | `execute`, `comment_text` |
 | Name matching | Compares a user-supplied table name with a table: in Python for the exclusions, in SQL for `--table` | `table_named_in`, `TABLE_LOOKUP_QUERY` |
 | Database list (ADR 0013) | `-d`, else every connectable non-template database in `pg_database`, read via the `postgres` database | module level, `dblist` |
 | Table selection (ADR 0012) | Three queries: freeze mode (by the greater of XID and MultiXact age), `--no-freeze` mode (by dead-tuple fraction), and the `--table` lookup, which replaces either | module level, `tabquery`, `FREEZE_AGE_SQL`, `TABLE_LOOKUP_QUERY` |
@@ -43,10 +44,21 @@ registration and the whole run execute at import. It cannot be imported.
   forms.** Breaks: change one without the other and `-T`,
   `--exclude-table-in-database` and `--table` stop agreeing on what a name
   means (ADR 0007).
-- **The `--table` value reaches the server as a query parameter.** It is the
+- **The `--table` value reaches the server as a query parameter.** Apart
+  from the `--comment` text (next invariant) it is the
   only user-supplied text in any query. Breaks: formatted into the statement
   it is SQL injection as the connecting role. Because that statement has
   parameters, its literal percent signs are doubled.
+- **Every statement is sent with `execute(cur, ...)`, never with a cursor's
+  own `execute`, and is passed in without a closing semicolon.** `execute`
+  appends the `--comment` text as ` /* text */`. The text cannot end the
+  comment because `comment_text` refuses, at argument parsing, any value
+  containing `/*`, `*/`, a NUL or a line break; nothing is stripped or
+  escaped except that `%` is doubled when the statement has parameters,
+  which is when psycopg2 formats it. Breaks: a statement sent directly goes
+  without the comment; a check loosened to "clean up" the value lets text
+  such as `**//` close the comment and the rest reach the server as SQL; a
+  semicolon puts the comment after the statement instead of in it.
 - **Connections are autocommit.** Breaks: VACUUM cannot run in a transaction
   block.
 - **`args.dbpass` is never printed; print `args_for_display()` instead.**
@@ -258,6 +270,8 @@ loops break at their next test of `interrupt_signal`, closing the connection
   `TABLE_LOOKUP_QUERY`, together, and `tests/test_table_names.py`.
 - Change connection behaviour: `dbconnect`, and
   `tests/test_connection_setup.py`.
+- Add a statement: send it with `execute(cur, statement, params)`, without
+  a closing semicolon; `tests/test_comment.py` counts the direct calls.
 - Add a way for a run to fall short: a field on `RunOutcome`, its term in
   `work_was_missed()`, its line in the summary block, the exit-status table
   in `README.md`, and `tests/test_run_outcome.py`. Print what reports it

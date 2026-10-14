@@ -259,6 +259,31 @@ def test_interrupt_report_without_verbose(db, start_ff, signum, status):
     ]
 
 
+def test_signal_cancels_a_vacuum_sent_with_a_comment(db, start_ff):
+    # --comment changes the text of every statement and nothing about how
+    # one is sent or waited for.
+    db.create_table("t_held")
+    before = db.frozenxids()
+
+    with vacuum_held_up(db, "t_held"):
+        proc = start_ff(*FREEZE_ALL, "-c", "app:nightly 100%", "-d", db.name)
+        wait_until_blocked(db)
+        proc.send_signal(signal.SIGTERM)
+        code, stdout, stderr = finish(proc)
+        assert_no_backend_left(db.cluster)
+
+    assert code == 143
+    assert stdout == ""
+    assert stderr.splitlines() == [
+        "Vacuuming interrupted by SIGTERM",
+        f"Work remains: VACUUM of public.t_held in database {db.name} was interrupted.",
+    ]
+    vacuums = db.script_vacuums()
+    assert targets(vacuums) == [("public", "t_held")]
+    assert vacuums[0].sql.endswith(" /* app:nightly 100% */")
+    assert db.frozen_since(before) == set()
+
+
 def test_interrupt_outranks_the_enforced_time_limit(db, start_ff, script_clock):
     # After the deadline, with --enforce-time, a cancelled VACUUM normally
     # means "stopped at the time limit" and exit status 0.  Not when the

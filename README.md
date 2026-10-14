@@ -22,6 +22,7 @@ Requires psycopg2
                               [--vacuum] [--pause PAUSE_TIME] [--freezeage FREEZEAGE] [--costdelay COSTDELAY]
                               [--costlimit COSTLIMIT] [-t] [--enforce-time] [--lock-timeout LOCK_TIMEOUT] [--no-advisory-lock]
                               [-l LOGFILE] [-v] [--debug] [-U DBUSER] [-H DBHOST] [-p DBPORT] [-w DBPASS] [--table TABLE]
+                              [-c COMMENT]
 
     options:
       -h, --help            show this help message and exit
@@ -78,6 +79,9 @@ Requires psycopg2
                             only process tables with this name: a bare name matches in every schema, SCHEMA.TABLE only that table.
                             The table is vacuumed whatever its age, size or dead rows: --freezeage, --minsizemb and the --no-freeze
                             thresholds do not apply to it; exclusions still do. -st is an older spelling of this option
+      -c COMMENT, --comment COMMENT
+                            text to append as a comment, /* COMMENT */, to every statement sent to the server, so that monitoring
+                            tools can recognise or ignore what this script runs. It may not contain /* or */, a NUL or a line break
 
 Notes:
 
@@ -138,6 +142,8 @@ A report of a failure is any line about something that by itself makes the exit 
 The split is made for schedulers such as cron, which mail what a job writes to standard error.  A run with `-l` writes nothing to standard output, writes its failures to standard error, and keeps the whole run, failures included and in order, in the log file.  A run without `-l` writes a failure to standard error only; it is not repeated on standard output.  A run in which nothing went wrong writes nothing to standard error, with or without `-l`, unless `--debug` is given.
 
 The log file is appended to, never truncated.  Each run starts its part of it with a blank line, a rule and a `flexible freeze started` line with the time; that header is written only to a log file.  Lines are written out as they are produced, and the file is closed when the script ends, a stop on SIGINT or SIGTERM included; a process that is killed outright (SIGKILL) closes nothing, and loses nothing that was written.  If standard error is itself sent to the log file (`-l FILE 2>>FILE`), each failure is in it twice.  A failure report that cannot be written to standard error, because whatever was reading it has gone away, is still written to the log file; the run goes on, writes nothing more to standard error, and ends with the exit status it would have had.  If the file cannot be opened, the run does not start: the error is on standard error and the exit status is 1.  Errors in the command line are found before the log file is opened and are never in it.
+
+`--comment TEXT` (or `-c TEXT`) appends ` /* TEXT */` to every statement `flexible_freeze` sends: the `VACUUM`s, and also the session settings, the advisory-lock call and the queries that list the databases and the tables.  It is there so that monitoring tools which read comments in statements can pick out what this script runs, or ignore it; for example `-c application:flexible_freeze,pganalyze:no-alert`.  The text is sent as given, so it may not contain `/*` or `*/`, a NUL or a line break; such a value is an error in the command line (exit status 2) and nothing is sent.  It is not altered to make it fit.  With `-v`, the line printed for each table shows its `VACUUM` without the comment; the text is in the argument lists that `--debug` and a log file with `-v` print.
 
 `-t` puts the time in front of each message (once, if the message runs to several lines), failure reports included; the copy of a report in the log file carries the same time as the one on standard error.  A password given with `-w` is shown as `********` wherever the arguments are printed (`--debug`, and the log file with `-v`).
 

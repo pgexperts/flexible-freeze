@@ -50,6 +50,23 @@ def non_negative_int(text):
         raise argparse.ArgumentTypeError("must not be negative: %r" % text)
     return value
 
+# argparse type for --comment.  The text is put between /* and */ after every
+# statement (see execute), so it must not be able to end that comment: what
+# came after the end would reach the server as SQL.  A value that could is
+# rejected, not cleaned up.  Taking the delimiters out does not work, because
+# what is left can close up into one: with each "/*" and then each "*/"
+# removed, "**//" becomes "*/".  An opening delimiter is refused as well:
+# PostgreSQL nests block comments, so it would leave the comment open and
+# every statement of the run a syntax error.  A line break would spread each
+# statement over several lines of the server's log, and a NUL cannot be sent
+# at all.
+def comment_text(text):
+    if "/*" in text or "*/" in text:
+        raise argparse.ArgumentTypeError("must not contain /* or */: %r" % text)
+    if "\0" in text or "\n" in text or "\r" in text:
+        raise argparse.ArgumentTypeError("must not contain a NUL or a line break: %r" % text)
+    return text
+
 parser = argparse.ArgumentParser()
 parser.add_argument("-m", "--minutes", dest="run_min",
                     type=non_negative_int, default=120,
@@ -116,6 +133,8 @@ parser.add_argument("-w", "--password", dest="dbpass",
 # -st is kept because existing invocations use it.
 parser.add_argument("--table", "-st", dest="table",
                   help="only process tables with this name: a bare name matches in every schema, SCHEMA.TABLE only that table.  The table is vacuumed whatever its age, size or dead rows: --freezeage, --minsizemb and the --no-freeze thresholds do not apply to it; exclusions still do.  -st is an older spelling of this option")
+parser.add_argument("-c", "--comment", dest="comment", type=comment_text,
+                  help="text to append as a comment, /* COMMENT */, to every statement sent to the server, so that monitoring tools can recognise or ignore what this script runs.  It may not contain /* or */, a NUL or a line break")
 
 args = parser.parse_args()
 
@@ -212,6 +231,29 @@ def failure_print(some_message):
         os.close(devnull)
     return True
 
+# Every statement the script sends goes through here, and nothing else calls
+# a cursor's execute(): that is what makes --comment apply to all of them,
+# the settings and the catalog queries as much as the VACUUM.
+#
+# The comment goes at the very end, with a space on either side of the text,
+# so that a text beginning or ending with "/" or "*" cannot join up with a
+# delimiter.  A statement is passed in without a closing semicolon: after one
+# the comment would follow the statement instead of being part of it, and
+# the server's per-statement text (pg_stat_statements) would not have it.
+#
+# psycopg2 %-formats a statement if and only if it is given parameters, None
+# being the one value that counts as not given.  So a percent sign in the
+# comment is doubled in exactly that case; doubled for a statement without
+# parameters it would arrive doubled, and left single in one with parameters
+# it would be read as a placeholder.
+def execute(cur, statement, params=None):
+    if args.comment is not None:
+        comment = args.comment
+        if params is not None:
+            comment = comment.replace("%", "%%")
+        statement = "{0} /* {1} */".format(statement, comment)
+    cur.execute(statement, params)
+
 # Returns an open connection or raises; it never returns None.  Callers
 # decide what a failure means: fatal while listing the databases, a skipped
 # database inside the run.
@@ -238,7 +280,7 @@ def dbconnect(dbname, dbuser, dbhost, dbport, dbpass):
     # trade-off: on PostgreSQL 16 and earlier, ANALYZE of a table whose
     # expression index depends on search_path can fail under the empty path.
     cur = conn.cursor()
-    cur.execute("SELECT pg_catalog.set_config('search_path', '', false)")
+    execute(cur, "SELECT pg_catalog.set_config('search_path', '', false)")
     cur.close()
 
     return conn
@@ -441,7 +483,7 @@ TABLE_LOOKUP_QUERY = """SELECT pg_class.oid::regclass AS full_table_name,
                 AND %(name)s::text IN (pg_class.relname::text,
                     nspname::text || '.' || pg_class.relname::text,
                     pg_class.oid::regclass::text)
-            ORDER BY {freeze_age} DESC, nspname, pg_class.relname;""".format(
+            ORDER BY {freeze_age} DESC, nspname, pg_class.relname""".format(
                 freeze_age=FREEZE_AGE_SQL)
 
 # One run per database at a time.  Two runs in the same database (a nightly
@@ -634,7 +676,7 @@ if args.dblist is None:
 
     cur = conn.cursor()
     try:
-        cur.execute("""SELECT datname FROM pg_database
+        execute(cur, """SELECT datname FROM pg_database
             WHERE datallowconn AND NOT datistemplate
             ORDER BY age(datfrozenxid) DESC""")
     except Exception:
@@ -733,7 +775,7 @@ for db in dblist:
             FROM deadrow_tables
             WHERE dead_pct > 0.05
             AND table_bytes >= {0} * 2 ^ 20
-            ORDER BY dead_pct DESC, table_bytes DESC;""".format(args.minsizemb)
+            ORDER BY dead_pct DESC, table_bytes DESC""".format(args.minsizemb)
     else:
     # if freezing, get list of top tables to freeze, oldest first; what
     # "oldest" means is at FREEZE_AGE_SQL.
@@ -765,7 +807,7 @@ for db in dblist:
             FROM tabfreeze
             WHERE freeze_age > {0}
             AND table_bytes >= {1} * 2 ^ 20
-            ORDER BY freeze_age DESC, table_bytes DESC;""".format(
+            ORDER BY freeze_age DESC, table_bytes DESC""".format(
                 args.freezeage, args.minsizemb, FREEZE_AGE_SQL)
 
     # From here on the connection is closed on every way out of this
@@ -773,12 +815,12 @@ for db in dblist:
     # time limit, and a stop on a signal.
     try:
         try:
-            cur.execute("SET vacuum_cost_delay = {0}".format(args.costdelay))
-            cur.execute("SET vacuum_cost_limit = {0}".format(args.costlimit))
+            execute(cur, "SET vacuum_cost_delay = {0}".format(args.costdelay))
+            execute(cur, "SET vacuum_cost_limit = {0}".format(args.costlimit))
             # Needed by the check on conn.notices after each VACUUM (see
             # there): a database or role default of ERROR would otherwise
             # keep the server's warnings from this session.
-            cur.execute("SET client_min_messages = warning")
+            execute(cur, "SET client_min_messages = warning")
             # Ends every wait for a lock in this session after this long,
             # with an error that the handlers here record like any other:
             # against the database when it was the table listing, against
@@ -793,20 +835,20 @@ for db in dblist:
             # it never cuts short a VACUUM that is running.  Sent in every
             # case, 0 included: that replaces a database or role default,
             # which is what "without limit" has to mean.
-            cur.execute("SET lock_timeout = '{0}s'".format(args.lock_timeout))
+            execute(cur, "SET lock_timeout = '{0}s'".format(args.lock_timeout))
 
             # Claim the database; see ADVISORY_LOCK_KEY.  Before the table
             # list is read, so that a run that is turned away has done no
             # work here, and after the settings, so that nothing is left to
             # fail between the claim and the first table.
             if args.advisory_lock:
-                cur.execute("SELECT pg_catalog.pg_try_advisory_lock({0})".format(ADVISORY_LOCK_KEY))
+                execute(cur, "SELECT pg_catalog.pg_try_advisory_lock({0})".format(ADVISORY_LOCK_KEY))
                 if not cur.fetchone()[0]:
                     failure_print("skipping database {d} (another flexible_freeze run is working on it: advisory lock {k} is held there)".format(d=db, k=ADVISORY_LOCK_KEY))
                     outcome.skipped_databases.append(db)
                     continue
 
-            cur.execute(tabquery, tabparams)
+            execute(cur, tabquery, tabparams)
             verbose_print("getting list of tables")
 
             # rows of (regclass text, schema name, table name); see table_named_in()
@@ -940,14 +982,14 @@ for db in dblist:
 
             try:
                 if args.enforcetime:
-                    cur.execute(timeout_query)
+                    execute(cur, timeout_query)
                 else:
-                    cur.execute("SET statement_timeout = 0")
+                    execute(cur, "SET statement_timeout = 0")
 
                 # Emptied so that whatever is in it afterwards was raised by
                 # this table's VACUUM and by nothing earlier.
                 del conn.notices[:]
-                cur.execute(exquery)
+                execute(cur, exquery)
             except Exception as ex:
                 # An interrupt first (see the note at the connection attempt
                 # above).  The error is then almost always the cancellation

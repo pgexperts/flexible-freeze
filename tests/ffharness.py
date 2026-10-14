@@ -143,7 +143,8 @@ _VACUUM_OPTION = re.compile(r"(?P<name>[A-Za-z_]+)(?:\s+(?P<value>[A-Za-z0-9_]+)
 _VACUUM = re.compile(
     r"^VACUUM\s+"
     r"(?:\((?P<paren>[^)]*)\)\s*|(?P<words>(?:(?:FULL|FREEZE|VERBOSE|ANALYZE)\s+)*))"
-    rf"(?:(?P<schema>{_IDENT})\s*\.\s*)?(?P<table>{_IDENT})\s*;?\s*$",
+    rf"(?:(?P<schema>{_IDENT})\s*\.\s*)?(?P<table>{_IDENT})\s*"
+    r"(?:/\*(?:(?!\*/).)*\*/\s*)?;?\s*$",
     re.IGNORECASE,
 )
 
@@ -211,9 +212,12 @@ def parse_vacuum(statement):
     the name (FULL, FREEZE, VERBOSE, ANALYZE) or as a parenthesised list in
     which each entry is an option name, alone or followed by one unquoted
     word as its value (`TRUNCATE false`, `PARALLEL 2`).  An empty entry, or
-    an empty list, is passed over, although the server refuses both.
-    Anything else is an error: a quoted value, a value of several words, a
-    column list, a second table.
+    an empty list, is passed over, although the server refuses both.  After
+    the table there may be one /* ... */ comment on the same line, which is
+    what the script's --comment adds; it is accepted and not reported, and
+    `.sql` still has it.  Anything else is an error: a quoted value, a value
+    of several words, a column list, a second table, a comment anywhere
+    else or a second one.
 
     An entry with a value is reported as "NAME value", the value in lower
     case as the server reads a boolean word.  The meaning of a value is not
