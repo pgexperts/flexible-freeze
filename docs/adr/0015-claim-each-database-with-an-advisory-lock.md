@@ -49,3 +49,26 @@ holding the lock until the VACUUM ends, so the next run skips the database
 until then. The key sits in the namespace shared with applications' own
 advisory locks. A skipped database is exit 1 even though nothing is wrong with
 the database.
+
+## Addendum (2026-10-13)
+
+A refused lock now names its holders (issue #61). When
+`pg_try_advisory_lock()` returns false, the run sends
+`ADVISORY_LOCK_HOLDER_QUERY` (`pg_locks` left-joined to `pg_stat_activity`,
+for the key's two 32-bit halves with `objsubid` 1) and the skip line names each
+holder by pid, role and application name; those three columns are visible to
+any role, so no extra privilege is needed. The wording goes by
+`application_name`: a holder named `flexible_freeze` is reported as another run,
+as before; any other is reported as a session that does not appear to be
+flexible_freeze, with a warning that every run will skip the database until it
+lets go; a holder with no pid is a prepared transaction and is never taken for
+a run; a holder whose application name cannot be found is not called either.
+`application_name` is set by the client, so a session can pass itself off as a
+run or the reverse; that is accepted and documented in the README, and the
+distinction is a hint for the operator that decides nothing. If the holder has
+let go by the time of the lookup, the line says the lock was held a moment ago;
+if the lookup fails, the line says the lock is held and why its holder could
+not be determined. In every case the database is skipped, the exit status is 1,
+and the lock is not tried again. A run that gets the lock sends nothing new.
+The key and the rest of this decision are unchanged, as is the consequence that
+any role that can connect can make every run skip a database.

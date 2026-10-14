@@ -63,3 +63,13 @@ truncation is sent, so the table's `vacuum_truncate` storage parameter still
 decides; `TRUNCATE true` is never sent, since it would override a table set
 never to be truncated. Like `SKIP_LOCKED`, the option exists from
 PostgreSQL 12 and only in the parenthesized form.
+
+## Addendum (2026-10-13)
+
+The session that lists the databases now sets `lock_timeout` from
+`--lock-timeout` as well, 0 included (record 0020), so it is no longer the one
+session without the bound. The consequence above that a locked TOAST table is
+skipped without a message, its parent counted as vacuumed, no longer holds for
+sessions on PostgreSQL 14 or later that may use schema `pg_toast`; see record
+0019. Such a session adds `PROCESS_TOAST false` to the parent's option list and
+sends a second statement for the TOAST table, with `SKIP_LOCKED` on both.

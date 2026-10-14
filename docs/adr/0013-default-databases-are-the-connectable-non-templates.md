@@ -2,7 +2,8 @@
 id: 0013
 title: The default database list is every connectable non-template database
 date: 2026-10-13
-status: Accepted
+status: Superseded
+superseded_by: 0020
 summary: Without -d the script works on each database with datallowconn and not datistemplate, postgres included, oldest datfrozenxid first.
 ---
 

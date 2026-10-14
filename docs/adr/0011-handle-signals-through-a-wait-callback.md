@@ -56,3 +56,27 @@ name resolution still block, outside the callback. SIGHUP is not handled. After
 a second signal the exit status is 128 plus the signal while a VACUUM may
 still run, and finding it is left to `pg_stat_activity`. SIGKILL still leaves
 the VACUUM running.
+
+## Addendum (2026-10-13)
+
+"SIGHUP is not handled" no longer holds (issue #65, item b). SIGHUP is now
+registered with the same handler as SIGINT and SIGTERM, so a closed terminal or
+dropped ssh session cancels the running VACUUM and the run exits 129 (128 plus
+the signal). Two exceptions: a SIGHUP that is already ignored when the script
+starts, which is how `nohup` runs a command, stays ignored (only "ignored" can
+be inherited across the exec, so the script finds either that or the default);
+and on a platform without SIGHUP the registration is skipped. The harness can
+start the script with SIGHUP ignored (record 0008).
+
+A failure while listing the databases is now a reported failure (record 0020).
+The interrupt is tested before that failure is reported, as everywhere else, so
+a signal during the listing still ends the run with 128 plus the signal.
+
+Declined in the same issue, and so still consequences of this record:
+
+- **Item a:** a multi-host `-H` still does not fail over from a host that
+  answers nothing; the one `connect_timeout` is spent on the first host.
+- **Item d:** `conn.cancel()` and name resolution still block outside the wait
+  callback, so a signal is not acted on until they return. Fixing it would need
+  a thread or a non-blocking resolver, and this record rejected a worker
+  thread.
