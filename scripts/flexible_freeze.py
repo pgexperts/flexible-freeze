@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 '''Flexible Freeze script for PostgreSQL databases
 Version 0.6
-(c) 2014-2021 PostgreSQL Experts Inc.
-Licensed under The PostgreSQL License
+(c) 2014, Josh Berkus, Quinn Weaver and PostgreSQL Experts Inc.
+Licensed under the 2-clause BSD License
 
 This script is designed for doing VACUUM FREEZE or VACUUM ANALYZE runs
 on your database during known slow traffic periods.  If doing both
@@ -28,8 +28,8 @@ def timestamp():
     now = time.time()
     return time.strftime("%Y-%m-%d %H:%M:%S %Z")
 
-if sys.hexversion < 0x3060000:
-    print("At least Python 3.6 required; you have %s" % sys.version, file=sys.stderr)
+if sys.hexversion < 0x30B0000:
+    print("At least Python 3.11 required; you have %s" % sys.version, file=sys.stderr)
     exit(1)
 
 # argparse type for the options that are counts, sizes or durations.  A
@@ -536,7 +536,7 @@ def tables_for_display(tables):
 
 debug_print("python version: %s" % sys.version)
 debug_print("psycopg2 version: %s" % psycopg2.__version__)
-debug_print("argparse version: %s" % argparse.__version__)
+debug_print("argparse version: %s" % getattr(argparse, "__version__", "n/a"))
 debug_print("parameters: %s" % repr(args_for_display()))
 
 # process arguments that argparse can't handle completely on its own
