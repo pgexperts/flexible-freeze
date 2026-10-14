@@ -231,9 +231,11 @@ def db(make_db):
 
 @pytest.fixture
 def run_ff(cluster):
-    """run_ff(*args, env=None, cwd=None, timeout=60) -> CompletedProcess.
+    """run_ff(*args, env=None, cwd=None, timeout=60, port=None) ->
+    CompletedProcess.
 
     Runs the script against the throwaway cluster with text stdout/stderr.
+    `port` is only for a silent_server.
     """
     return cluster.run_ff
 
@@ -247,13 +249,23 @@ def script_clock(tmp_path):
 
 
 @pytest.fixture
+def silent_server(cluster):
+    """A ffharness.SilentServer: accepts the script's connection and never
+    answers it.  Pass its `.port` to start_ff / run_ff."""
+    server = cluster.silent_server()
+    yield server
+    server.close()
+
+
+@pytest.fixture
 def start_ff(cluster):
-    """start_ff(*args, env=None, cwd=None) -> Popen, for tests that must act
-    while the script is running.  Anything still alive is killed afterwards."""
+    """start_ff(*args, env=None, cwd=None, port=None) -> Popen, for tests
+    that must act while the script is running.  Anything still alive is
+    killed afterwards.  `port` is only for a silent_server."""
     started = []
 
-    def launcher(*args, env=None, cwd=None):
-        proc = cluster.start_ff(*args, env=env, cwd=cwd)
+    def launcher(*args, env=None, cwd=None, port=None):
+        proc = cluster.start_ff(*args, env=env, cwd=cwd, port=port)
         started.append(proc)
         return proc
 

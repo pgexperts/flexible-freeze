@@ -17,7 +17,8 @@ registration and the whole run execute at import. It cannot be imported.
 | Table selection | Two queries: freeze mode (by XID age) and `--no-freeze` mode (by dead-tuple fraction) | module level, `tabquery` |
 | Vacuum loop | Exclusions, pause, time check, `statement_timeout`, VACUUM, server messages | module level, `for db in dblist` |
 | Run outcome | What was and was not done; the only input to the summary and the exit status | `RunOutcome`, `outcome`, the summary block at the end of the file |
-| Test harness | Throwaway cluster, the single launcher for the script, catalog and statement-log probes, a movable clock for the script | `tests/ffharness.py`, `tests/conftest.py` |
+| Interruption | SIGINT and SIGTERM: the handler records the signal; the psycopg2 wait callback cancels the running statement and applies `connect_timeout`; the pause ends early; a second signal stops waiting for the server | `signal_handler`, `interrupt_signal`, `interrupt_repeated`, `wait_for_server`, `pause`, `exit_if_interrupted` |
+| Test harness | Throwaway cluster, the single launcher for the script, catalog and statement-log probes, a clock for the script that tests can move and stop, a socket that never answers | `tests/ffharness.py`, `tests/conftest.py` |
 
 ## Invariants
 
@@ -51,6 +52,24 @@ registration and the whole run execute at import. It cannot be imported.
   each VACUUM. Breaks: the server skips a table it will not vacuum with a
   WARNING and a successful return, and the table is counted as done. The
   message text is never matched; it is translated and version-dependent.
+- **The signal handler only assigns `interrupt_signal` and
+  `interrupt_repeated`.** It can run between any two bytecodes. Breaks: printing from it can re-enter a print in
+  progress, exiting from it skips the summary, and closing the connection
+  from it leaves the VACUUM running in the server.
+- **Every wait on the server goes through `wait_for_server`,** the psycopg2
+  wait callback, installed before the first connection. Breaks: inside a
+  blocking libpq call the interpreter does not run, so a signal is not even
+  recorded until the statement returns. The one exception is `conn.cancel()`
+  itself, which blocks while it delivers the request.
+- **Every wait is sliced (`WAIT_SLICE_SECS`) and tests `interrupt_signal`
+  between slices.** A handler that returns does not end the `select()` or
+  `sleep()` it interrupted; Python resumes them (PEP 475). Breaks: a plain
+  `time.sleep(pause)` or a `select()` with no timeout sees the signal only
+  when the wait is over anyway.
+- **Every `except` in the database and table loops tests `interrupt_signal`
+  before treating the error as a failure.** The cancel that a signal causes
+  arrives as an ordinary error. Breaks: the interrupted table is recorded as
+  failed (or the database as skipped) and the run goes on.
 - **`dbconnect()` returns a connection or raises.** Breaks: a `None` return
   fails later, outside the handler that would have skipped the database.
 - **Each database's connection is closed by the `try`/`finally` around its
@@ -69,10 +88,11 @@ registration and the whole run execute at import. It cannot be imported.
   recorded and makes the exit status 1. A lost connection ends that database
   only, and there is no reconnect.
 - Exit status: 0 complete or stopped at the time limit, 1 work missed (or
-  the run could not start), 2 bad arguments. A stop at the time limit is 0
-  on purpose, including a vacuum cancelled by `--enforce-time`; that case is
-  told from a failure by the error being a query cancel, `--enforce-time`
-  being set, and the deadline having passed.
+  the run could not start), 2 bad arguments, 130 stopped by SIGINT, 143
+  stopped by SIGTERM (128 + the signal number; these outrank 0 and 1). A
+  stop at the time limit is 0 on purpose, including a vacuum cancelled by
+  `--enforce-time`; that case is told from a failure by the error being a
+  query cancel, `--enforce-time` being set, and the deadline having passed.
 - The time limit is checked before each table only (ADR 0002). It is not
   checked during the table listing. The pause is taken before a vacuum that
   follows another one, not after each, and is cut off at the limit.
@@ -86,7 +106,30 @@ registration and the whole run execute at import. It cannot be imported.
   purpose (ADR 0005); do not "fix" that by removing it.
 - `-l` rebinds `sys.stdout` to the logfile. Debug output and tracebacks stay
   on stderr.
-- The SIGINT handler cannot run while psycopg2 is blocked in a VACUUM.
+- A signal is acted on by whatever it interrupted, within one wait slice:
+  `wait_for_server` cancels the statement with `conn.cancel()` and keeps
+  waiting for the server's answer, so the error surfaces from the
+  `execute()` that was waiting. The cancel is not sent from the handler.
+  It is repeated (`CANCEL_RETRY_SECS`) because a backend that has not yet
+  read the statement ignores the request. A signal that lands between two
+  statements cancels nothing at that moment; the next statement's wait
+  sends the request as soon as it begins.
+- The wait for the server's answer is given up when `cancel()` raises (the
+  request could not be delivered) or a second signal arrives
+  (`interrupt_repeated`), always after one request has been sent. The
+  exception leaving the callback makes psycopg2 close the connection, and
+  `conn.closed` in the table loop's handler is what marks the VACUUM as
+  not confirmed cancelled (`outcome.interrupt_unconfirmed`). Without the
+  second signal a server that never answers leaves a process only SIGKILL
+  can end.
+- `interrupt_signal` is copied to `outcome.interrupted_by` once, after the
+  loops; the summary and the exit status read only the copy. The steps
+  before the loops (the database list) have no summary and call
+  `exit_if_interrupted()` instead.
+- With a wait callback installed libpq does not apply `connect_timeout`;
+  `wait_for_server` does, to the attempt as a whole and not per host.
+- The wait callback is process-wide in psycopg2 and changes how every query
+  and connection attempt waits, not only VACUUM.
 - The default database list excludes `postgres`, `template0` and `template1`
   by name.
 - Freeze mode caps the table list at 1000; `--no-freeze` mode has no cap.
@@ -106,6 +149,11 @@ exclusions → for each table: pause if a vacuum came before → time check →
 set `statement_timeout` → VACUUM → record the result in `outcome` → close the
 connection → summary and exit status from `outcome`.
 
+On SIGINT or SIGTERM: the handler records the signal → the wait in progress
+notices it (`wait_for_server` cancels the statement, `pause` returns) → the
+loops break at their next test of `interrupt_signal`, closing the connection
+→ the same summary, led by the interruption → exit 130 or 143.
+
 ## Where to change X
 
 - Add or change an option: the `parser.add_argument` block; mirror it in the
@@ -119,6 +167,9 @@ connection → summary and exit status from `outcome`.
 - Add a way for a run to fall short: a field on `RunOutcome`, its term in
   `work_was_missed()`, its line in the summary block, the exit-status table
   in `README.md`, and `tests/test_run_outcome.py`.
+- Add a step that can block: make it a psycopg2 call (covered by the wait
+  callback) or a sliced wait like `pause`, test `interrupt_signal` first in
+  its error handling, and add a case to `tests/test_signals.py`.
 - Add a test: use the fixtures in `tests/conftest.py`; prove outcomes from
   the catalog (`Database.frozen_since`) or the statement log
   (`Database.script_vacuums`), not from the script's output alone.
