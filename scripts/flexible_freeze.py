@@ -92,10 +92,16 @@ def comment_text(text):
 # but an empty or blank value (an unset variable in a cron entry, say) names no
 # table and must not come to mean "every table", so it is refused here.  For -T
 # the same value would match nothing, so the table the cron line meant to
-# protect would be vacuumed without a word.
+# protect would be vacuumed without a word.  A value with leading or trailing
+# whitespace is refused too, not stripped: matching is exact, so the stripped
+# name would be a different table from the one written, and a table really
+# named " orders" stays reachable through its quoted form (ADR 0021).
 def non_empty_table(text):
     if not text.strip():
         raise argparse.ArgumentTypeError("argument must name a table")
+    if text != text.strip():
+        raise argparse.ArgumentTypeError(
+            "argument must not have leading or trailing whitespace")
     return text
 
 # argparse type for -p/--port.  Accepted: one port, or a comma-separated list
@@ -877,6 +883,25 @@ debug_print("parameters: %s" % repr(args_for_display()))
 
 # process arguments that argparse can't handle completely on its own
 
+# Splits the table part of a --exclude-table-in-database value at the dots
+# outside double quotes, so that "a..b" is one name.  A doubled "" inside
+# quotes toggles the state twice and needs no case of its own.  An unbalanced
+# quote leaves the rest of the value quoted: the dots after it do not split,
+# the entry matches no table, and -v lists it as unmatched like any other
+# name that matches nothing.
+def split_outside_quotes(text):
+    parts, current, quoted = [], [], False
+    for ch in text:
+        if ch == '"':
+            quoted = not quoted
+        if ch == "." and not quoted:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    parts.append("".join(current))
+    return parts
+
 database_table_map = {}
 if args.exclude_table_in_database:
     for elem in args.exclude_table_in_database:
@@ -890,9 +915,18 @@ if args.exclude_table_in_database:
         # 'db.schema..t'): an empty part anywhere in the table portion.
         # Under bare-relname matching (ADR 0007) these could name a table
         # whose relname holds a dot, and that table becomes unnameable here;
-        # rejecting the whole family keeps the rule uniform (ADR 0021).
-        if len(parts) != 2 or not parts[0] or any(not part for part in parts[1].split(".")):
+        # rejecting the whole family keeps the rule uniform (ADR 0021).  The
+        # split leaves quoted dots alone, so 'db.s."a..b"' has no empty part.
+        # A table part with surrounding whitespace is refused as -T is.
+        if (len(parts) != 2 or not parts[0]
+                or any(not part for part in split_outside_quotes(parts[1]))):
             print("invalid argument '{arg}' to flag --exclude-table-in-database: argument must be of the form DATABASE.TABLE or DATABASE.SCHEMA.TABLE".format(arg=elem), file=sys.stderr)
+            exit(2)
+        elif parts[1] != parts[1].strip():
+            print(("invalid argument '{arg}' to flag "
+                   "--exclude-table-in-database: table name must not have "
+                   "leading or trailing whitespace").format(arg=elem),
+                  file=sys.stderr)
             exit(2)
         else:
             dat = parts[0]
