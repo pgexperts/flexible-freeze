@@ -77,7 +77,7 @@ def test_no_freeze_vacuums_a_quoted_table_off_the_search_path(db, run_ff):
     assert result.returncode == 0, result.stdout + result.stderr
     vacuums = db.script_vacuums()
     assert targets(vacuums) == [("Sales", "OrderItems")]
-    assert vacuums[0].options == {"ANALYZE"}
+    assert vacuums[0].options == {"ANALYZE", "SKIP_LOCKED"}
     db.wait_for_vacuum_count("OrderItems", 1, schema="Sales")
     assert db.is_analyzed("OrderItems", schema="Sales")
     assert not db.is_analyzed("skipped", schema="Sales")
@@ -297,7 +297,7 @@ def test_no_freeze_honours_exclude_table_in_database(make_db, run_ff):
     assert result.returncode == 0, result.stdout + result.stderr
     vacuums = one.script_vacuums()
     assert targets(vacuums) == [("Sales", "OrderItems")]
-    assert vacuums[0].options == {"ANALYZE"}
+    assert vacuums[0].options == {"ANALYZE", "SKIP_LOCKED"}
     assert set(targets(two.script_vacuums())) == {
         ("Sales", "OrderItems"), ("Sales", "skipped"),
     }
@@ -497,7 +497,7 @@ def test_no_freeze_table_option_selects_among_the_tables_with_dead_rows(db, run_
     assert result.returncode == 0, result.stdout + result.stderr
     vacuums = db.script_vacuums()
     assert targets(vacuums) == [("Sales", "OrderItems")]
-    assert vacuums[0].options == {"ANALYZE"}
+    assert vacuums[0].options == {"ANALYZE", "SKIP_LOCKED"}
     db.wait_for_vacuum_count("OrderItems", 1, schema="Sales")
     assert db.is_analyzed("OrderItems", schema="Sales")
     assert not db.is_analyzed("other", schema="Sales")
@@ -530,10 +530,10 @@ def test_table_option_vacuums_a_table_the_selection_would_leave_out(
     vacuums = db.script_vacuums()
     assert targets(vacuums) == [small]
     if "--no-freeze" in selection:
-        assert vacuums[0].options == {"ANALYZE"}
+        assert vacuums[0].options == {"ANALYZE", "SKIP_LOCKED"}
         db.wait_for_vacuum_count("t_small", 1)
     else:
-        assert vacuums[0].options == {"FREEZE", "ANALYZE"}
+        assert vacuums[0].options == {"FREEZE", "ANALYZE", "SKIP_LOCKED"}
         assert db.frozen_since(before) == {small}
 
 

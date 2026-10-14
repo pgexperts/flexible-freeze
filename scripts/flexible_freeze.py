@@ -86,6 +86,13 @@ parser.add_argument("-t", "--print-timestamps", action="store_true",
                     dest="print_timestamps")
 parser.add_argument("--enforce-time", dest="enforcetime", action="store_true",
                     help="enforce time limit by terminating vacuum")
+# What these two guard against is described where they are applied: at the
+# session settings in the database loop and at ADVISORY_LOCK_KEY.
+parser.add_argument("--lock-timeout", dest="lock_timeout",
+                    type=non_negative_int, default=10,
+                    help="seconds to wait for a lock before giving up (set as the session's lock_timeout).  A database whose table list cannot be read in that time is skipped, a table whose VACUUM runs into it is reported as failed, and the run goes on.  0 means wait without limit.  Default is 10.")
+parser.add_argument("--no-advisory-lock", dest="advisory_lock", action="store_false",
+                    help="Do not guard against overlapping runs.  By default a run takes an advisory lock in each database while it works there, and skips a database in which another run holds that lock.")
 parser.add_argument("-l", "--log", dest="logfile")
 parser.add_argument("-v", "--verbose", action="store_true",
                     dest="verbose")
@@ -366,6 +373,37 @@ TABLE_LOOKUP_QUERY = """SELECT pg_class.oid::regclass AS full_table_name,
             ORDER BY {freeze_age} DESC, nspname, pg_class.relname;""".format(
                 freeze_age=FREEZE_AGE_SQL)
 
+# One run per database at a time.  Two runs in the same database (a nightly
+# run still going when the next one starts, a second cron entry) select the
+# same tables in the same order.  With SKIP_LOCKED on the VACUUM the later
+# one no longer queues behind the earlier, but it reports the table the
+# other is on as locked and vacuums again every table the other has just
+# finished.  So a run claims each database, for as long as it has it open,
+# with an advisory lock on this key, and a run that finds the key taken
+# skips that database and says why.
+#
+# Per database, and not one lock for the whole cluster: an advisory lock
+# belongs to the database it is taken in (the same key in two databases is
+# two locks), and with -d a run connects to the named databases only, so two
+# runs need not have any database in common in which to meet.  It is also
+# the finer grain: runs over different databases leave each other alone.
+#
+# Session level and never released explicitly.  The server drops it when
+# the database's connection closes, which the loop does on every way out of
+# a database and which the server does for it if the process dies, so there
+# is no stale lock to clear after a crash.  pg_try_advisory_lock() does not
+# wait, so it needs neither a timeout nor handling of its own for an
+# interrupt.
+#
+# The key is the eight ASCII bytes of "flexfrze" read as one big-endian
+# 64-bit integer.  It is fixed, and must stay so, because every copy and
+# every version of the script has to agree on it.  It is spelled from a name
+# because the key space is shared with everything else that uses the
+# database, and small numbers are what applications pick.  In pg_locks it
+# shows as locktype 'advisory', classid 1718379896, objid 1718778469,
+# objsubid 1.
+ADVISORY_LOCK_KEY = 0x666C657866727A65  # 7380385457142659685
+
 # What a run did and did not get done.  The loops below only record here;
 # the closing summary and the exit status are worked out from this record,
 # once, at the end of the run.  Nothing inside the loops may call sys.exit:
@@ -387,8 +425,8 @@ class RunOutcome(object):
         self.failed_tables = []
         # VACUUM returned, but the server had something to say about it.
         self.unvacuumed_tables = []
-        # Databases not worked through: could not connect, could not list
-        # the tables, or lost the connection part-way.
+        # Databases not worked through: could not connect, held by another
+        # run, could not list the tables, or lost the connection part-way.
         self.skipped_databases = []
         # --table: the databases in which no table has that name, and
         # whether one has it anywhere.  A miss in one database is expected
@@ -659,6 +697,32 @@ for db in dblist:
             # there): a database or role default of ERROR would otherwise
             # keep the server's warnings from this session.
             cur.execute("SET client_min_messages = warning")
+            # Ends every wait for a lock in this session after this long,
+            # with an error that the handlers here record like any other:
+            # against the database when it was the table listing, against
+            # the table when it was a VACUUM.  It is what bounds the
+            # listing: the size functions in those queries open every
+            # candidate table, so the whole list queues behind a pending
+            # ACCESS EXCLUSIVE lock on any one of them.  For a VACUUM it is
+            # the fallback behind SKIP_LOCKED (see where the statement is
+            # built), which passes over a locked table but does not cover
+            # any other lock the statement may come to wait for.  Unlike
+            # statement_timeout it measures the wait and not the work, so
+            # it never cuts short a VACUUM that is running.  Sent in every
+            # case, 0 included: that replaces a database or role default,
+            # which is what "without limit" has to mean.
+            cur.execute("SET lock_timeout = '{0}s'".format(args.lock_timeout))
+
+            # Claim the database; see ADVISORY_LOCK_KEY.  Before the table
+            # list is read, so that a run that is turned away has done no
+            # work here, and after the settings, so that nothing is left to
+            # fail between the claim and the first table.
+            if args.advisory_lock:
+                cur.execute("SELECT pg_catalog.pg_try_advisory_lock({0})".format(ADVISORY_LOCK_KEY))
+                if not cur.fetchone()[0]:
+                    _print("skipping database {d} (another flexible_freeze run is working on it: advisory lock {k} is held there)".format(d=db, k=ADVISORY_LOCK_KEY))
+                    outcome.skipped_databases.append(db)
+                    continue
 
             cur.execute(tabquery, tabparams)
             verbose_print("getting list of tables")
@@ -754,18 +818,33 @@ for db in dblist:
                     timeout_query = """SET statement_timeout = '%ss'""" % timeout_secs
 
             # if not, vacuum or freeze
-            exquery = "VACUUM "
+            #
+            # SKIP_LOCKED, always: a table on which another session holds a
+            # conflicting lock (an anti-wraparound autovacuum, a CREATE
+            # INDEX) is passed over at once.  Without it the VACUUM joined
+            # the queue for that lock, and the run sat there for as long as
+            # the other session took, with no test of the time limit, which
+            # is made between tables only.  The server reports the skip
+            # with a WARNING and a successful return; the check on
+            # conn.notices below is what records the table as not vacuumed.
+            # lock_timeout alone would not do: every locked table would
+            # cost the full timeout and be reported as a failure.
+            #
+            # SKIP_LOCKED exists only in the parenthesized option list, and
+            # only from PostgreSQL 12, the oldest version supported.
+            vacuum_options = []
             if not args.skip_freeze:
-                exquery += "FREEZE "
+                vacuum_options.append("FREEZE")
             if not args.skip_analyze:
-                exquery += "ANALYZE "
+                vacuum_options.append("ANALYZE")
+            vacuum_options.append("SKIP_LOCKED")
 
             # The regclass text is already valid SQL for this session: the server
             # schema-qualifies it when the schema is not on the search_path and
             # double-quotes each part that needs it.  It must go in unmodified;
             # wrapping it in quotes again turns sales.orders into a single
             # (nonexistent) name and "Orders" into an invalid identifier.
-            exquery += table
+            exquery = "VACUUM ({0}) {1}".format(', '.join(vacuum_options), table)
 
             verbose_print("%s in database %s" % (exquery, db,))
 

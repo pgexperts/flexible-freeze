@@ -16,9 +16,14 @@
 # How a signal is made to arrive at a known point.  Each test waits for a
 # state it can observe before signalling, never for a length of time:
 #
-# * during a VACUUM or the table-listing query: another session holds a lock
-#   the statement needs, and the test waits for the script's backend to show
-#   up as waiting for it;
+# * during a VACUUM: another session keeps a pin on the table's only page,
+#   which a freezing VACUUM has to wait for, and the test waits for the
+#   script's backend to show up as waiting for it.  A lock on the table
+#   would not hold the VACUUM: the script's VACUUM skips a locked table and
+#   is over before a signal could arrive;
+# * during the table-listing query: another session holds a lock the query
+#   needs, the script is run with --lock-timeout 0 so that the wait does not
+#   end by itself, and the test waits for the backend to show up as waiting;
 # * during a connection attempt: the script is pointed at a socket that
 #   accepts and never answers (silent_server), and the test waits for the
 #   accept;
@@ -49,10 +54,18 @@ BOTH_SIGNALS = pytest.mark.parametrize(
     ids=["SIGINT", "SIGTERM"],
 )
 
-# Blocks VACUUM (which takes the same lock) but not the table-listing query.
-BLOCKS_VACUUM = "SHARE UPDATE EXCLUSIVE"
 # Blocks everything, the listing query's pg_table_size() included.
 BLOCKS_LISTING = "ACCESS EXCLUSIVE"
+
+# Without this the script gives up a lock wait after ten seconds.  The tests
+# that signal a script waiting for a lock do so well inside that, but on a
+# loaded machine the wait must not be able to end first and be taken for
+# the effect of the signal.
+WAIT_FOR_LOCKS = ("--lock-timeout", "0")
+
+# What a backend is waiting for, as pg_stat_activity.wait_event_type has it.
+A_LOCK = "Lock"
+A_PINNED_PAGE = "BufferPin"
 
 
 def targets(vacuums):
@@ -60,7 +73,7 @@ def targets(vacuums):
 
 
 @contextlib.contextmanager
-def lock_held(db, table, mode=BLOCKS_VACUUM):
+def lock_held(db, table, mode):
     """Hold a lock on public.<table> in an open transaction.
 
     Yields the connection; rolling it back releases the lock early.
@@ -69,6 +82,35 @@ def lock_held(db, table, mode=BLOCKS_VACUUM):
     try:
         with conn.cursor() as cur:
             cur.execute(f'LOCK TABLE public."{table}" IN {mode} MODE')
+        yield conn
+    finally:
+        conn.close()
+
+
+@contextlib.contextmanager
+def vacuum_held_up(db, table):
+    """Keep a freezing VACUUM of public.<table> from finishing.
+
+    A cursor that has returned one row and is still open keeps a pin on the
+    page that row is on.  VACUUM (FREEZE) must freeze the rows of that page
+    and needs the page to itself for it, so it waits for the pin to go:
+    past the table's lock (the cursor's ACCESS SHARE does not conflict, so
+    SKIP_LOCKED does not come into it) and not waiting for any lock (so
+    lock_timeout does not either).  The wait can be cancelled like any
+    other.  Only a freezing VACUUM waits; a plain one leaves a pinned page
+    for next time.  The table has to fit in one page, as the tables
+    create_table builds by default do.
+
+    Yields the connection; rolling it back closes the cursor, which drops
+    the pin and lets the VACUUM finish.
+    """
+    conn = db.connect(autocommit=False)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f'DECLARE ff_pin NO SCROLL CURSOR FOR SELECT id FROM public."{table}"'
+            )
+            cur.execute("FETCH 1 FROM ff_pin")
         yield conn
     finally:
         conn.close()
@@ -85,25 +127,29 @@ def script_backends(cluster):
     )
 
 
-def wait_until_blocked(db):
-    """Return, once the script's backend in `db` is waiting for a lock, the
-    process id of that backend."""
+def wait_until_blocked(db, on=A_PINNED_PAGE):
+    """Return, once the script's backend in `db` is waiting for `on`, the
+    process id of that backend.
+
+    The default is the wait of a VACUUM held up by vacuum_held_up(); the
+    table-listing query behind a lock is A_LOCK.
+    """
 
     def probe():
         for datname, state, waiting_on, pid in script_backends(db.cluster):
-            if (datname, state, waiting_on) == (db.name, "active", "Lock"):
+            if (datname, state, waiting_on) == (db.name, "active", on):
                 return pid
         return None
 
-    return wait_for(probe, what=f"the script to wait for a lock in {db.name}")
+    return wait_for(probe, what=f"the script to wait ({on}) in {db.name}")
 
 
 def assert_no_backend_left(cluster):
     """The script's sessions are gone from the server.
 
-    Called while the lock that blocked the statement is still held: a
-    statement that was merely abandoned by its client is then still there,
-    waiting, and would run as soon as the lock went away.
+    Called while the lock or pin that blocked the statement is still held:
+    a statement that was merely abandoned by its client is then still there,
+    waiting, and would run as soon as the obstacle went away.
     """
     wait_for(
         lambda: not script_backends(cluster),
@@ -125,15 +171,15 @@ def finish(proc, timeout=PROMPT):
 def test_signal_during_a_vacuum_cancels_it_and_ends_the_run(
     make_db, start_ff, signum, status
 ):
-    # t_locked is created first, so it is the oldest table and is taken
+    # t_held is created first, so it is the oldest table and is taken
     # first: everything else in the run would come after it.
     one, two = make_db("one"), make_db("two")
-    one.create_table("t_locked")
+    one.create_table("t_held")
     one.create_table("t_next")
     two.create_table("t_other")
     before_one, before_two = one.frozenxids(), two.frozenxids()
 
-    with lock_held(one, "t_locked"):
+    with vacuum_held_up(one, "t_held"):
         proc = start_ff(*FREEZE_ALL, "-v", "-d", f"{one.name},{two.name}")
         wait_until_blocked(one)
         proc.send_signal(signum)
@@ -142,10 +188,10 @@ def test_signal_during_a_vacuum_cancels_it_and_ends_the_run(
 
     assert code == status
     assert "Traceback" not in stderr
-    # Nothing was vacuumed, then or after the lock went away, and nothing
+    # Nothing was vacuumed, then or after the pin went away, and nothing
     # was started after the interrupted table: not the next table, and not
     # so much as a connection to the next database.
-    assert targets(one.script_vacuums()) == [("public", "t_locked")]
+    assert targets(one.script_vacuums()) == [("public", "t_held")]
     assert one.frozen_since(before_one) == set()
     assert two.script_statements() == []
     assert two.frozen_since(before_two) == set()
@@ -155,9 +201,9 @@ def test_signal_during_a_vacuum_cancels_it_and_ends_the_run(
     assert_lines_in_order(
         stdout,
         [
-            "processing table public.t_locked",
+            "processing table public.t_held",
             f"Vacuuming interrupted by {name}",
-            (f"Work remains: VACUUM of public.t_locked in database {one.name} "
+            (f"Work remains: VACUUM of public.t_held in database {one.name} "
              "was interrupted."),
             "after vacuuming 0 tables in 1 databases",
             "Flexible Freeze run complete",
@@ -165,7 +211,7 @@ def test_signal_during_a_vacuum_cancels_it_and_ends_the_run(
     )
     # Interrupted is not failed, and the run is not described as complete,
     # as merely incomplete, or as out of time.
-    assert "VACUUMing public.t_locked failed." not in lines
+    assert "VACUUMing public.t_held failed." not in lines
     assert not [line for line in lines if line.startswith("Tables that failed")]
     assert "All tables vacuumed." not in lines
     assert "Not all tables were vacuumed." not in lines
@@ -175,9 +221,9 @@ def test_signal_during_a_vacuum_cancels_it_and_ends_the_run(
 
 @BOTH_SIGNALS
 def test_interrupt_report_without_verbose(db, start_ff, signum, status):
-    db.create_table("t_locked")
+    db.create_table("t_held")
 
-    with lock_held(db, "t_locked"):
+    with vacuum_held_up(db, "t_held"):
         proc = start_ff(*FREEZE_ALL, "-d", db.name)
         wait_until_blocked(db)
         proc.send_signal(signum)
@@ -187,7 +233,7 @@ def test_interrupt_report_without_verbose(db, start_ff, signum, status):
     assert stderr == ""
     assert stdout.splitlines() == [
         f"Vacuuming interrupted by {signal.Signals(signum).name}",
-        f"Work remains: VACUUM of public.t_locked in database {db.name} was interrupted.",
+        f"Work remains: VACUUM of public.t_held in database {db.name} was interrupted.",
     ]
 
 
@@ -198,7 +244,7 @@ def test_interrupt_outranks_the_enforced_time_limit(db, start_ff, script_clock):
     db.create_table("t_big")
     before = db.frozenxids()
 
-    with lock_held(db, "t_big"):
+    with vacuum_held_up(db, "t_big"):
         proc = start_ff(
             *FREEZE_ALL, "--enforce-time", "-m", "1", "-d", db.name,
             env=script_clock.env,
@@ -219,22 +265,28 @@ def test_interrupt_outranks_the_enforced_time_limit(db, start_ff, script_clock):
 
 
 def test_interrupt_outranks_a_failure_and_the_failure_is_still_reported(
-    make_db, start_ff
+    make_db, make_role, start_ff
 ):
     # A table has already failed when the signal arrives.  Left alone the
     # run would exit 1; interrupted it exits 130, and the summary still
     # lists what failed and counts what was done.
+    #
+    # The failure: the run is made as a role that has no USAGE on the schema
+    # of t_fails, so the server refuses that VACUUM with an error.  The role
+    # owns the other tables and vacuums them like anyone.
+    role = make_role("owner")
     one, two = make_db("one"), make_db("two")
-    one.create_table("t_fails")
-    one.create_table("t_done")
-    two.create_table("t_locked")
-    two.create_table("t_never")
-    # In `one` a lock wait is an error after a moment; in `two` it is a wait.
-    one.execute(f'ALTER DATABASE "{one.name}" SET lock_timeout = \'200ms\'')
+    one.create_schema("vault")
+    one.create_table("t_fails", schema="vault")
+    one.create_table("t_done", owner=role)
+    two.create_table("t_held", owner=role)
+    two.create_table("t_never", owner=role)
     before_one, before_two = one.frozenxids(), two.frozenxids()
 
-    with lock_held(one, "t_fails"), lock_held(two, "t_locked"):
-        proc = start_ff(*FREEZE_ALL, "-v", "-d", f"{one.name},{two.name}")
+    with vacuum_held_up(two, "t_held"):
+        proc = start_ff(
+            *FREEZE_ALL, "-v", "-U", role, "-d", f"{one.name},{two.name}"
+        )
         wait_until_blocked(two)
         proc.send_signal(signal.SIGTERM)
         code, stdout, stderr = finish(proc)
@@ -244,20 +296,21 @@ def test_interrupt_outranks_a_failure_and_the_failure_is_still_reported(
     assert "Traceback" not in stderr
     assert one.frozen_since(before_one) == {("public", "t_done")}
     assert two.frozen_since(before_two) == set()
-    assert targets(two.script_vacuums()) == [("public", "t_locked")]
+    assert targets(two.script_vacuums()) == [("public", "t_held")]
     assert_lines_in_order(
         stdout,
         [
-            "VACUUMing public.t_fails failed.",
+            "VACUUMing vault.t_fails failed.",
+            "permission denied for schema vault",
             "Vacuuming interrupted by SIGTERM",
-            (f"Work remains: VACUUM of public.t_locked in database {two.name} "
+            (f"Work remains: VACUUM of public.t_held in database {two.name} "
              "was interrupted."),
-            f"Tables that failed: public.t_fails in database {one.name}",
+            f"Tables that failed: vault.t_fails in database {one.name}",
             "after vacuuming 1 tables in 2 databases",
             "Flexible Freeze run complete",
         ],
     )
-    assert "VACUUMing public.t_locked failed." not in stdout
+    assert "VACUUMing public.t_held failed." not in stdout
 
 
 def test_second_signal_gives_up_on_a_server_that_does_not_answer(db, start_ff):
@@ -266,10 +319,10 @@ def test_second_signal_gives_up_on_a_server_that_does_not_answer(db, start_ff):
     # first signal however long it waits.  The second one ends the wait.
     # The first still decides the exit status, and the summary no longer
     # claims that the VACUUM was cancelled.
-    db.create_table("t_locked")
+    db.create_table("t_held")
     before = db.frozenxids()
 
-    with lock_held(db, "t_locked"):
+    with vacuum_held_up(db, "t_held"):
         proc = start_ff(*FREEZE_ALL, "-d", db.name)
         backend = wait_until_blocked(db)
         os.kill(backend, signal.SIGSTOP)
@@ -280,7 +333,7 @@ def test_second_signal_gives_up_on_a_server_that_does_not_answer(db, start_ff):
         finally:
             os.kill(backend, signal.SIGCONT)
         # The cancel request was sent before the script gave up: once the
-        # backend runs again it acts on it, and goes away without the lock
+        # backend runs again it acts on it, and goes away without the pin
         # having been released.
         assert_no_backend_left(db.cluster)
 
@@ -288,7 +341,7 @@ def test_second_signal_gives_up_on_a_server_that_does_not_answer(db, start_ff):
     assert stderr == ""
     assert stdout.splitlines() == [
         "Vacuuming interrupted by SIGINT",
-        (f"Work remains: VACUUM of public.t_locked in database {db.name} was "
+        (f"Work remains: VACUUM of public.t_held in database {db.name} was "
          "interrupted; the server did not confirm that it was cancelled, and it "
          "may still be running there."),
     ]
@@ -305,20 +358,22 @@ def test_signal_while_idle_between_statements_stops_the_next_vacuum(
     # after the table list, before anything is sent for the first table.
     # Nothing is waiting on the server at that moment, so nothing is there to
     # cancel; the VACUUM that follows has to be cancelled once it is under
-    # way.  Held up behind a lock, it would otherwise wait for good.
+    # way.  Held up by a pinned page, it would otherwise wait for good.
     #
     # Getting the script to that point: t_gate's lock holds up the listing
-    # query (but t_locked is listed first, being older); the clock is put on
+    # query (but t_held is listed first, being older); the clock is put on
     # hold while the script waits there; with the gate opened the script
     # runs on to its next reading of the clock, which is the time check
     # before the first table.
-    db.create_table("t_locked")
+    db.create_table("t_held")
     db.create_table("t_gate")
     before = db.frozenxids()
 
-    with lock_held(db, "t_locked"), lock_held(db, "t_gate", BLOCKS_LISTING) as gate:
-        proc = start_ff(*FREEZE_ALL, "-d", db.name, env=script_clock.env)
-        wait_until_blocked(db)
+    with vacuum_held_up(db, "t_held"), lock_held(db, "t_gate", BLOCKS_LISTING) as gate:
+        proc = start_ff(
+            *FREEZE_ALL, *WAIT_FOR_LOCKS, "-d", db.name, env=script_clock.env
+        )
+        wait_until_blocked(db, A_LOCK)
         script_clock.hold()
         gate.rollback()
         script_clock.wait_until_held()
@@ -337,7 +392,7 @@ def test_signal_while_idle_between_statements_stops_the_next_vacuum(
     assert db.frozen_since(before) == set()
     assert stdout.splitlines() == [
         "Vacuuming interrupted by SIGINT",
-        f"Work remains: VACUUM of public.t_locked in database {db.name} was interrupted.",
+        f"Work remains: VACUUM of public.t_held in database {db.name} was interrupted.",
     ]
 
 
@@ -396,8 +451,10 @@ def test_signal_during_the_table_listing_ends_the_run(
     before_one, before_two = one.frozenxids(), two.frozenxids()
 
     with lock_held(one, "t_locked", BLOCKS_LISTING):
-        proc = start_ff(*FREEZE_ALL, "-d", f"{one.name},{two.name}")
-        wait_until_blocked(one)
+        proc = start_ff(
+            *FREEZE_ALL, *WAIT_FOR_LOCKS, "-d", f"{one.name},{two.name}"
+        )
+        wait_until_blocked(one, A_LOCK)
         proc.send_signal(signum)
         code, stdout, stderr = finish(proc)
         assert_no_backend_left(one.cluster)
