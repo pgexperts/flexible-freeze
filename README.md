@@ -78,8 +78,8 @@ Requires PostgreSQL 12 or later: every `VACUUM` is sent with `SKIP_LOCKED`, whic
                             append output to this file instead of standard output. A failure report goes to the file and to standard
                             error
       -v, --verbose         print progress as the run goes, including each database and table it works on
-      --debug               print debugging output to standard error: the versions in use, the arguments, and each table skipped by
-                            an exclusion
+      --debug               print debugging output to standard error: the versions in use, the arguments, the --exclude-table-in-
+                            database entries, and each table that one of them skips (not in a --table run)
       -U DBUSER, --user DBUSER
                             database user
       -H DBHOST, --host DBHOST
