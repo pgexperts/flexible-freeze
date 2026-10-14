@@ -599,11 +599,76 @@ def test_table_option_value_is_never_read_as_sql(db, run_ff):
     assert db.script_vacuums() == []
 
 
+# -- --table naming a relation that is there and cannot be vacuumed -----------
+#
+# A partitioned table, a foreign table or a view of the name is not "no such
+# table": the line for the database names the relation and its kind.  Nothing
+# else changes.  The database still counts as one where the name matched no
+# table, so the summary and the exit status are those of a name that nothing
+# has (test_table_option_says_when_the_table_does_not_exist), and the line
+# is a -v message like the one it stands in for.
+#
+# The relations are outside public, so that the printed name is the same
+# under any search_path (see the top of the file).
+
+
+def cannot_be_vacuumed(relation, kind, database):
+    """The -v line for a relation of the name that is of a kind the script
+    does not vacuum; `relation` is the name as the script prints it."""
+    return (
+        f"specified single table {relation} exists in database {database.name} "
+        f"but is a {kind} and cannot be vacuumed by this script"
+    )
+
+
+PARTITIONS_HINT = "; name its partitions with --table instead"
+
+
+def assert_counted_as_matching_no_table(result, name, *databases):
+    """Exit status and summary of a run whose --table name found nothing to
+    vacuum in any database: the same whether or not a relation has the name."""
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert result.stderr.splitlines() == [
+        "Not all tables were vacuumed.",
+        f"Databases where --table {name} matched no table: "
+        + ", ".join(database.name for database in databases),
+    ]
+
+
+def catalog_lookups(database, since=0):
+    """The script's statements that look a name up in pg_class."""
+    return [
+        statement
+        for statement in database.script_statements(since=since)
+        if "pg_class" in statement
+    ]
+
+
+def build_partitioned(database, schema, name):
+    """A range-partitioned table with one partition, name_low, holding rows
+    inserted after it was created (so that a freeze would move its
+    relfrozenxid; see Database.create_table).  Returns the partition."""
+    database.execute(
+        f"CREATE TABLE {schema}.{name} (id integer, pad text) PARTITION BY RANGE (id)"
+    )
+    database.execute(
+        f"CREATE TABLE {schema}.{name}_low PARTITION OF {schema}.{name} "
+        "FOR VALUES FROM (0) TO (1000)"
+    )
+    database.execute(
+        f"INSERT INTO {schema}.{name} SELECT g, 'x' FROM generate_series(1, 100) AS g"
+    )
+    return (schema, f"{name}_low")
+
+
 def test_table_option_finds_a_materialized_view_but_not_a_view(db, run_ff):
-    # What can be named is what VACUUM can be pointed at in either mode.
+    # What can be named is what VACUUM can be pointed at in either mode.  A
+    # view is not, but it is there, and the run says so instead of saying
+    # that nothing has the name.
     build(db, ("public", "t_base"))
+    db.create_schema("reports")
     db.execute("CREATE MATERIALIZED VIEW mv_base AS SELECT * FROM t_base")
-    db.execute("CREATE VIEW v_base AS SELECT * FROM t_base")
+    db.execute("CREATE VIEW reports.v_base AS SELECT * FROM public.t_base")
 
     result = run_ff("--table", "mv_base", "-d", db.name)
 
@@ -613,11 +678,239 @@ def test_table_option_finds_a_materialized_view_but_not_a_view(db, run_ff):
     mark = db.cluster.log_offset()
     result = run_ff("-v", "--table", "v_base", "-d", db.name)
 
-    assert result.returncode == 1, result.stdout + result.stderr
-    assert (
-        f"specified single table v_base does not exist in database {db.name}"
-    ) in result.stdout.splitlines()
+    assert_counted_as_matching_no_table(result, "v_base", db)
+    lines = result.stdout.splitlines()
+    assert cannot_be_vacuumed("reports.v_base", "view", db) in lines
+    assert not any("does not exist" in line for line in lines)
     assert db.script_vacuums(since=mark) == []
+
+
+def test_table_option_says_when_the_name_is_a_partitioned_table(db, run_ff):
+    build(db, T_KEEP)
+    db.create_schema("sales")
+    partition = build_partitioned(db, "sales", "measurements")
+    before = db.frozenxids()
+
+    result = run_ff(*FREEZE_ALL, "-v", "--table", "measurements", "-d", db.name)
+
+    assert_counted_as_matching_no_table(result, "measurements", db)
+    lines = result.stdout.splitlines()
+    assert (
+        cannot_be_vacuumed("sales.measurements", "partitioned table", db)
+        + PARTITIONS_HINT
+    ) in lines
+    assert not any("does not exist" in line for line in lines)
+    # The parent is not expanded: its partition was left alone.
+    assert db.frozen_since(before) == set()
+    assert db.script_vacuums() == []
+
+    # The line for the database is a -v message; the summary is not.
+    result = run_ff(*FREEZE_ALL, "--table", "measurements", "-d", db.name)
+
+    assert_counted_as_matching_no_table(result, "measurements", db)
+    assert result.stdout == ""
+    assert db.script_vacuums() == []
+
+    # And the hint is good: the partition can be named.
+    result = run_ff(*FREEZE_ALL, "--table", "measurements_low", "-d", db.name)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert db.frozen_since(before) == {partition}
+
+
+def test_table_option_says_when_the_name_is_a_foreign_table(db, run_ff):
+    # A wrapper with no handler needs no extension to be installed.  Its
+    # table cannot be read, and never is: the lookup reads the catalog only.
+    build(db, T_KEEP)
+    db.create_schema("sales")
+    db.execute("CREATE FOREIGN DATA WRAPPER ff_no_handler")
+    db.execute("CREATE SERVER ff_elsewhere FOREIGN DATA WRAPPER ff_no_handler")
+    db.execute("CREATE FOREIGN TABLE sales.remote_orders (id integer) SERVER ff_elsewhere")
+    before = db.frozenxids()
+
+    result = run_ff(*FREEZE_ALL, "-v", "--table", "remote_orders", "-d", db.name)
+
+    assert_counted_as_matching_no_table(result, "remote_orders", db)
+    lines = result.stdout.splitlines()
+    assert cannot_be_vacuumed("sales.remote_orders", "foreign table", db) in lines
+    assert not any("does not exist" in line for line in lines)
+    assert not any("partitions" in line for line in lines)
+    assert db.frozen_since(before) == set()
+    assert db.script_vacuums() == []
+
+    result = run_ff(*FREEZE_ALL, "--table", "remote_orders", "-d", db.name)
+
+    assert_counted_as_matching_no_table(result, "remote_orders", db)
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["OrderView", "Sales.OrderView", '"Sales"."OrderView"'],
+    ids=["bare", "schema-qualified", "as-printed"],
+)
+def test_table_option_says_when_the_name_is_a_view_in_any_of_its_forms(db, run_ff, name):
+    # The name is matched by the rules that find a table, and the relation
+    # is printed the way a table is: by its regclass text.
+    build(db, ("Sales", "OrderItems"), T_KEEP)
+    db.execute('CREATE VIEW "Sales"."OrderView" AS SELECT * FROM "Sales"."OrderItems"')
+    before = db.frozenxids()
+
+    result = run_ff(*FREEZE_ALL, "-v", "--table", name, "-d", db.name)
+
+    assert_counted_as_matching_no_table(result, name, db)
+    lines = result.stdout.splitlines()
+    assert cannot_be_vacuumed('"Sales"."OrderView"', "view", db) in lines
+    assert not any("does not exist" in line for line in lines)
+    assert not any("partitions" in line for line in lines)
+    assert db.frozen_since(before) == set()
+    assert db.script_vacuums() == []
+    # The kind is asked for after the lookup of the table has come back
+    # empty, and only then (see the test of a name that is both, below).
+    assert len(catalog_lookups(db)) == 2
+
+    result = run_ff(*FREEZE_ALL, "--table", name, "-d", db.name)
+
+    assert_counted_as_matching_no_table(result, name, db)
+    assert result.stdout == ""
+
+
+def test_table_option_names_each_relation_that_cannot_be_vacuumed(db, run_ff):
+    # A bare name is that name in every schema, here as in the lookup of
+    # a table: one line for each, in schema order.
+    build(db, ("archive", "items"), T_KEEP)
+    db.create_schema("sales")
+    db.execute("CREATE VIEW archive.orders AS SELECT * FROM archive.items")
+    build_partitioned(db, "sales", "orders")
+
+    result = run_ff(*FREEZE_ALL, "-v", "--table", "orders", "-d", db.name)
+
+    assert_counted_as_matching_no_table(result, "orders", db)
+    assert_lines_in_order(
+        result.stdout,
+        [
+            cannot_be_vacuumed("archive.orders", "view", db),
+            cannot_be_vacuumed("sales.orders", "partitioned table", db)
+            + PARTITIONS_HINT,
+        ],
+    )
+    assert db.script_vacuums() == []
+
+    # A qualified name is that schema's relation only.
+    result = run_ff(*FREEZE_ALL, "-v", "--table", "archive.orders", "-d", db.name)
+
+    assert_counted_as_matching_no_table(result, "archive.orders", db)
+    lines = result.stdout.splitlines()
+    assert cannot_be_vacuumed("archive.orders", "view", db) in lines
+    assert not any("partitioned table" in line for line in lines)
+
+
+@pytest.mark.parametrize(
+    "statement, name",
+    [
+        ("CREATE SEQUENCE sales.order_ids", "order_ids"),
+        ("CREATE INDEX orders_by_id ON sales.orders (id)", "orders_by_id"),
+        ("CREATE TYPE sales.order_line AS (id integer, qty integer)", "order_line"),
+    ],
+    ids=["sequence", "index", "composite-type"],
+)
+def test_table_option_says_any_other_kind_of_relation_does_not_exist(
+    db, run_ff, statement, name
+):
+    # Only the three kinds an operator would take for a table are named.
+    # Everything else with a pg_class row is, as before, no such table.
+    build(db, ("sales", "orders"), T_KEEP)
+    db.execute(statement)
+    before = db.frozenxids()
+
+    result = run_ff(*FREEZE_ALL, "-v", "--table", name, "-d", db.name)
+
+    assert_counted_as_matching_no_table(result, name, db)
+    lines = result.stdout.splitlines()
+    assert (
+        f"specified single table {name} does not exist in database {db.name}"
+    ) in lines
+    assert not any("cannot be vacuumed" in line for line in lines)
+    assert db.frozen_since(before) == set()
+    assert db.script_vacuums() == []
+
+
+def test_table_option_does_not_find_another_sessions_temp_view(db, run_ff):
+    # The temporary schemas are left out for a view as they are for a table
+    # (see the test of another session's temporary table below).
+    build(db, T_KEEP)
+    owner = db.connect()
+    try:
+        with owner.cursor() as cur:
+            cur.execute("CREATE TEMP VIEW ff_temp_view AS SELECT 1 AS id")
+
+        result = run_ff("-v", "--table", "ff_temp_view", "-d", db.name)
+    finally:
+        owner.close()
+
+    assert_counted_as_matching_no_table(result, "ff_temp_view", db)
+    lines = result.stdout.splitlines()
+    assert (
+        f"specified single table ff_temp_view does not exist in database {db.name}"
+    ) in lines
+    assert not any("cannot be vacuumed" in line for line in lines)
+
+
+def test_table_option_vacuums_the_table_and_passes_over_a_view_of_the_same_name(
+    db, run_ff
+):
+    # One database, the name in two schemas: a table in one and a view in
+    # the other.  The table is what was asked for, and the run is the one
+    # it was before a view could be reported: nothing is said about the
+    # view, and the kind of relation is not even asked for.
+    build(db, ("sales", "orders"), T_KEEP)
+    db.create_schema("archive")
+    db.execute("CREATE VIEW archive.orders AS SELECT * FROM sales.orders")
+    before = db.frozenxids()
+
+    result = run_ff(*FREEZE_ALL, "-v", "--table", "orders", "-d", db.name)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stderr == ""
+    assert "archive.orders" not in result.stdout
+    assert "cannot be vacuumed" not in result.stdout
+    assert db.frozen_since(before) == {("sales", "orders")}
+    assert targets(db.script_vacuums()) == [("sales", "orders")]
+    assert len(catalog_lookups(db)) == 1
+
+
+def test_table_option_says_where_the_name_is_a_view_and_vacuums_where_it_is_a_table(
+    make_db, run_ff
+):
+    # The table was found, so the run exits 0; the database that has only a
+    # view of the name is told apart from one that has nothing of it.
+    one, two, three = make_db("one"), make_db("two"), make_db("three")
+    build(one, ("sales", "items"))
+    one.execute("CREATE VIEW sales.orders AS SELECT * FROM sales.items")
+    build(two, ("sales", "orders"))
+    build(three, ("sales", "items"))
+    before_one, before_two = one.frozenxids(), two.frozenxids()
+
+    result = run_ff(
+        *FREEZE_ALL, "-v", "--table", "orders",
+        "-d", f"{one.name},{two.name},{three.name}",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stderr == ""
+    assert_lines_in_order(
+        result.stdout,
+        [
+            cannot_be_vacuumed("sales.orders", "view", one),
+            "processing table sales.orders",
+            f"specified single table orders does not exist in database {three.name}",
+            "All tables vacuumed.",
+        ],
+    )
+    assert one.frozen_since(before_one) == set()
+    assert one.script_vacuums() == []
+    assert two.frozen_since(before_two) == {("sales", "orders")}
+    assert len(catalog_lookups(two)) == 1
 
 
 def test_table_option_does_not_find_another_sessions_temp_table(db, run_ff):
