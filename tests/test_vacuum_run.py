@@ -11,6 +11,7 @@
 
 import re
 
+import pytest
 from ffharness import FREEZE_ALL, assert_lines_in_order
 
 T1 = ("public", "t1")
@@ -22,6 +23,11 @@ TIMESTAMPED = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[^:]*: .+")
 
 def targets(vacuums):
     return [vacuum.target for vacuum in vacuums]
+
+
+def table_bytes(db):
+    # The main fork of t1 only, which is what truncation shortens.
+    return db.execute("SELECT pg_relation_size('public.t1')")[0][0]
 
 
 def test_default_run_freezes_and_analyzes(db, run_ff):
@@ -118,6 +124,52 @@ def test_no_freeze_vacuums_a_table_with_dead_rows_and_skips_a_clean_one(db, run_
     db.wait_for_vacuum_count("t_dead", 1)
     assert db.is_analyzed("t_dead")
     assert not db.is_analyzed("t_clean")
+
+
+@pytest.mark.parametrize(
+    "mode, mode_options",
+    [(FREEZE_ALL, {"FREEZE", "ANALYZE"}), (("--no-freeze",), {"ANALYZE"})],
+    ids=["freeze", "no-freeze"],
+)
+@pytest.mark.parametrize("no_truncate", [False, True], ids=["default", "no-truncate"])
+def test_no_truncate_keeps_the_empty_pages_at_the_end_of_a_table(
+    db, run_ff, mode, mode_options, no_truncate
+):
+    # Every row is deleted, so the whole table is empty pages that VACUUM
+    # gives back to the operating system unless it is told not to.  Half of
+    # the rows go first, through make_dead_tuples, which waits for the
+    # statistics the --no-freeze selection reads.
+    db.create_table("t1", rows=1000)
+    db.make_dead_tuples("t1")
+    db.execute("DELETE FROM public.t1")
+    size_before = table_bytes(db)
+    assert size_before > 0
+
+    result = run_ff(*mode, *(["--no-truncate"] if no_truncate else []), "-d", db.name)
+
+    assert result.returncode == 0
+    assert result.stdout == "All tables vacuumed.\n"
+    assert result.stderr == ""
+    vacuums = db.script_vacuums()
+    assert targets(vacuums) == [T1]
+    # The option is sent only when it was asked for.
+    assert vacuums[0].options == mode_options | {"SKIP_LOCKED"} | (
+        {"TRUNCATE false"} if no_truncate else set()
+    )
+    # And the server acted on it.
+    assert table_bytes(db) == (size_before if no_truncate else 0)
+
+
+def test_verbose_shows_truncate_false_in_the_statement(db, run_ff):
+    db.create_table("t1")
+
+    result = run_ff(*FREEZE_ALL, "--no-truncate", "-v", "-d", db.name)
+
+    assert result.returncode == 0
+    vacuums = db.script_vacuums()
+    assert targets(vacuums) == [T1]
+    assert "TRUNCATE false" in vacuums[0].options
+    assert f"{vacuums[0].sql} in database {db.name}" in result.stdout.splitlines()
 
 
 def test_table_with_the_oldest_xid_is_frozen_first(db, run_ff):

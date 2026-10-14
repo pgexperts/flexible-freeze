@@ -234,3 +234,6 @@ def test_help_describes_the_options_as_they_behave(run_ff):
     assert "more than 5% of rows dead" in text
     assert "in the last hour" in text
     assert "--vacuum Same as --no-freeze" in text
+    # --no-truncate: what it leaves out and what that is for
+    assert "--no-truncate Do not truncate empty pages off the end of each table" in text
+    assert "ACCESS EXCLUSIVE lock" in text

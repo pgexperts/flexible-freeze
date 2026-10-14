@@ -68,6 +68,8 @@ parser.add_argument("--no-freeze", dest="skip_freeze", action="store_true",
                     help="Do VACUUM ANALYZE instead of VACUUM FREEZE ANALYZE.  Tables are then chosen by fixed thresholds instead of by age: more than 100 dead rows, more than 5%% of rows dead, and not vacuumed (manually or by autovacuum) in the last hour.  --freezeage is ignored.")
 parser.add_argument("--no-analyze", dest="skip_analyze", action="store_true",
                     help="Do not do an ANALYZE as part of the VACUUM operation")
+parser.add_argument("--no-truncate", dest="skip_truncate", action="store_true",
+                    help="Do not truncate empty pages off the end of each table as part of the VACUUM operation (VACUUM's TRUNCATE false), which avoids the ACCESS EXCLUSIVE lock that the truncation takes on the table")
 # Deprecated spelling of --no-freeze.  It must keep that option's dest: the
 # rest of the script reads skip_freeze only, so a dest of its own would make
 # this option a silent no-op and the run a much heavier VACUUM FREEZE.
@@ -917,6 +919,14 @@ for db in dblist:
                 vacuum_options.append("FREEZE")
             if not args.skip_analyze:
                 vacuum_options.append("ANALYZE")
+            # --no-truncate.  Nothing is sent without it, and in particular
+            # not TRUNCATE true: the option overrides the table's
+            # vacuum_truncate storage parameter in either direction, so a
+            # table that was set never to be truncated keeps that setting in
+            # an ordinary run.  Like SKIP_LOCKED, the option is there from
+            # PostgreSQL 12 and only in the parenthesized list.
+            if args.skip_truncate:
+                vacuum_options.append("TRUNCATE false")
             vacuum_options.append("SKIP_LOCKED")
 
             # The regclass text is already valid SQL for this session: the server

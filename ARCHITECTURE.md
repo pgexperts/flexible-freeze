@@ -1,7 +1,7 @@
 # Architecture
 
 flexible-freeze is one Python script, `scripts/flexible_freeze.py`, that runs
-`VACUUM ([FREEZE,] [ANALYZE,] SKIP_LOCKED)` table by table inside a time
+`VACUUM ([FREEZE,] [ANALYZE,] [TRUNCATE false,] SKIP_LOCKED)` table by table inside a time
 window. PostgreSQL 12 is the oldest server it supports (CI covers 14-18) and
 Python 3.11 the oldest interpreter. It is a
 top-to-bottom script: there is no `main()`, and argument parsing, signal
