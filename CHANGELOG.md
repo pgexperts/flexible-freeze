@@ -25,7 +25,6 @@ Everything below is relative to 0.6.  The reasons are in `docs/adr/`.
 - `-c`/`--comment` appends `/* TEXT */` to every statement sent, so monitoring tools can recognise them.
 - `-s`/`--minsizemb` skips tables smaller than this.
 - `--table` (older spelling `-st`) vacuums one named table.
-- `-p` accepts a comma-separated libpq port list for a multi-host `-H`.
 
 ### Changed behaviour
 
@@ -42,13 +41,13 @@ Everything below is relative to 0.6.  The reasons are in `docs/adr/`.
 - `--table` naming a view, foreign table or partitioned table says what it is and that the script cannot vacuum it, instead of saying it does not exist.
 - Tables are vacuumed by their schema-qualified name as the server prints it; `-T`, `--exclude-table-in-database` and `--table` match a bare or a `schema.table` name.
 - Without `--enforce-time` each operation is preceded by `SET statement_timeout = 0`; with it, a vacuum cancelled at the time limit is a normal stop (exit 0) that names the table.
+- `-p` is checked before any connection: one port or a comma-separated list for a multi-host `-H`, each an integer from 1 to 65535; an empty or malformed value is refused with exit status 2.
 - `--costlimit` must be at least 1, the server's minimum; negative values for the other numeric options, and an empty part of `--exclude-table-in-database`, are refused with exit status 2.
 - Sessions run with an empty `search_path`, and connection values are passed to libpq as parameters, not pasted into a connection string.
 - The `-w` password is masked in `--debug` output and in the log file.
 
 ### Fixes
 
-- `--vacuum` did nothing; it now means `--no-freeze`.
 - An empty entry in `-d` (a doubled or trailing comma) no longer raises an exception.
 - The dead-row percentage used by `--no-freeze` is calculated correctly.
 - A TOAST table locked by another session is reported, and its table counted as not vacuumed (exit status 1), instead of being skipped in silence; this holds for runs as a superuser (a role with `USAGE` on `pg_toast`) on PostgreSQL 14 or later, which vacuum the TOAST table with a statement of its own.  Other runs still have the gap.
