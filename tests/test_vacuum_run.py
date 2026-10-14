@@ -150,9 +150,13 @@ def test_session_settings_precede_the_work(db, run_ff):
     statements = db.script_statements()
     # The empty search_path is set first, before any other statement.
     assert statements[0] == SET_SEARCH_PATH
-    assert statements[1:3] == [
+    # Then the session settings, all of them before the table list is read.
+    # Warnings are asked for so that a table the server declines to vacuum
+    # is noticed (test_run_outcome.py).
+    assert statements[1:4] == [
         "SET vacuum_cost_delay = 20",
         "SET vacuum_cost_limit = 2000",
+        "SET client_min_messages = warning",
     ]
     # ADR 0005: without --enforce-time any inherited statement_timeout is
     # cleared immediately before the vacuum.
@@ -171,10 +175,11 @@ def test_session_settings_precede_the_work_on_a_non_iso_datestyle(db, run_ff):
 
     assert result.returncode == 0
     statements = db.script_statements()
-    assert statements[:3] == [
+    assert statements[:4] == [
         SET_SEARCH_PATH,
         "SET vacuum_cost_delay = 20",
         "SET vacuum_cost_limit = 2000",
+        "SET client_min_messages = warning",
     ]
     assert statements[-2:] == ["SET statement_timeout = 0", db.script_vacuums()[0].sql]
 

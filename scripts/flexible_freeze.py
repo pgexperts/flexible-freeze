@@ -132,11 +132,13 @@ def _print(some_message):
     sys.stdout.flush()
     return True
 
+# Returns an open connection or raises; it never returns None.  Callers
+# decide what a failure means: fatal while listing the databases, a skipped
+# database inside the run.
 def dbconnect(dbname, dbuser, dbhost, dbport, dbpass):
 
     if not dbname:
-        _print("ERROR: a target database is required.")
-        return None
+        raise ValueError("a target database is required")
 
     # Pass each value to libpq as a parameter rather than pasting it into a
     # key=value connection string.  Database names come from pg_database when
@@ -184,6 +186,46 @@ def table_named_in(names, tabrow):
     regclass_text, nspname, relname = tabrow
     forms = (regclass_text, relname, "%s.%s" % (nspname, relname))
     return any(name in forms for name in names)
+
+# What a run did and did not get done.  The loops below only record here;
+# the closing summary and the exit status are worked out from this record,
+# once, at the end of the run.  Nothing inside the loops may call sys.exit:
+# that is what used to let one failed table drop every later table and
+# database without a word.
+#
+# "The statement returned" is not taken to mean "the table was vacuumed":
+# the server reports some tables it declined to vacuum with a WARNING and a
+# successful return, so those are kept apart from tables whose VACUUM raised.
+#
+# Tables are recorded as (regclass text, database name).
+class RunOutcome(object):
+    def __init__(self):
+        # Completed work only: databases whose table list was obtained, and
+        # VACUUMs that returned without an error or a server message.
+        self.databases_listed = 0
+        self.tables_vacuumed = 0
+        # VACUUM (or its statement_timeout setting) raised an error.
+        self.failed_tables = []
+        # VACUUM returned, but the server had something to say about it.
+        self.unvacuumed_tables = []
+        # Databases not worked through: could not connect, could not list
+        # the tables, or lost the connection part-way.
+        self.skipped_databases = []
+        # Databases in which --table matched nothing.
+        self.table_missing_in = []
+        # The run stopped at the time limit.  With --enforce-time that can
+        # be in the middle of a vacuum, which is then the cancelled table.
+        self.time_limited = False
+        self.cancelled_table = None
+
+    # Exit status 1.  Stopping at the time limit is not in this list: it is
+    # the designed way for a nightly run to end, and exits 0.
+    def work_was_missed(self):
+        return bool(self.failed_tables or self.unvacuumed_tables
+                    or self.skipped_databases or self.table_missing_in)
+
+def tables_for_display(tables):
+    return ', '.join("{t} in database {d}".format(t=t, d=d) for t, d in tables)
 
 # startup debugging info
 
@@ -233,7 +275,6 @@ halt_time = time.time() + ( args.run_min * 60 )
 
 # get set for user interrupt
 conn = None
-time_exit = None
 signal.signal(signal.SIGINT, signal_handler)
 
 # start logging to log file, if used
@@ -280,28 +321,33 @@ n_dbs = len(dblist)
 verbose_print("Processing {n} database{pl} (list of databases is {l})".format(n = n_dbs, l = ', '.join(dblist), pl = 's' if n_dbs > 1 else ''))
 
 # connect to each database
-time_exit = False
-tabcount = 0
-dbcount = 0
+outcome = RunOutcome()
 timeout_secs = 0
+
+# --pause is a pause between vacuums, so it is taken before a vacuum that
+# follows another one, never after one: whether a further table is coming is
+# not known until the next database has been listed.
+pause_pending = False
+
+# Exclusion values that matched a selected table, as (database or None for
+# -T, value); the rest are reported at the end of the run.
+exclusions_matched = set()
 
 for db in dblist:
     verbose_print("working on database {0}".format(db))
-    if time_exit:
+    if outcome.time_limited:
         break
-    else:
-        dbcount += 1
     conn = None
     try:
         conn = dbconnect(db, args.dbuser, args.dbhost, args.dbport, args.dbpass)
     except Exception as err:
         _print("skipping database {d} (couldn't connect: {e})".format(d=db, e=str(err)))
+        outcome.skipped_databases.append(db)
         continue
 
+    # The one cursor for everything done in this database.
     cur = conn.cursor()
-    cur.execute("SET vacuum_cost_delay = {0}".format(args.costdelay))
-    cur.execute("SET vacuum_cost_limit = {0}".format(args.costlimit))
-    
+
     # if vacuuming, get list of top tables to vacuum
     if args.skip_freeze:
         tabquery = """WITH deadrow_tables AS (
@@ -343,92 +389,196 @@ for db in dblist:
             ORDER BY freeze_age DESC, table_bytes DESC
             LIMIT 1000;""".format(args.freezeage, args.minsizemb)
 
-    cur.execute(tabquery)
-    verbose_print("getting list of tables")
-
-    # rows of (regclass text, schema name, table name); see table_named_in()
-    tablist = cur.fetchall()
-
-    #if only one table is desired
-    if args.table:
-      # a bare name can match in more than one schema; all of them are kept
-      tablist = [tabrow for tabrow in tablist if table_named_in([args.table], tabrow)]
-      if not tablist:
-         print("specified single table {0} was not found (or excluded) in database {1}".format(args.table, db))
-         continue
-
-    # for each table in list
-    for tabrow in tablist:
-        # the regclass text: used for all output and as the VACUUM target
-        table = tabrow[0]
-        if db in database_table_map and table_named_in(database_table_map[db], tabrow):
-            debug_print("skipping table {t} in database {d} per --exclude-table-in-database argument".format(t=table, d=db))
-            continue
-    # check time; if overtime, exit
-        elif args.tables_to_exclude and table_named_in(args.tables_to_exclude, tabrow):
-            verbose_print(
-                "skipping table {t} per --exclude-table argument".format(t=table))
-            continue
-        else:
-            verbose_print("processing table {t}".format(t=table))
-
-        if time.time() >= halt_time:
-            verbose_print("Reached time limit.  Exiting.")
-            time_exit = True
-            break
-        else:
-            tabcount += 1
-            # figure out statement_timeout
-            if args.enforcetime:
-                timeout_secs = int(halt_time - time.time()) + 30
-                timeout_query = """SET statement_timeout = '%ss'""" % timeout_secs
-            
-    # if not, vacuum or freeze
-        exquery = "VACUUM "
-        if not args.skip_freeze:
-            exquery += "FREEZE "
-        if not args.skip_analyze:
-            exquery += "ANALYZE "
-        
-        # The regclass text is already valid SQL for this session: the server
-        # schema-qualifies it when the schema is not on the search_path and
-        # double-quotes each part that needs it.  It must go in unmodified;
-        # wrapping it in quotes again turns sales.orders into a single
-        # (nonexistent) name and "Orders" into an invalid identifier.
-        exquery += table
-
-        verbose_print("%s in database %s" % (exquery, db,))
-        excur = conn.cursor()
-
+    # From here on the connection is closed on every way out of this
+    # database: the skips below, the end of its table list, a stop at the
+    # time limit, and an exit raised by the signal handler.
+    try:
         try:
-            if args.enforcetime:
-                excur.execute(timeout_query)
+            cur.execute("SET vacuum_cost_delay = {0}".format(args.costdelay))
+            cur.execute("SET vacuum_cost_limit = {0}".format(args.costlimit))
+            # Needed by the check on conn.notices after each VACUUM (see
+            # there): a database or role default of ERROR would otherwise
+            # keep the server's warnings from this session.
+            cur.execute("SET client_min_messages = warning")
+
+            cur.execute(tabquery)
+            verbose_print("getting list of tables")
+
+            # rows of (regclass text, schema name, table name); see table_named_in()
+            tablist = cur.fetchall()
+        except Exception as err:
+            _print("skipping database {d} (couldn't list its tables: {e})".format(d=db, e=str(err).rstrip()))
+            outcome.skipped_databases.append(db)
+            continue
+        outcome.databases_listed += 1
+
+        #if only one table is desired
+        if args.table:
+            # a bare name can match in more than one schema; all of them are kept
+            tablist = [tabrow for tabrow in tablist if table_named_in([args.table], tabrow)]
+            if not tablist:
+                _print("specified single table {0} was not found (or excluded) in database {1}".format(args.table, db))
+                outcome.table_missing_in.append(db)
+                continue
+
+        # Note which exclusion values apply to this list.  Done for the whole
+        # list here rather than in the loop below: that loop stops at the
+        # first exclusion that fits a table, and can itself be stopped by the
+        # time limit, and either would leave a value that does match a table
+        # reported as one that matched nothing.
+        for tabrow in tablist:
+            for name in database_table_map.get(db, []):
+                if table_named_in([name], tabrow):
+                    exclusions_matched.add((db, name))
+            for name in args.tables_to_exclude or []:
+                if table_named_in([name], tabrow):
+                    exclusions_matched.add((None, name))
+
+        # for each table in list
+        for tabrow in tablist:
+            # the regclass text: used for all output and as the VACUUM target
+            table = tabrow[0]
+            if db in database_table_map and table_named_in(database_table_map[db], tabrow):
+                debug_print("skipping table {t} in database {d} per --exclude-table-in-database argument".format(t=table, d=db))
+                continue
+            elif args.tables_to_exclude and table_named_in(args.tables_to_exclude, tabrow):
+                verbose_print(
+                    "skipping table {t} per --exclude-table argument".format(t=table))
+                continue
             else:
-                excur.execute("SET statement_timeout = 0")
-                
-            excur.execute(exquery)
-        except Exception as ex:
-            _print("VACUUMing %s failed." % table)
-            _print(str(ex))
+                verbose_print("processing table {t}".format(t=table))
+
+            # The pause owed since the previous vacuum.  It is cut off at the
+            # time limit: past that point the check below ends the run, and
+            # sleeping first would only hold the connection open for nothing.
+            if pause_pending:
+                pause_pending = False
+                pause_secs = min(args.pause_time, halt_time - time.time())
+                if pause_secs > 0:
+                    time.sleep(pause_secs)
+
+            # check time; if overtime, exit
             if time.time() >= halt_time:
-                verbose_print("halted flexible_freeze due to enforced time limit")
+                verbose_print("Reached time limit.  Exiting.")
+                outcome.time_limited = True
+                break
             else:
-                _print("VACUUMING %s failed." % table[0])
-                _print(str(ex))
-            sys.exit(1)
+                # figure out statement_timeout
+                if args.enforcetime:
+                    timeout_secs = int(halt_time - time.time()) + 30
+                    timeout_query = """SET statement_timeout = '%ss'""" % timeout_secs
 
-        time.sleep(args.pause_time)
+            # if not, vacuum or freeze
+            exquery = "VACUUM "
+            if not args.skip_freeze:
+                exquery += "FREEZE "
+            if not args.skip_analyze:
+                exquery += "ANALYZE "
 
-conn.close()
+            # The regclass text is already valid SQL for this session: the server
+            # schema-qualifies it when the schema is not on the search_path and
+            # double-quotes each part that needs it.  It must go in unmodified;
+            # wrapping it in quotes again turns sales.orders into a single
+            # (nonexistent) name and "Orders" into an invalid identifier.
+            exquery += table
+
+            verbose_print("%s in database %s" % (exquery, db,))
+
+            try:
+                if args.enforcetime:
+                    cur.execute(timeout_query)
+                else:
+                    cur.execute("SET statement_timeout = 0")
+
+                # Emptied so that whatever is in it afterwards was raised by
+                # this table's VACUUM and by nothing earlier.
+                del conn.notices[:]
+                cur.execute(exquery)
+            except Exception as ex:
+                # The cancellation --enforce-time asked for, arriving when it
+                # was asked for.  That ends the run, but as a stop at the
+                # time limit and not as a failure.  A cancel inside the
+                # window, or one in a run that set no timeout, came from
+                # somewhere else and is a failed table like any other.
+                if (args.enforcetime and time.time() >= halt_time
+                        and isinstance(ex, psycopg2.extensions.QueryCanceledError)):
+                    verbose_print("halted flexible_freeze due to enforced time limit")
+                    outcome.time_limited = True
+                    outcome.cancelled_table = (table, db)
+                    break
+
+                _print("VACUUMing %s failed." % table)
+                _print(str(ex).rstrip())
+                outcome.failed_tables.append((table, db))
+
+                # One table failing says nothing about the next, so the run
+                # goes on -- unless the failure took the connection with it.
+                # No reconnect is attempted: the database is recorded as
+                # unfinished and the next one is started.
+                if conn.closed:
+                    _print("skipping the rest of database {d} (connection lost)".format(d=db))
+                    outcome.skipped_databases.append(db)
+                    break
+            else:
+                # The server reports a table it declines to vacuum (one the
+                # role has no permission on, for instance) with a WARNING and
+                # then returns as if the VACUUM had run.  Any message at all
+                # is therefore taken to mean "not vacuumed".  Its text is
+                # passed on but never examined: it is translated, and worded
+                # differently from one server version to the next.
+                if conn.notices:
+                    _print("VACUUMing %s drew a message from the server; not counting it as vacuumed." % table)
+                    for notice in conn.notices:
+                        _print(notice.rstrip())
+                    outcome.unvacuumed_tables.append((table, db))
+                else:
+                    outcome.tables_vacuumed += 1
+
+            pause_pending = True
+    finally:
+        cur.close()
+        conn.close()
 
 # did we get through all tables?
 # exit, report results
-if not time_exit:
-    _print("All tables vacuumed.")
-    verbose_print("%d tables in %d databases" % (tabcount, dbcount))
-else:
+if outcome.time_limited:
     _print("Vacuuming halted due to timeout")
-    verbose_print("after vacuuming %d tables in %d databases" % (tabcount, dbcount,))
+    if outcome.cancelled_table:
+        _print("Work remains: VACUUM of {t} was cancelled at the time limit.".format(
+            t=tables_for_display([outcome.cancelled_table])))
+elif outcome.work_was_missed():
+    _print("Not all tables were vacuumed.")
+else:
+    _print("All tables vacuumed.")
+
+if outcome.failed_tables:
+    _print("Tables that failed: " + tables_for_display(outcome.failed_tables))
+if outcome.unvacuumed_tables:
+    _print("Tables not counted as vacuumed: " + tables_for_display(outcome.unvacuumed_tables))
+if outcome.skipped_databases:
+    _print("Databases skipped or left unfinished: " + ', '.join(outcome.skipped_databases))
+if outcome.table_missing_in:
+    _print("Databases where --table {t} matched no selected table: {d}".format(
+        t=args.table, d=', '.join(outcome.table_missing_in)))
+
+if outcome.time_limited:
+    verbose_print("after vacuuming %d tables in %d databases" % (outcome.tables_vacuumed, outcome.databases_listed,))
+else:
+    verbose_print("%d tables in %d databases" % (outcome.tables_vacuumed, outcome.databases_listed))
+
+# A mistyped exclusion protects nothing, and the table it was meant for is
+# vacuumed.  It is mentioned rather than treated as an error, and only with
+# -v, because a correct value also matches nothing in a run that did not
+# select its table.
+unmatched = ["-T %s" % name for name in args.tables_to_exclude or []
+             if (None, name) not in exclusions_matched]
+unmatched += ["--exclude-table-in-database %s.%s" % (dat, tab)
+              for dat, tabs in database_table_map.items() for tab in tabs
+              if (dat, tab) not in exclusions_matched]
+if unmatched:
+    verbose_print("exclusions that matched no selected table: " + ', '.join(unmatched)
+                  + ("" if outcome.databases_listed == len(dblist)
+                     else " (not every database was examined)"))
 
 verbose_print("Flexible Freeze run complete")
-sys.exit(0)
+sys.exit(1 if outcome.work_was_missed() else 0)

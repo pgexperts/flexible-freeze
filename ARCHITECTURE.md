@@ -15,8 +15,9 @@ registration and the whole run execute at import. It cannot be imported.
 | Name matching | Compares a user-supplied table name with a selected table | `table_named_in` |
 | Database list | `-d`, else `pg_database` via the `postgres` database | module level, `dblist` |
 | Table selection | Two queries: freeze mode (by XID age) and `--no-freeze` mode (by dead-tuple fraction) | module level, `tabquery` |
-| Vacuum loop | Exclusions, time check, `statement_timeout`, VACUUM, pause | module level, `for db in dblist` |
-| Test harness | Throwaway cluster, the single launcher for the script, catalog and statement-log probes | `tests/ffharness.py`, `tests/conftest.py` |
+| Vacuum loop | Exclusions, pause, time check, `statement_timeout`, VACUUM, server messages | module level, `for db in dblist` |
+| Run outcome | What was and was not done; the only input to the summary and the exit status | `RunOutcome`, `outcome`, the summary block at the end of the file |
+| Test harness | Throwaway cluster, the single launcher for the script, catalog and statement-log probes, a movable clock for the script | `tests/ffharness.py`, `tests/conftest.py` |
 
 ## Invariants
 
@@ -40,6 +41,21 @@ registration and the whole run execute at import. It cannot be imported.
   block.
 - **`args.dbpass` is never printed; print `args_for_display()` instead.**
   Breaks: the password lands in stderr or the logfile.
+- **Nothing inside the database and table loops exits; it records in
+  `outcome`.** The summary and the exit status are computed once, after the
+  loops. Breaks: a `sys.exit` in a loop drops every later table and database
+  without a summary, and a problem that is only printed never reaches the
+  exit status.
+- **A VACUUM that returns is counted only if `conn.notices` is empty.** The
+  session sets `client_min_messages = warning` and the list is emptied before
+  each VACUUM. Breaks: the server skips a table it will not vacuum with a
+  WARNING and a successful return, and the table is counted as done. The
+  message text is never matched; it is translated and version-dependent.
+- **`dbconnect()` returns a connection or raises.** Breaks: a `None` return
+  fails later, outside the handler that would have skipped the database.
+- **Each database's connection is closed by the `try`/`finally` around its
+  work.** Breaks: code added between `dbconnect()` and that `try` can leave a
+  session open for the rest of the run.
 - **Tests start the script only through `run_ff` / `start_ff`.** Breaks: a
   run without the forced host and port reaches whatever server libpq
   defaults to and vacuums it (ADR 0008).
@@ -48,11 +64,24 @@ registration and the whole run execute at import. It cannot be imported.
 
 - With no `-H`/`-p` the script connects to the local default server and
   works through every database. Never run it by hand to "try something".
-- A failed VACUUM calls `sys.exit(1)`: one bad table ends the run for all
-  remaining tables and databases. A failed connection only skips that
-  database (ADR 0004). The two are deliberately not symmetrical yet.
+- A failed table, a database that cannot be connected to or listed (ADR
+  0004), and a `--table` that matches nothing do not stop the run; each is
+  recorded and makes the exit status 1. A lost connection ends that database
+  only, and there is no reconnect.
+- Exit status: 0 complete or stopped at the time limit, 1 work missed (or
+  the run could not start), 2 bad arguments. A stop at the time limit is 0
+  on purpose, including a vacuum cancelled by `--enforce-time`; that case is
+  told from a failure by the error being a query cancel, `--enforce-time`
+  being set, and the deadline having passed.
 - The time limit is checked before each table only (ADR 0002). It is not
-  checked during the pause or the table listing.
+  checked during the table listing. The pause is taken before a vacuum that
+  follows another one, not after each, and is cut off at the limit.
+- The exclusions reported as unmatched (`-v`) are worked out over each whole
+  table list before the table loop, not in it; the loop stops at the first
+  exclusion that fits and can be cut short by the time limit.
+- The window is whole minutes, so tests reach "after the deadline" by moving
+  the script's clock (`script_clock` fixture, `ffharness.ScriptClock`), not
+  by waiting.
 - Without `--enforce-time` the script sets `statement_timeout = 0` on
   purpose (ADR 0005); do not "fix" that by removing it.
 - `-l` rebinds `sys.stdout` to the logfile. Debug output and tracebacks stay
@@ -71,9 +100,11 @@ registration and the whole run execute at import. It cannot be imported.
 ## Flow
 
 Parse arguments → build the database list (`-d`, or `pg_database` ordered by
-`age(datfrozenxid)`) → for each database: `dbconnect` → set cost limits →
-run the selection query → apply `--table`, then exclusions → for each table:
-time check → set `statement_timeout` → VACUUM → pause → summary and exit.
+`age(datfrozenxid)`) → for each database: `dbconnect` → set cost limits and
+`client_min_messages` → run the selection query → apply `--table`, then
+exclusions → for each table: pause if a vacuum came before → time check →
+set `statement_timeout` → VACUUM → record the result in `outcome` → close the
+connection → summary and exit status from `outcome`.
 
 ## Where to change X
 
@@ -85,6 +116,9 @@ time check → set `statement_timeout` → VACUUM → pause → summary and exit
 - Change how names match: `table_named_in`, and `tests/test_table_names.py`.
 - Change connection behaviour: `dbconnect`, and
   `tests/test_connection_setup.py`.
+- Add a way for a run to fall short: a field on `RunOutcome`, its term in
+  `work_was_missed()`, its line in the summary block, the exit-status table
+  in `README.md`, and `tests/test_run_outcome.py`.
 - Add a test: use the fixtures in `tests/conftest.py`; prove outcomes from
   the catalog (`Database.frozen_since`) or the statement log
   (`Database.script_vacuums`), not from the script's output alone.

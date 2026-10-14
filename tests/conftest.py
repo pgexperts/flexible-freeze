@@ -239,6 +239,14 @@ def run_ff(cluster):
 
 
 @pytest.fixture
+def script_clock(tmp_path):
+    """A ffharness.ScriptClock.  Start the script with `env=script_clock.env`
+    and call `script_clock.advance(seconds)` to put its deadline in the past
+    without waiting for it."""
+    return ffharness.ScriptClock(tmp_path / "clock")
+
+
+@pytest.fixture
 def start_ff(cluster):
     """start_ff(*args, env=None, cwd=None) -> Popen, for tests that must act
     while the script is running.  Anything still alive is killed afterwards."""

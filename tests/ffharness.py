@@ -391,6 +391,79 @@ def run_ff(host, port, *args, env=None, cwd=None, timeout=RUN_TIMEOUT):
     return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
 
 
+# -- a clock the test can move ----------------------------------------------
+
+# The name is what makes it run: Python imports a module called sitecustomize
+# from its path at startup, before the first line of the script.
+_CLOCK_MODULE = "sitecustomize.py"
+_CLOCK_OFFSET_VARIABLE = "FF_TEST_CLOCK_OFFSET_FILE"
+_CLOCK_SOURCE = f'''\
+# Written by the flexible_freeze test harness (ffharness.ScriptClock).
+# Adds the number of seconds held in a file to time.time(), so that a test
+# can move the clock of the script it is running.
+import os
+import time
+
+_real_time = time.time
+_offset_file = os.environ["{_CLOCK_OFFSET_VARIABLE}"]
+
+
+def _shifted_time():
+    try:
+        with open(_offset_file) as source:
+            return _real_time() + float(source.read())
+    except (OSError, ValueError):
+        return _real_time()
+
+
+time.time = _shifted_time
+'''
+
+
+class ScriptClock:
+    """Moves the clock of a running script forward, on the test's command.
+
+    The script counts its time window in whole minutes and --enforce-time
+    adds a 30-second grace period, so nothing that is meant to happen "once
+    the deadline has passed" can be reached in real time by a test that is
+    to finish in seconds.  Started with `env=clock.env`, the script reads
+    time.time() through a shim that adds an offset kept in a file;
+    advance() rewrites that file, and the script sees the jump on its next
+    reading of the clock.  The server's clock is not affected, so a
+    statement_timeout still runs in real time.
+
+    The script itself stays unmodified and is launched by the same argv; the
+    shim is found through PYTHONPATH, which is why it shadows any
+    sitecustomize module the interpreter would otherwise load.  Only
+    time.time() moves: sleeps and timestamps are real.
+    """
+
+    def __init__(self, directory):
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        (self.directory / _CLOCK_MODULE).write_text(_CLOCK_SOURCE)
+        self._offset_file = self.directory / "offset"
+        self.advance(0)
+
+    @property
+    def env(self):
+        """Environment for start_ff / run_ff that puts the shim in place."""
+        inherited = os.environ.get("PYTHONPATH")
+        path = [str(self.directory)] + ([inherited] if inherited else [])
+        return {
+            "PYTHONPATH": os.pathsep.join(path),
+            _CLOCK_OFFSET_VARIABLE: str(self._offset_file),
+        }
+
+    def advance(self, seconds):
+        """Make the script's clock read `seconds` ahead of the real one."""
+        # Renamed into place so the script never reads a half-written file,
+        # which it would take for an offset of zero: a jump backwards.
+        scratch = self._offset_file.with_suffix(".new")
+        scratch.write_text(repr(float(seconds)))
+        os.replace(str(scratch), str(self._offset_file))
+
+
 # -- locating PostgreSQL ----------------------------------------------------
 
 
