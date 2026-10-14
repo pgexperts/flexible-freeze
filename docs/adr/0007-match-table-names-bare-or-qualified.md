@@ -86,3 +86,11 @@ Residual: the second query is sent whenever the first finds nothing, with or
 without `-v`, although only `-v` prints what it finds. A run without `-v`
 therefore sends one extra catalog query in each database that has no table of
 the name.
+
+## Addendum (2026-10-14)
+
+The residual above is closed (issue #67): `TABLE_KIND_QUERY` is now sent only
+when `TABLE_LOOKUP_QUERY` has returned nothing and `-v` is given, so a run
+without `-v` sends the one query it always did and a failure of the second
+query can no longer skip a database for a line nobody sees. The database is
+recorded as not having the table either way.

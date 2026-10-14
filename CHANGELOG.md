@@ -58,6 +58,9 @@ Everything below is relative to 0.6.  The reasons are in `docs/adr/`.
 - With `-v`, a failed write to standard output while vacuuming a TOAST table is no longer reported as that table failing.
 - The dead-row percentage used by `--no-freeze` is calculated correctly.
 - A TOAST table locked by another session is reported, and its table counted as not vacuumed (exit status 1), instead of being skipped in silence; this holds for runs as a superuser (a role with `USAGE` on `pg_toast`) on PostgreSQL 14 or later, which vacuum the TOAST table with a statement of its own.  Other runs still have the gap.
+- Reporting details (#67): a database skipped during setup now says which step failed ("couldn't set up its session", "check its TOAST tables", "take its advisory lock", "list its tables", "check what kind of relation --table names") instead of always "couldn't list its tables"; a failed `SET statement_timeout` reads "setting statement_timeout before VACUUMing X failed" instead of blaming the VACUUM; the "working on database" line is no longer printed for the database a time-limited run stops at; the summary says "matched no table that can be vacuumed" (a view, partitioned table or foreign table of the name is not a table to it); a role name in the advisory-lock holder report is quoted, so a name with a line break cannot forge report lines.
+- The `--table` kind lookup is sent only with `-v`, the only place its answer is shown, so a failure of it can no longer skip a database for an invisible line (#67).
+- The line for a table left out by `--exclude-table-in-database` is a `-v` line like the one for `-T`, no longer a `--debug` line (#67).
 
 ### Development
 

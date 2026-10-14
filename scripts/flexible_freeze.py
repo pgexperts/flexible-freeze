@@ -190,10 +190,10 @@ parser.add_argument("-l", "--log", dest="logfile",
                     help="append output to this file instead of standard output.  A failure report goes to the file and to standard error")
 parser.add_argument("-v", "--verbose", action="store_true",
                     dest="verbose",
-                    help="print progress as the run goes, including each database and table it works on")
+                    help="print progress as the run goes, including each database and table it works on and each table that -T or --exclude-table-in-database leaves out")
 parser.add_argument("--debug", action="store_true",
                     dest="debug",
-                    help="print debugging output to standard error: the versions in use, the arguments, the --exclude-table-in-database entries, and each table that one of them skips (not in a --table run)")
+                    help="print debugging output to standard error: the versions in use, the arguments, the --exclude-table-in-database entries")
 parser.add_argument("-U", "--user", dest="dbuser",
                   help="database user")
 parser.add_argument("-H", "--host", dest="dbhost",
@@ -658,8 +658,9 @@ UNVACUUMABLE_KINDS = {
     'v': 'view',
 }
 
-# Sent only when TABLE_LOOKUP_QUERY has returned nothing: a run whose name
-# matches a table issues the statements it always did.  Rows of (regclass
+# Sent only when TABLE_LOOKUP_QUERY has returned nothing and -v is given
+# (the answer is shown only there): a run whose name matches a table issues
+# the statements it always did.  Rows of (regclass
 # text, relkind), in a fixed order because each gets a line of output.
 # relkind is cast because its type, "char", is not text to every driver.
 TABLE_KIND_QUERY = """SELECT pg_class.oid::regclass AS full_table_name,
@@ -795,11 +796,15 @@ def advisory_lock_holders_report(holders):
 
     prepared = "a prepared transaction (see pg_prepared_xacts)"
 
+    # Role and application name are both names the holder chose, so both are
+    # quoted: a role name with a line break in it would otherwise start
+    # report lines of its own.  json.dumps escapes the break; it is the
+    # idiom used for a database name elsewhere in this script.
     def holder_text(pid, role, application):
         if pid is None:
             return prepared
         return "pid {p}, role {r}, application name {a}".format(
-            p=pid, r=role if role is not None else "not known",
+            p=pid, r=json.dumps(role) if role is not None else "not known",
             a='"%s"' % application if application is not None else "not known")
 
     def is_other(pid, role, application):
@@ -1136,9 +1141,11 @@ for db in dblist:
     # table loop's break for an interrupt ends up.
     if interrupt_signal is not None:
         break
-    verbose_print("working on database {0}".format(db))
+    # Tested before the line is printed: a run that has stopped at the time
+    # limit is not working on this database, and says so for none after it.
     if outcome.time_limited:
         break
+    verbose_print("working on database {0}".format(db))
     conn = None
     try:
         conn = dbconnect(db, args.dbuser, args.dbhost, args.dbport, args.dbpass)
@@ -1258,6 +1265,11 @@ for db in dblist:
     # database: the skips below, the end of its table list, a stop at the
     # time limit, and a stop on a signal.
     try:
+        # What the next statement of the setup block is for, as the end of
+        # "couldn't ...": set before each step, so that the line for a
+        # database skipped by the handler below says which step failed
+        # rather than blaming the table listing for all of them.
+        stage = "set up its session"
         try:
             execute(cur, "SET vacuum_cost_delay = {0}".format(args.costdelay))
             execute(cur, "SET vacuum_cost_limit = {0}".format(args.costlimit))
@@ -1284,6 +1296,7 @@ for db in dblist:
             # Whether this session's VACUUMs name the TOAST table separately;
             # see TOAST_SPLIT_QUERY.  After lock_timeout, like every other
             # statement here.
+            stage = "check its TOAST tables"
             execute(cur, TOAST_SPLIT_QUERY)
             split_toast = cur.fetchone()[0]
 
@@ -1292,6 +1305,7 @@ for db in dblist:
             # work here, and after the settings, so that nothing is left to
             # fail between the claim and the first table.
             if args.advisory_lock:
+                stage = "take its advisory lock"
                 execute(cur, "SELECT pg_catalog.pg_try_advisory_lock({0})".format(ADVISORY_LOCK_KEY))
                 if not cur.fetchone()[0]:
                     # Refused: say who has it; see ADVISORY_LOCK_KEY.  The
@@ -1314,6 +1328,7 @@ for db in dblist:
                     outcome.skipped_databases.append(db)
                     continue
 
+            stage = "list its tables"
             execute(cur, tabquery, tabparams)
             verbose_print("getting list of tables")
 
@@ -1324,17 +1339,23 @@ for db in dblist:
             # --table found no table to vacuum.  Before that is put down
             # as "no such table", see whether the name is there as a kind
             # of relation this script does not vacuum; see TABLE_KIND_QUERY.
-            # Inside this try: a failure here is a failure to list this
-            # database's tables like any other.
+            # Only with -v, which is the only place the answer is shown: a
+            # failure of the lookup skips the database, and that is not a
+            # price worth paying for a line that is not printed.  The
+            # database is recorded as one where the name matched no table
+            # either way (see outcome.table_missing_in below).  Inside this
+            # try: a failure here is a failure of this database like any
+            # other.
             unvacuumable = []
-            if args.table is not None and not tablist:
+            if args.table is not None and not tablist and args.verbose:
+                stage = "check what kind of relation --table names"
                 execute(cur, TABLE_KIND_QUERY, tabparams)
                 # rows of (regclass text, relkind)
                 unvacuumable = cur.fetchall()
         except Exception as err:
             if interrupt_signal is not None:
                 break
-            failure_print("skipping database {d} (couldn't list its tables: {e})".format(d=db, e=str(err).rstrip()))
+            failure_print("skipping database {d} (couldn't {s}: {e})".format(d=db, s=stage, e=str(err).rstrip()))
             outcome.skipped_databases.append(db)
             continue
         outcome.databases_listed += 1
@@ -1391,7 +1412,7 @@ for db in dblist:
                 if args.table is not None:
                     _print("specified single table {t} is excluded in database {d} by --exclude-table-in-database; not vacuuming it".format(t=table, d=db))
                 else:
-                    debug_print("skipping table {t} in database {d} per --exclude-table-in-database argument".format(t=table, d=db))
+                    verbose_print("skipping table {t} in database {d} per --exclude-table-in-database argument".format(t=table, d=db))
                 continue
             elif args.tables_to_exclude and table_named_in(args.tables_to_exclude, tabrow):
                 if args.table is not None:
@@ -1510,6 +1531,11 @@ for db in dblist:
             # alone, as the parent's would have been at the last moment.
             # That SET is the one statement between the two.
             vacuuming = table
+            # What a failure is reported as ("... failed."), filled in with
+            # `vacuuming`: the SETs say so, instead of passing for the
+            # VACUUM they precede.  `vacuuming` already names the TOAST
+            # table when the SET between the two statements runs.
+            step = "setting statement_timeout before VACUUMing %s"
             try:
                 if args.enforcetime:
                     execute(cur, timeout_query)
@@ -1518,7 +1544,9 @@ for db in dblist:
 
                 for position, (exquery, vacuuming) in enumerate(vacuums):
                     if position > 0 and args.enforcetime:
+                        step = "setting statement_timeout before VACUUMing %s"
                         execute(cur, enforced_timeout_query())
+                    step = "VACUUMing %s"
                     # Emptied so that whatever is in it afterwards was
                     # raised by this statement and by nothing earlier.
                     del conn.notices[:]
@@ -1558,7 +1586,7 @@ for db in dblist:
                     outcome.cancelled_table = (table, db)
                     break
 
-                failure_print("VACUUMing %s failed." % vacuuming)
+                failure_print((step + " failed.") % vacuuming)
                 failure_print(str(ex).rstrip())
                 outcome.failed_tables.append((table, db))
 
@@ -1635,7 +1663,7 @@ if outcome.unvacuumed_tables:
 if outcome.skipped_databases:
     failure_print("Databases skipped or left unfinished: " + ', '.join(outcome.skipped_databases))
 if outcome.table_found_nowhere():
-    failure_print("Databases where --table {t} matched no table: {d}".format(
+    failure_print("Databases where --table {t} matched no table that can be vacuumed: {d}".format(
         t=args.table, d=', '.join(outcome.table_missing_in)))
 
 if outcome.time_limited or outcome.interrupted_by is not None:

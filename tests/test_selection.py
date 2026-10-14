@@ -451,7 +451,7 @@ def test_exclude_table_in_database_applies_to_that_database_only(make_db, run_ff
     before_one, before_two = one.frozenxids(), two.frozenxids()
 
     result = run_ff(
-        *FREEZE_ALL, "--debug",
+        *FREEZE_ALL, "-v",
         "--exclude-table-in-database", f"{one.name}.t",
         "-d", f"{one.name},{two.name}",
     )
@@ -460,9 +460,22 @@ def test_exclude_table_in_database_applies_to_that_database_only(make_db, run_ff
     assert (
         f"skipping table public.t in database {one.name} "
         "per --exclude-table-in-database argument"
-    ) in result.stderr
+    ) in result.stdout
     assert one.frozen_since(before_one) == {T_KEEP}
     assert two.frozen_since(before_two) == {T, T_KEEP}
+
+    # A progress line like the -T one, so not a debugging line: --debug
+    # alone does not print it.
+    result = run_ff(
+        *FREEZE_ALL, "--debug",
+        "--exclude-table-in-database", f"{one.name}.t",
+        "-d", f"{one.name},{two.name}",
+    )
+
+    assert result.returncode == 0
+    assert "per --exclude-table-in-database argument" not in (
+        result.stdout + result.stderr
+    )
 
 
 def test_exclude_table_in_database_rejects_a_bare_table_name(cluster, run_ff):

@@ -481,22 +481,46 @@ def test_error_on_the_toast_statement_is_a_failed_table(db, start_ff, tmp_path):
     assert db.frozen_since(before) == {("public", "t_next")}
 
 
-def test_failed_split_query_skips_the_database_as_one_whose_tables_could_not_be_listed(
-    make_db, start_ff, tmp_path
+# Each step of a database's setup has its own name in the line for a database
+# the setup failed in: (the text that only that step's statement contains, the
+# options the step needs, what the line says the script couldn't do).
+SETUP_STEPS = [
+    ("SET vacuum_cost_delay", [], "set up its session"),
+    (SPLIT_QUERY, [], "check its TOAST tables"),
+    ("pg_try_advisory_lock", [], "take its advisory lock"),
+    ("tabfreeze", [], "list its tables"),
+    (
+        "relkind IN ('p', 'f', 'v')",
+        ["-v", "--table", "orders"],
+        "check what kind of relation --table names",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "mark, options, step", SETUP_STEPS, ids=[step for *_, step in SETUP_STEPS]
+)
+def test_failed_setup_statement_skips_the_database_and_names_the_step(
+    make_db, start_ff, tmp_path, mark, options, step
 ):
-    # The split query is the last statement of the session-settings block,
-    # so its failure belongs to the same handler as a failure of the table
-    # list: the database is skipped before any table is touched, and the
-    # next database is still done.  The script is stopped just before the
-    # query and its backend terminated meanwhile, so that the query meets a
-    # lost connection.
+    # Every statement of the setup block shares one handler, so a failure in
+    # any of them skips the database before any table is touched, and the
+    # next database is still done; the line says which step it was.  The
+    # script is stopped just before the statement and its backend terminated
+    # meanwhile, so that the statement meets a lost connection.  The last
+    # step is the --table kind lookup, which needs a name that is a view.
     one, two = make_db("one"), make_db("two")
     one.create_table("t_one")
     two.create_table("t_two")
+    if options:
+        one.execute("CREATE VIEW public.orders AS SELECT 1 AS id")
+        two.create_table("orders")
     before_one, before_two = one.frozenxids(), two.frozenxids()
-    gate = StatementGate(tmp_path / "gate", SPLIT_QUERY)
+    gate = StatementGate(tmp_path / "gate", mark)
 
-    proc = start_ff(*FREEZE_ALL, "-d", f"{one.name},{two.name}", env=gate.env)
+    proc = start_ff(
+        *FREEZE_ALL, *options, "-d", f"{one.name},{two.name}", env=gate.env
+    )
     try:
         gate.wait_until_held()
         pid = script_backend_pid(one)
@@ -509,14 +533,17 @@ def test_failed_split_query_skips_the_database_as_one_whose_tables_could_not_be_
 
     assert proc.returncode == 1, stdout + stderr
     assert "Traceback" not in stderr
-    assert f"skipping database {one.name} (couldn't list its tables: " in stderr
+    assert f"skipping database {one.name} (couldn't {step}: " in stderr
     assert stderr.splitlines()[-2:] == [
         "Not all tables were vacuumed.",
         f"Databases skipped or left unfinished: {one.name}",
     ]
     assert one.script_vacuums() == []
     assert one.frozen_since(before_one) == set()
-    assert two.frozen_since(before_two) == {("public", "t_two")}
+    if options:
+        assert two.frozen_since(before_two) == {("public", "orders")}
+    else:
+        assert two.frozen_since(before_two) == {("public", "t_two")}
 
 
 # -- an interrupt ---------------------------------------------------------------------
@@ -686,6 +713,42 @@ def test_enforced_time_sets_the_toast_statements_timeout_from_the_time_left(
     assert 600 < parent_timeout <= 630
     assert 300 <= toast_timeout < 330
     assert toast_timeout <= parent_timeout - 270
+
+
+@pytest.mark.parametrize(
+    "options", [[], ["--enforce-time"]], ids=["unenforced", "enforced"]
+)
+def test_failed_statement_timeout_set_is_reported_as_the_set_not_as_the_vacuum(
+    db, start_ff, tmp_path, options
+):
+    # The SET goes out inside the table's try, ahead of its VACUUM, and used
+    # to be reported as "VACUUMing X failed".  The script is stopped just
+    # before the SET and its backend terminated meanwhile.  The table is
+    # recorded as failed all the same.  (The SET between a parent and its
+    # TOAST statement shares the wording but cannot be reached on its own:
+    # the gate matches text, and the two SETs read alike.)
+    create_toasted_table(db, "t_set")
+    gate = StatementGate(tmp_path / "gate", "SET statement_timeout")
+
+    proc = start_ff(*FREEZE_ALL, *options, "-d", db.name, env=gate.env)
+    try:
+        gate.wait_until_held()
+        pid = script_backend_pid(db)
+        assert pid is not None
+        db.cluster.execute("postgres", "SELECT pg_terminate_backend(%s)", (pid,))
+        wait_for(lambda: script_backend_pid(db) is None, what="the script's backend to go")
+    finally:
+        gate.release()
+    stdout, stderr = proc.communicate(timeout=PROMPT)
+
+    assert proc.returncode == 1, stdout + stderr
+    assert "Traceback" not in stderr
+    lines = stderr.splitlines()
+    assert lines[0] == (
+        "setting statement_timeout before VACUUMing public.t_set failed."
+    )
+    assert f"Tables that failed: public.t_set in database {db.name}" in lines
+    assert db.script_vacuums() == []
 
 
 def test_enforced_time_still_sends_the_toast_statement_after_the_window_closed(

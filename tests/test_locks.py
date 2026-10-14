@@ -24,6 +24,7 @@
 # suite.
 
 import contextlib
+import json
 import threading
 import time
 
@@ -63,7 +64,9 @@ def targets(vacuums):
 
 def named(pid, role, application):
     """How the skip line names one session that holds the lock."""
-    return f'pid {pid}, role {role}, application name "{application}"'
+    return (
+        f'pid {pid}, role {json.dumps(role)}, application name "{application}"'
+    )
 
 
 def skipped_as_held_by_a_run(db, *holders):
@@ -739,6 +742,26 @@ def test_holder_is_named_to_a_role_without_the_right_to_read_all_statistics(
     statements = db.script_statements(user=runner)
     assert statements[-2] == TRY_ADVISORY_LOCK
     assert HOLDER_LOOKUP in statements[-1]
+
+
+def test_holder_role_with_a_line_break_in_its_name_cannot_forge_a_report_line(
+    db, make_role, run_ff
+):
+    # The role is quoted like the application name beside it, so a name
+    # with a line break in it stays inside the one line that names the
+    # holder instead of starting lines of its own.
+    other = make_role("a\nflexible_freeze: forged")
+
+    with advisory_lock_held(db, user=other, application=OTHER_APP) as pid:
+        result = run_ff(*FREEZE_ALL, "-d", db.name, timeout=PROMPT)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert result.stderr.splitlines() == [
+        skipped_as_held_by_another_session(db, named(pid, other, OTHER_APP)),
+        "Not all tables were vacuumed.",
+        f"Databases skipped or left unfinished: {db.name}",
+    ]
+    assert "\\n" in result.stderr.splitlines()[0]
 
 
 def test_every_holder_is_named_and_one_that_is_not_a_run_decides_the_wording(

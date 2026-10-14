@@ -52,11 +52,13 @@ registration and the whole run execute at import. It cannot be imported.
   name is one thing when a table is looked for and another when its kind is
   reported.
 - **`TABLE_KIND_QUERY` is sent only when `TABLE_LOOKUP_QUERY` returned no
-  row (with or without `-v`, though only `-v` prints what it finds), and its
-  rows are never vacuumed (ADR 0007).** Breaks: sent every time, a run
-  that finds its table issues a statement it did not before; fed into the
-  table list, a view or a foreign table gets a VACUUM the server declines
-  and a partitioned table one that vacuums every partition unasked.
+  row and `-v` is given (only `-v` prints what it finds), and its rows are
+  never vacuumed (ADR 0007).** Breaks: sent every time, a run that finds
+  its table issues a statement it did not before, and a failure of the
+  lookup skips a database for a line nobody sees; fed into the table list,
+  a view or a foreign table gets a VACUUM the server declines and a
+  partitioned table one that vacuums every partition unasked.
+  `outcome.table_missing_in` does not depend on the lookup.
 - **The `--table` value reaches the server as a query parameter.** Apart
   from the `--comment` text (next invariant) it is the
   only user-supplied text in any query. Breaks: formatted into the statement
@@ -186,7 +188,8 @@ registration and the whole run execute at import. It cannot be imported.
   `pg_try_advisory_lock` returns false, and only then,
   `ADVISORY_LOCK_HOLDER_QUERY` asks `pg_locks` (left join
   `pg_stat_activity`) for the holders, and the line names each: pid, role,
-  application name. A holder whose application name is the script's
+  application name (role and application name both quoted, the role with
+  `json.dumps`, so that a role name with a line break cannot forge lines). A holder whose application name is the script's
   (`APPLICATION_NAME`) is "another flexible_freeze run"; any other name
   gets the line saying it does not appear to be flexible_freeze and that
   every run will skip the database until it lets go; one such holder
@@ -237,11 +240,16 @@ registration and the whole run execute at import. It cannot be imported.
   query and the fetch share one `try`; the message for both says "query".
   Nothing there is left to an uncaught exception, whose traceback would
   reach stderr and not the log file.
-- A failure in the session settings, the advisory-lock call, the listing
-  query or the `--table` kind lookup (`TABLE_KIND_QUERY`) is reported as
-  "couldn't list its tables" and skips the database; the message names
-  only the listing. The advisory-lock holder lookup is the exception (see
-  above).
+- A failure in the session settings, the TOAST split query, the
+  advisory-lock call, the listing query or the `--table` kind lookup
+  (`TABLE_KIND_QUERY`) skips the database with "couldn't <step>"; the
+  step (`stage`, set before each statement) is one of "set up its
+  session", "check its TOAST tables", "take its advisory lock", "list its
+  tables" and "check what kind of relation --table names". The
+  advisory-lock holder lookup is the exception (see above). Likewise a
+  failure of a `SET statement_timeout` in the table loop reads "setting
+  statement_timeout before VACUUMing X failed", not "VACUUMing X failed"
+  (`step`); the table is recorded as failed either way.
 - A lost connection ends that database only (recorded as unfinished, exit
   status 1), and there is no reconnect.
 - A `--table` name that no table in a database has is recorded, and

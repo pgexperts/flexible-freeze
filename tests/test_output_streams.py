@@ -163,8 +163,8 @@ def database_held_by_another_run(db, make_role, stack):
         (f"skipping database {db.name} (advisory lock {ADVISORY_KEY} is held "
          "there by a session that does not appear to be flexible_freeze, and "
          "every run will skip this database until that session releases the "
-         f"lock or ends: pid {pid}, role {db.cluster.superuser}, application "
-         f'name "{HARNESS_APP}")'),
+         f"lock or ends: pid {pid}, role "
+         f'"{db.cluster.superuser}", application name "{HARNESS_APP}")'),
         "Not all tables were vacuumed.",
         f"Databases skipped or left unfinished: {db.name}",
     ]
@@ -172,9 +172,9 @@ def database_held_by_another_run(db, make_role, stack):
 
 def table_listing_failure(db, make_role, stack):
     # The server refuses a vacuum_cost_delay above 100 ms, which is reported
-    # as a database whose tables could not be listed.
+    # as a database whose session could not be set up.
     return ("--costdelay", "1000", "-d", db.name), [
-        f"skipping database {db.name} (couldn't list its tables: ",
+        f"skipping database {db.name} (couldn't set up its session: ",
         "Not all tables were vacuumed.",
         f"Databases skipped or left unfinished: {db.name}",
     ]
@@ -184,7 +184,7 @@ def table_found_nowhere(db, make_role, stack):
     db.create_table("items")
     return ("--table", "orders", "-d", db.name), [
         "Not all tables were vacuumed.",
-        f"Databases where --table orders matched no table: {db.name}",
+        f"Databases where --table orders matched no table that can be vacuumed: {db.name}",
     ]
 
 
@@ -408,7 +408,7 @@ def test_table_found_nowhere_is_reported_where_it_happened(db, run_ff):
         [
             f"specified single table orders does not exist in database {db.name}",
             "Not all tables were vacuumed.",
-            f"Databases where --table orders matched no table: {db.name}",
+            f"Databases where --table orders matched no table that can be vacuumed: {db.name}",
             "0 tables in 1 databases",
             "Flexible Freeze run complete",
         ],
