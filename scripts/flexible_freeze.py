@@ -50,6 +50,17 @@ def non_negative_int(text):
         raise argparse.ArgumentTypeError("must not be negative: %r" % text)
     return value
 
+def port_list(text):
+    # libpq accepts one port per host; keep the original text for psycopg2.
+    try:
+        for part in text.split(","):
+            if not part:
+                raise ValueError
+            int(part)
+    except ValueError:
+        raise argparse.ArgumentTypeError("invalid port value: %r" % text) from None
+    return text
+
 # argparse type for --comment.  The text is put between /* and */ after every
 # statement (see execute), so it must not be able to end that comment: what
 # came after the end would reach the server as SQL.  A value that could is
@@ -131,8 +142,8 @@ parser.add_argument("-U", "--user", dest="dbuser",
                   help="database user")
 parser.add_argument("-H", "--host", dest="dbhost",
                   help="database hostname")
-parser.add_argument("-p", "--port", dest="dbport", type=int,
-                  help="database port")
+parser.add_argument("-p", "--port", dest="dbport", type=port_list,
+                  help="database port (single or comma-separated for multiple hosts)")
 parser.add_argument("-w", "--password", dest="dbpass",
                   help="database password.  Visible to other local users in the "
                        "process list for the whole run; prefer PGPASSWORD, a "

@@ -412,6 +412,20 @@ def coverage_env():
     }
 
 
+def parse_only(option, value):
+    """Exercise one CLI option without opening a connection or overriding the test target.
+
+    The final --help exits during parsing, before the script can connect.
+    This is for options such as -p that ff_command intentionally forbids.
+    """
+    if option not in ("-p", "--port"):
+        raise ValueError("parse_only is limited to the port option")
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), option, value, "--help"],
+        env=child_env(), capture_output=True, text=True, check=False,
+    )
+
+
 def start_ff(host, port, *args, env=None, cwd=None, merge_streams=False):
     """Start the script and return the Popen object.
 

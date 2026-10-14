@@ -4,9 +4,8 @@
 # exit status 2, a message on stderr, nothing on stdout, no traceback, and no
 # connection to the server.
 #
-# The port option cannot be given a bad value here: the harness supplies -p
-# itself and refuses any argument that names a port, so its type is observed
-# through the argument dump of --debug instead.
+# The harness supplies -p itself for database-backed runs.  Parser-only port
+# cases use its parse_only helper, which exits on --help before connecting.
 #
 # The tests for rejected values give no -d on purpose.  A value that slipped
 # through would then make the script connect and list the databases, which is
@@ -16,7 +15,7 @@ import ast
 import re
 
 import pytest
-from ffharness import FREEZE_ALL, SCRIPT
+from ffharness import FREEZE_ALL, SCRIPT, parse_only
 
 T = ("public", "t")
 
@@ -148,10 +147,26 @@ def test_non_integer_value_keeps_the_usual_argparse_message(cluster, run_ff):
 # between Python versions, so each field is looked for on its own.
 
 
-def test_port_is_parsed_as_an_integer(cluster, run_ff):
+def test_port_is_passed_to_libpq_as_text(cluster, run_ff):
     result = run_ff("--debug", "-d", NO_SUCH_DB)
 
-    assert re.search(rf"\bdbport={cluster.port}\b", result.stderr)
+    assert re.search(rf"\bdbport='{cluster.port}'", result.stderr)
+
+
+@pytest.mark.parametrize("port", ["5543", "5543,5544"])
+def test_port_accepts_single_or_multihost_values_before_connection(port):
+    result = parse_only("-p", port)
+    assert result.returncode == 0, result.stderr
+    assert "usage:" in result.stdout
+
+
+@pytest.mark.parametrize("port", ["", "5543,", ",5544", "5543,,5544", "5543,bad"])
+def test_port_rejects_malformed_multihost_values_before_connection(port):
+    result = parse_only("--port", port)
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "argument -p/--port:" in result.stderr
+    assert "Traceback" not in result.stderr
 
 
 def test_table_option_defaults_to_none(run_ff):
