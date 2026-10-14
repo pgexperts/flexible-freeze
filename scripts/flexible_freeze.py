@@ -16,6 +16,8 @@ changed in each.
 '''
 
 import os
+import re
+import json
 import time
 import sys
 import atexit
@@ -372,8 +374,8 @@ def dbconnect(dbname, dbuser, dbhost, dbport, dbpass):
     return conn
 
 # Stopping on SIGINT, SIGTERM or SIGHUP.  (Which of them the handler is
-# installed for, and when SIGHUP is left alone, is decided where the handler
-# is registered.)
+# installed for, and when SIGINT or SIGHUP is left alone, is decided where
+# the handler is registered.)
 #
 # interrupt_signal is the first of them to arrive, or None.  The handler
 # does nothing but record it, because it can run between any two bytecodes of
@@ -457,6 +459,27 @@ CANCEL_RETRY_SECS = 2
 # (PGCONNECT_TIMEOUT, or a service file's), so it is applied here.  The limit
 # covers the whole attempt, where libpq's own would start afresh for each
 # host of a multi-host connection.
+#
+# libpq no longer checks the value either, so that is done here too.  It can
+# only be done when the first connection is made, since the value may come
+# from a service file that nothing before then reads.  A bad value ends the
+# run on the spot, with one message and the status of a bad argument, instead
+# of being reported as a connection failure of every database.  What is
+# accepted is what libpq accepts on its own path (strtol, then only white
+# space may follow): an optional sign and ASCII digits, in the range of a C
+# int, white space around them.  Python's int() alone would also take digit
+# separators ("1_0") and non-ASCII digits, which libpq refuses.  A negative
+# value means no timeout, as in libpq.
+LIBPQ_INTEGER = re.compile(r'[ \t\n\v\f\r]*([+-]?[0-9]+)[ \t\n\v\f\r]*')
+
+def connect_timeout_seconds(value):
+    match = LIBPQ_INTEGER.fullmatch(value)
+    seconds = int(match.group(1)) if match else None
+    if seconds is None or not -2**31 <= seconds < 2**31:
+        failure_print('connect_timeout is {v}, not a whole number of seconds'.format(v=json.dumps(value)))
+        sys.exit(2)
+    return seconds
+
 def wait_for_server(waiting_conn):
     # psycopg2 moves a connection to STATUS_READY once it is established; a
     # statement can be cancelled from then on, and not before.
@@ -464,7 +487,8 @@ def wait_for_server(waiting_conn):
                                              psycopg2.extensions.STATUS_BEGIN)
     give_up_at = None
     if connecting:
-        connect_timeout = int(waiting_conn.get_dsn_parameters().get('connect_timeout') or 0)
+        configured = waiting_conn.get_dsn_parameters().get('connect_timeout')
+        connect_timeout = 0 if configured is None else connect_timeout_seconds(configured)
         if connect_timeout > 0:
             give_up_at = time.monotonic() + connect_timeout
     next_cancel = 0
@@ -921,8 +945,16 @@ halt_time = time.time() + ( args.run_min * 60 )
 # quietly undo it.  (Only "ignored" can be inherited: a handler does not
 # survive the exec that started the script, so what is found here is either
 # that or the default.)  The other is a platform that has no such signal.
+#
+# SIGINT gets the same treatment, for the same reason: a background job of a
+# non-interactive shell (`cmd &`) is started with it ignored, to keep the
+# Ctrl-C meant for the foreground away from it, and CPython leaves an
+# inherited ignore in place only if the script does not replace it.  SIGTERM
+# is deliberately without the check: an inherited ignore of it is rare, and
+# the operator's kill must always work.
 psycopg2.extensions.set_wait_callback(wait_for_server)
-signal.signal(signal.SIGINT, signal_handler)
+if signal.getsignal(signal.SIGINT) is not signal.SIG_IGN:
+    signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 if hasattr(signal, "SIGHUP") and signal.getsignal(signal.SIGHUP) is not signal.SIG_IGN:
     signal.signal(signal.SIGHUP, signal_handler)

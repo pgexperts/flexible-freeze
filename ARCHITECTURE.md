@@ -22,8 +22,8 @@ registration and the whole run execute at import. It cannot be imported.
 | Vacuum loop | Exclusions, pause, time check, `statement_timeout`, VACUUM (one statement, or the table's and its TOAST table's: ADR 0019), server messages | module level, `for db in dblist`, `TOAST_SPLIT_QUERY`, `vacuums` |
 | Lock handling (ADR 0014, 0015) | `SKIP_LOCKED` on every VACUUM; the session's `lock_timeout` (`--lock-timeout`); one advisory lock per database against overlapping runs (`--no-advisory-lock`), and when it is refused a lookup that names its holders | `ADVISORY_LOCK_KEY`, `ADVISORY_LOCK_HOLDER_QUERY`, `advisory_lock_holders_report`, `APPLICATION_NAME`, the session settings and `vacuum_options` in the database loop |
 | Run outcome (ADR 0009) | What was and was not done; the only input to the summary and the exit status | `RunOutcome`, `outcome`, the summary block at the end of the file |
-| Interruption (ADR 0011) | SIGINT, SIGTERM and SIGHUP (the last only if it was not already ignored when the script started): the handler records the signal; the psycopg2 wait callback cancels the running statement and applies `connect_timeout`; the pause ends early; a second signal stops waiting for the server | `signal_handler`, `interrupt_signal`, `interrupt_repeated`, `wait_for_server`, `pause`, `exit_if_interrupted` |
-| Test harness | Throwaway cluster (and a sweep of clusters a killed session left), the single launcher for the script, catalog and statement-log probes, a clock for the script that tests can move and stop, a gate that stops the script just before one statement (`StatementGate`; `KindLookupGate`, `HolderLookupGate`), a probe for the files the script left open at exit, a socket that never answers, a start with SIGHUP ignored (`start_ff(ignore_sighup=True)`), a SCRAM role for password tests, per-subprocess coverage (`.coveragerc`), the fold of a TOAST table's VACUUM into its parent's (`fold_toast_vacuums`) | `tests/ffharness.py`, `tests/conftest.py` |
+| Interruption (ADR 0011) | SIGINT, SIGTERM and SIGHUP (SIGINT and SIGHUP only if not already ignored when the script started; SIGTERM always): the handler records the signal; the psycopg2 wait callback cancels the running statement and applies `connect_timeout`; the pause ends early; a second signal stops waiting for the server | `signal_handler`, `interrupt_signal`, `interrupt_repeated`, `wait_for_server`, `pause`, `exit_if_interrupted` |
+| Test harness | Throwaway cluster (and a sweep of clusters a killed session left), the single launcher for the script, catalog and statement-log probes, a clock for the script that tests can move and stop, a gate that stops the script just before one statement (`StatementGate`; `KindLookupGate`, `HolderLookupGate`), a probe for the files the script left open at exit, a socket that never answers, a start with chosen signals ignored (`start_ff(ignore_signals=(signal.SIGHUP,))`), a SCRAM role for password tests, per-subprocess coverage (`.coveragerc`), the fold of a TOAST table's VACUUM into its parent's (`fold_toast_vacuums`) | `tests/ffharness.py`, `tests/conftest.py` |
 
 ## Invariants
 
@@ -126,10 +126,13 @@ registration and the whole run execute at import. It cannot be imported.
   two copies of the script with different keys do not see each other; a
   transaction-level lock is gone at once under autocommit; a lock taken
   outside that `try` can outlive the database's work.
-- **SIGHUP gets the handler only if it is not already ignored when the
-  script starts** (`signal.getsignal` is not `SIG_IGN`), and only where the
-  platform has the signal (ADR 0011). Breaks: registered unconditionally, a run
-  started with `nohup` is stopped by the hangup it was protected from.
+- **SIGHUP and SIGINT get the handler only if not already ignored when the
+  script starts** (`signal.getsignal` is not `SIG_IGN`), SIGHUP also only where
+  the platform has the signal (ADR 0011). SIGTERM is registered
+  unconditionally on purpose: the operator's kill must work. Breaks: SIGHUP
+  registered unconditionally, a run started with `nohup` is stopped by the
+  hangup it was protected from; SIGINT likewise for a background job of a
+  non-interactive shell, which starts it ignored.
 - **The signal handler only assigns `interrupt_signal` and
   `interrupt_repeated`.** It can run between any two bytecodes (ADR 0011).
   Breaks: printing from it can re-enter a print in progress, exiting from it skips the summary, and closing the connection
@@ -255,10 +258,11 @@ registration and the whole run execute at import. It cannot be imported.
   It finds ordinary tables and materialized views outside the temporary
   schemas, and its matches still go through the exclusions.
 - Exit status: 0 complete or stopped at the time limit, 1 work missed (or
-  the run could not start), 2 bad arguments, 129 stopped by SIGHUP, 130
+  the run could not start), 2 bad arguments (or a `connect_timeout` that is not a whole number, found at
+  the first connection), 129 stopped by SIGHUP, 130
   stopped by SIGINT, 143 stopped by SIGTERM (128 + the signal number; these
-  outrank 0 and 1). A SIGHUP that the script inherited as ignored (`nohup`)
-  is not handled and stops nothing. A
+  outrank 0 and 1). A SIGHUP or SIGINT that the script inherited as ignored
+  (`nohup`, a background job) is not handled and stops nothing. A
   stop at the time limit is 0 on purpose, including a vacuum cancelled by
   `--enforce-time`; that case is told from a failure by the error being a
   query cancel, `--enforce-time` being set, and the deadline having passed.
@@ -341,7 +345,11 @@ registration and the whole run execute at import. It cannot be imported.
   `exit_if_interrupted()` instead, first thing in each `except`, so that a
   cancel the signal caused is not reported as a failure to list.
 - With a wait callback installed libpq does not apply `connect_timeout`;
-  `wait_for_server` does, to the attempt as a whole and not per host.
+  `wait_for_server` does, to the attempt as a whole and not per host. It also
+  checks the value, which libpq no longer does: a value libpq would refuse
+  ends the run at the first connection with one message and status 2
+  (`connect_timeout_seconds`); the value may come from a service file, so the
+  check cannot be at parse time. It accepts exactly what libpq does.
 - The wait callback is process-wide in psycopg2 and changes how every query
   and connection attempt waits, not only VACUUM.
 - The default database list is every database with `datallowconn` and not

@@ -14,9 +14,11 @@
 # cancellation, and the summary then says that the VACUUM may still be
 # running.
 #
-# SIGHUP has one exception: a run that was started with the signal ignored,
-# which is what nohup does, leaves it ignored and is not stopped by it.  And
-# a platform that has no SIGHUP must not keep the script from running.
+# SIGHUP and SIGINT have one exception: a run that was started with the
+# signal ignored (SIGHUP by nohup, SIGINT by a non-interactive shell that
+# starts a background job) leaves it ignored and is not stopped by it; SIGTERM
+# has none.  And a platform that has no SIGHUP must not keep the script from
+# running.
 #
 # How a signal is made to arrive at a known point.  Each test waits for a
 # state it can observe before signalling, never for a length of time:
@@ -46,6 +48,7 @@
 # the test instead of hanging the suite.
 
 import contextlib
+import json
 import os
 import signal
 import time
@@ -435,7 +438,7 @@ def test_sighup_ignored_when_the_run_started_stays_ignored(db, start_ff):
     before = db.frozenxids()
 
     with vacuum_held_up(db, "t_held") as pin:
-        proc = start_ff(*FREEZE_ALL, "-d", db.name, ignore_sighup=True)
+        proc = start_ff(*FREEZE_ALL, "-d", db.name, ignore_signals=(signal.SIGHUP,))
         wait_until_blocked(db)
         proc.send_signal(signal.SIGHUP)
         pin.rollback()
@@ -453,9 +456,56 @@ def test_run_started_with_sighup_ignored_still_stops_on_sigterm(db, start_ff):
     before = db.frozenxids()
 
     with vacuum_held_up(db, "t_held"):
-        proc = start_ff(*FREEZE_ALL, "-d", db.name, ignore_sighup=True)
+        proc = start_ff(*FREEZE_ALL, "-d", db.name, ignore_signals=(signal.SIGHUP,))
         wait_until_blocked(db)
         proc.send_signal(signal.SIGHUP)
+        proc.send_signal(signal.SIGTERM)
+        code, stdout, stderr = finish(proc)
+        assert_no_backend_left(db.cluster)
+
+    assert code == 143
+    assert stdout == ""
+    assert stderr.splitlines() == [
+        "Vacuuming interrupted by SIGTERM",
+        f"Work remains: VACUUM of public.t_held in database {db.name} was interrupted.",
+    ]
+    assert db.frozen_since(before) == set()
+
+
+def test_sigint_ignored_when_the_run_started_stays_ignored(db, start_ff):
+    # A background job of a non-interactive shell (`cmd &` in a script) is
+    # started with SIGINT ignored, so that the Ctrl-C meant for the script
+    # does not reach it.  The script must not undo that by installing its
+    # handler.  Same reasoning as for SIGHUP above: the signal is sent while
+    # the first VACUUM is held up, and a run that took any notice of it
+    # could not go on to vacuum both tables and exit with status 0.
+    db.create_table("t_held")
+    db.create_table("t_next")
+    before = db.frozenxids()
+
+    with vacuum_held_up(db, "t_held") as pin:
+        proc = start_ff(*FREEZE_ALL, "-d", db.name, ignore_signals=(signal.SIGINT,))
+        wait_until_blocked(db)
+        proc.send_signal(signal.SIGINT)
+        pin.rollback()
+        code, stdout, stderr = finish(proc)
+
+    assert code == 0
+    assert stderr == ""
+    assert stdout == "All tables vacuumed.\n"
+    assert db.frozen_since(before) == {("public", "t_held"), ("public", "t_next")}
+
+
+def test_run_started_with_sigint_ignored_still_stops_on_sigterm(db, start_ff):
+    # SIGTERM is deliberately not given the check: an inherited ignore of it
+    # is rare, and the operator's kill must work.
+    db.create_table("t_held")
+    before = db.frozenxids()
+
+    with vacuum_held_up(db, "t_held"):
+        proc = start_ff(*FREEZE_ALL, "-d", db.name, ignore_signals=(signal.SIGINT,))
+        wait_until_blocked(db)
+        proc.send_signal(signal.SIGINT)
         proc.send_signal(signal.SIGTERM)
         code, stdout, stderr = finish(proc)
         assert_no_backend_left(db.cluster)
@@ -815,3 +865,47 @@ def test_connect_timeout_still_applies(run_ff, silent_server):
     assert lines[0].startswith("skipping database ff_one (couldn't connect: ")
     assert "timeout expired" in lines[0]
     assert "Databases skipped or left unfinished: ff_one" in lines
+
+
+# What libpq accepts as connect_timeout, and the script has to accept too:
+# an optional sign and ASCII digits, with white space around them.  A
+# negative value means no timeout.
+@pytest.mark.parametrize("value", [" 10", "10 ", "+5", "-5", "010"])
+def test_connect_timeout_libpq_accepts_is_accepted(db, run_ff, value):
+    db.create_table("t1")
+    before = db.frozenxids()
+
+    result = run_ff(*FREEZE_ALL, "-d", db.name, env={"PGCONNECT_TIMEOUT": value})
+
+    assert result.stderr == ""
+    assert result.stdout == "All tables vacuumed.\n"
+    assert result.returncode == 0
+    assert db.frozen_since(before) == {("public", "t1")}
+
+
+# The check is the script's own, since libpq does not validate the value on a
+# connection driven by a wait callback.  Every value here is refused by libpq
+# itself when it connects over TCP.  The run ends at the first connection
+# with one message (the value shown as JSON, so that it is plain ASCII on one
+# line), instead of blaming each database for it.
+@pytest.mark.parametrize(
+    "value", ["10s", "abc", "10.5", "1_0", "1e1", "0x10", "+", "", " ", "\u0663",
+              "2147483648", "-2147483649"]
+)
+@pytest.mark.parametrize("named", [False, True], ids=["listing", "named"])
+def test_connect_timeout_that_is_not_a_whole_number_ends_the_run(
+    db, run_ff, value, named
+):
+    db.create_table("t1")
+    before = db.frozenxids()
+    args = ["-d", f"{db.name},postgres"] if named else []
+
+    result = run_ff(*FREEZE_ALL, *args, env={"PGCONNECT_TIMEOUT": value})
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr.splitlines() == [
+        f"connect_timeout is {json.dumps(value)}, not a whole number of seconds"
+    ]
+    assert db.script_statements() == []
+    assert db.frozen_since(before) == set()

@@ -528,7 +528,7 @@ def coverage_env():
 
 
 def start_ff(host, port, *args, env=None, cwd=None, merge_streams=False,
-             ignore_sighup=False):
+             ignore_signals=()):
     """Start the script and return the Popen object.
 
     This is the only place in the test suite that launches the script.
@@ -540,17 +540,18 @@ def start_ff(host, port, *args, env=None, cwd=None, merge_streams=False,
     both, as `2>&1` does, for the tests of that order; proc.stderr is then
     None and nothing says which stream a line came from.
 
-    `ignore_sighup` starts the script with SIGHUP ignored, which is how
-    `nohup` runs a command.  The test process ignores the signal itself
-    while it starts the child and puts back what it had as soon as Popen
-    returns, which is after the child's exec: an ignored signal is
-    inherited through fork and exec, where a handler is reset by exec.
-    That is preferred to a preexec_fn, which runs Python between fork and
-    exec.  The cost is that a SIGHUP sent to pytest in that moment is
-    lost, and that it works on the main thread only (signal.signal()
-    refuses elsewhere).  Without the option the script inherits what the
-    test process has: the default action, unless pytest was itself started
-    with the signal ignored.
+    `ignore_signals` starts the script with those signals ignored:
+    (signal.SIGHUP,) is how `nohup` runs a command, and SIGINT is what a
+    background job of a non-interactive shell gets.  The test process
+    ignores the signals itself while it starts the child and puts back what
+    it had as soon as Popen returns, which is after the child's exec: an
+    ignored signal is inherited through fork and exec, where a handler is
+    reset by exec.  That is preferred to a preexec_fn, which runs Python
+    between fork and exec.  The cost is that one of those signals sent to
+    pytest in that moment is lost (a Ctrl-C included), and that it works on
+    the main thread only (signal.signal() refuses elsewhere).  Without the
+    option the script inherits what the test process has: the default
+    action, unless pytest was itself started with the signal ignored.
     """
     def launch():
         return subprocess.Popen(
@@ -563,13 +564,16 @@ def start_ff(host, port, *args, env=None, cwd=None, merge_streams=False,
             text=True,
         )
 
-    if not ignore_sighup:
+    if not ignore_signals:
         return launch()
-    previous = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    previous = {}
     try:
+        for sig in ignore_signals:
+            previous[sig] = signal.signal(sig, signal.SIG_IGN)
         return launch()
     finally:
-        signal.signal(signal.SIGHUP, previous)
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
 
 def run_ff(host, port, *args, env=None, cwd=None, timeout=RUN_TIMEOUT,
@@ -1281,17 +1285,17 @@ class Cluster:
 
     # -- the script ---------------------------------------------------------
 
-    def start_ff(self, *args, env=None, cwd=None, port=None, ignore_sighup=False):
+    def start_ff(self, *args, env=None, cwd=None, port=None, ignore_signals=()):
         """Start the script against this cluster; returns a Popen.
 
         `port` is a SilentServer's port number in this cluster's socket
         directory, or a string to hand to the script's -p as it is (see
         ff_command); without it the script gets this cluster's own port.
-        `ignore_sighup`: see the module-level start_ff.
+        `ignore_signals`: see the module-level start_ff.
         """
         return start_ff(
             self.sockdir, self._script_port(port), *args, env=env, cwd=cwd,
-            ignore_sighup=ignore_sighup,
+            ignore_signals=ignore_signals,
         )
 
     def run_ff(self, *args, env=None, cwd=None, timeout=RUN_TIMEOUT, port=None,
