@@ -435,7 +435,9 @@ def test_rejected_session_setting_skips_the_database(db, run_ff):
     assert result.returncode == 1
     assert "Traceback" not in result.stderr
     assert db.frozen_since(before) == set()
-    assert f"skipping database {db.name} (couldn't list its tables: " in result.stderr
+    assert (
+        f"skipping database {db.name} (couldn't set up its session: "
+    ) in result.stderr
     assert result.stderr.splitlines()[-2:] == [
         "Not all tables were vacuumed.",
         f"Databases skipped or left unfinished: {db.name}",
@@ -462,7 +464,7 @@ def test_table_option_that_matches_in_no_database_fails_the_run(make_db, run_ff)
     # the line for each database is a -v message (test_table_names.py).
     assert messages == [
         "Not all tables were vacuumed.",
-        f"Databases where --table orders matched no table: {one.name}, {two.name}",
+        f"Databases where --table orders matched no table that can be vacuumed: {one.name}, {two.name}",
     ]
 
 
@@ -520,7 +522,7 @@ def test_table_option_missing_and_a_skipped_database_reports_both(db, run_ff):
     assert result.stderr.splitlines()[-3:] == [
         "Not all tables were vacuumed.",
         f"Databases skipped or left unfinished: {NO_SUCH_DB}",
-        f"Databases where --table orders matched no table: {db.name}",
+        f"Databases where --table orders matched no table that can be vacuumed: {db.name}",
     ]
 
 
@@ -539,6 +541,10 @@ def test_time_limit_ends_the_run_for_the_remaining_databases(make_db, run_ff):
     assert result.returncode == 0
     assert one.script_vacuums() == []
     assert two.cluster.statements(dbname=two.name) == []
+    # Nor is it announced: the line says the script is working on a
+    # database, and a run that has stopped is not working on one.
+    assert f"working on database {one.name}" in result.stdout.splitlines()
+    assert f"working on database {two.name}" not in result.stdout
     assert_lines_in_order(
         result.stdout,
         [

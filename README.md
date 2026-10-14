@@ -79,9 +79,10 @@ Requires PostgreSQL 12 or later: every `VACUUM` is sent with `SKIP_LOCKED`, whic
       -l LOGFILE, --log LOGFILE
                             append output to this file instead of standard output. A failure report goes to the file and to standard
                             error
-      -v, --verbose         print progress as the run goes, including each database and table it works on
+      -v, --verbose         print progress as the run goes, including each database and table it works on and each table
+                            that -T or --exclude-table-in-database leaves out
       --debug               print debugging output to standard error: the versions in use, the arguments, the --exclude-table-in-
-                            database entries, and each table that one of them skips (not in a --table run)
+                            database entries
       -U DBUSER, --user DBUSER
                             database user
       -H DBHOST, --host DBHOST
@@ -103,7 +104,7 @@ Requires PostgreSQL 12 or later: every `VACUUM` is sent with `SKIP_LOCKED`, whic
 
 Notes:
 
-The minutes time limit is normally only enforced at the start of vacuuming each table, allowing vacuums to continue past the end of the time window.  If you set `--enforce-time`, however, it uses statement_timeout to terminate a running vacuum at the end of the time window (plus 30 seconds grace period).  A vacuum terminated that way is not a failure: the run ends as it does for any other stop at the time limit, and the summary names the table whose vacuum was cancelled.  Pages that vacuum had already frozen stay frozen, but the table's `relfrozenxid` is not advanced, so it will be selected first again on the next run, so a table that needs longer than the time window to vacuum needs a longer window.
+The minutes time limit is normally only enforced at the start of vacuuming each table, allowing vacuums to continue past the end of the time window.  If you set `--enforce-time`, however, it uses statement_timeout to terminate a running vacuum at the end of the time window (plus 30 seconds grace period).  A vacuum terminated that way is not a failure: the run ends as it does for any other stop at the time limit, and the summary names the table whose vacuum was cancelled.  Pages that vacuum had already frozen stay frozen, but the table's `relfrozenxid` is not advanced, so it will be selected first again on the next run, so a table that needs longer than the time window to vacuum needs a longer window.  A table that never finishes inside the window is cancelled on every run that reaches it, and it is not skipped on its own; `-T` is the way to exempt it.
 
 `--pause` is a pause between vacuums.  There is none after the last table, and a pause never runs past the end of the time window.
 
@@ -158,7 +159,7 @@ Connection settings other than host, port, user and password are taken from the 
 
 A mistyped `-T` or `--exclude-table-in-database` value excludes nothing.  With `-v`, the end of the run lists the exclusion values that matched none of the selected tables.  That is not an error: a correct value also matches nothing when its table was not selected for vacuuming in that run.
 
-The database user supplied is expected to have permissions on all tables (e.g. a superuser).  The server does not raise an error for a table the user may not vacuum: it skips the table with a warning.  `flexible_freeze` treats any warning the server raises during a table's VACUUM as "not vacuumed": it prints the server's message, lists the table in the summary, and exits with status 1.
+The database user supplied is expected to have permissions on all tables (e.g. a superuser).  The server does not raise an error for a table the user may not vacuum: it skips the table with a warning.  `flexible_freeze` treats any warning the server raises during a table's VACUUM as "not vacuumed": it prints the server's message, lists the table in the summary, and exits with status 1.  That includes a warning that is benign in itself, such as "oldest xmin is far in the past": a table whose VACUUM drew one counts as not vacuumed and makes the exit status 1, though the VACUUM ran.
 
 One table failing does not end the run.  The failure is printed, the run continues with the next table, and the summary at the end lists every table that failed.  The same goes for a database that cannot be connected to, whose tables cannot be listed, or in which another run holds the advisory lock: it is skipped and listed in the summary.  If the connection to a database is lost during a run, the rest of that database is skipped; `flexible_freeze` does not reconnect.
 

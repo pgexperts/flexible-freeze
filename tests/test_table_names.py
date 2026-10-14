@@ -178,7 +178,7 @@ def test_exclude_table_in_database_matches_a_table_off_the_search_path(
     before_one, before_two = one.frozenxids(), two.frozenxids()
 
     result = run_ff(
-        *FREEZE_ALL, "--debug",
+        *FREEZE_ALL, "-v",
         "--exclude-table-in-database", f"{one.name}.{name}",
         "-d", f"{one.name},{two.name}",
     )
@@ -187,7 +187,7 @@ def test_exclude_table_in_database_matches_a_table_off_the_search_path(
     assert (
         f"skipping table sales.orders in database {one.name} "
         "per --exclude-table-in-database argument"
-    ) in result.stderr
+    ) in result.stdout
     assert one.frozen_since(before_one) == {("archive", "items"), T_KEEP}
     assert two.frozen_since(before_two) == set(tables)
 
@@ -242,7 +242,7 @@ def test_exclude_table_in_database_still_matches_the_printed_name(make_db, run_f
     before_one, before_two = one.frozenxids(), two.frozenxids()
 
     result = run_ff(
-        *FREEZE_ALL, "--debug",
+        *FREEZE_ALL, "-v",
         "--exclude-table-in-database", f'{one.name}."Sales"."Order Items"',
         "-d", f"{one.name},{two.name}",
     )
@@ -251,7 +251,7 @@ def test_exclude_table_in_database_still_matches_the_printed_name(make_db, run_f
     assert (
         f'skipping table "Sales"."Order Items" in database {one.name} '
         "per --exclude-table-in-database argument"
-    ) in result.stderr
+    ) in result.stdout
     assert one.frozen_since(before_one) == {("Sales", "kept")}
     assert two.frozen_since(before_two) == set(tables)
 
@@ -442,7 +442,7 @@ def test_table_option_says_when_the_table_does_not_exist(db, run_ff):
         result.stderr,
         [
             "Not all tables were vacuumed.",
-            f"Databases where --table t_absent matched no table: {db.name}",
+            f"Databases where --table t_absent matched no table that can be vacuumed: {db.name}",
         ],
     )
     assert db.frozen_since(before) == set()
@@ -454,7 +454,7 @@ def test_table_option_says_when_the_table_does_not_exist(db, run_ff):
     assert result.stdout == ""
     assert result.stderr.splitlines() == [
         "Not all tables were vacuumed.",
-        f"Databases where --table t_absent matched no table: {db.name}",
+        f"Databases where --table t_absent matched no table that can be vacuumed: {db.name}",
     ]
 
 
@@ -665,7 +665,8 @@ def assert_counted_as_matching_no_table(result, name, *databases):
     assert result.returncode == 1, result.stdout + result.stderr
     assert result.stderr.splitlines() == [
         "Not all tables were vacuumed.",
-        f"Databases where --table {name} matched no table: "
+        f"Databases where --table {name} matched no table "
+        "that can be vacuumed: "
         + ", ".join(database.name for database in databases),
     ]
 
@@ -1051,8 +1052,8 @@ def test_failure_during_the_kind_lookup_skips_that_database_only(
     assert "Traceback" not in stderr
     assert proc.returncode == 1, stdout + stderr
     assert (
-        f"skipping database {one.name} (couldn't list its tables: "
-        "canceling statement due to lock timeout"
+        f"skipping database {one.name} (couldn't check what kind of "
+        "relation --table names: canceling statement due to lock timeout"
     ) in stderr
     assert_lines_in_order(
         stderr,
@@ -1072,6 +1073,32 @@ def test_failure_during_the_kind_lookup_skips_that_database_only(
     assert_lines_in_order(
         stdout, [f"working on database {two.name}", "1 tables in 1 databases"]
     )
+
+
+def test_kind_lookup_is_sent_with_verbose_only(make_db, run_ff):
+    # The lookup's only product is a -v line, so a run without -v does not
+    # send it: a failure of the lookup could only skip a database for a line
+    # nobody can see.  The database is still recorded as one where the name
+    # matched no table that can be vacuumed.
+    one, two = view_and_table(make_db)
+    before_two = two.frozenxids()
+
+    result = run_ff(
+        *FREEZE_ALL, "--table", "orders", "-d", f"{one.name},{two.name}"
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stderr == ""
+    assert "cannot be vacuumed" not in result.stdout
+    assert len(catalog_lookups(one)) == 1
+    assert one.script_vacuums() == []
+    assert two.frozen_since(before_two) == {("sales", "orders")}
+
+    mark = one.cluster.log_offset()
+    result = run_ff(*FREEZE_ALL, "--table", "orders", "-d", one.name)
+
+    assert_counted_as_matching_no_table(result, "orders", one)
+    assert len(catalog_lookups(one, since=mark)) == 1
 
 
 def test_time_limit_is_met_after_a_database_where_the_name_is_a_view(

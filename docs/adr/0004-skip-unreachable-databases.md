@@ -43,3 +43,11 @@ table list could not be read (the message reads "couldn't list its tables" and
 also covers a failure of the session settings), another run holds its advisory
 lock (record 0015), or the connection was lost part-way through it. A failed
 table no longer aborts the run; it is recorded and the run goes on.
+
+## Addendum (2026-10-14)
+
+The "couldn't list its tables" wording above is narrowed (issue #67): the
+message now names the step that failed ("couldn't set up its session",
+"check its TOAST tables", "take its advisory lock", "list its tables", "check
+what kind of relation --table names"). The database is skipped, listed in the
+summary and counted toward exit status 1 exactly as before.
