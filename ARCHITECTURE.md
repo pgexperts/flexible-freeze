@@ -352,7 +352,8 @@ registration and the whole run execute at import. It cannot be imported.
   same measure of age as a table's (`FREEZE_AGE_SQL`). A `-d` list never
   goes through that query and keeps the order it was written in.
   Databases of equal age (copies of one template, until something in them
-  is frozen) come in whatever order the server returns.
+  is frozen) go by name, `datname` being the secondary key, so that runs
+  are repeatable.
 - Neither selection caps its list; the time window is the only bound (ADR
   0012, which superseded 0003).
 - `--freezeage` is compared with one number per table, `FREEZE_AGE_SQL`: the
@@ -361,7 +362,11 @@ registration and the whole run execute at import. It cannot be imported.
   not selected; ADR 0012, addendum). `--minsizemb` is compared with
   `pg_table_size`, in both modes.
 - Both selections leave out `pg_catalog`, `information_schema` and the
-  temporary schemas, and neither selects partitioned tables.
+  temporary schemas, and neither selects partitioned tables. A temporary
+  schema is one matching `TEMP_SCHEMA_REGEX` (`pg_temp_N`, `pg_toast_temp_N`),
+  the same condition in the freeze, `--no-freeze` and `--table` queries; it
+  is a regex because `_` is a `LIKE` wildcard, which hid a user's `pgxtemp`
+  schema (issue #94).
   `--system-catalogs` lifts the first two for the freeze selection, and
   only that (ADR 0012, addendum): the condition on those two schemas becomes `true`
   (`system_schema_filter`) and the rest of the statement is untouched, so

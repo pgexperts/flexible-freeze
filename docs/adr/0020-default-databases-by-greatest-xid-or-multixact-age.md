@@ -71,3 +71,12 @@ standard error only. The listing query can now fail on a lock wait longer than
 `--lock-timeout`, which ends the run before any database is started. `postgres`
 must still be connectable for a run without `-d`. A database in the list that
 then cannot be connected to is skipped and reported (records 0004 and 0009).
+
+## Addendum (2026-10-13)
+
+Databases of equal age are now ordered by name: the query's secondary sort key
+is `datname` (issue #94). Equal ages are common, since `CREATE DATABASE` copies
+the template's `datfrozenxid` and `datminmxid`, and with no secondary key such
+databases came back in the server's order, so that two runs against one
+cluster could visit them differently and a time-limited run could stop in a
+different place each time. The primary order is unchanged.

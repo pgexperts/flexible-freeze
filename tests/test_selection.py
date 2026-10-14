@@ -343,6 +343,26 @@ def test_default_database_order_puts_the_greater_xid_age_first_too(
     ]
 
 
+def test_default_database_order_breaks_a_tie_by_name(cluster, make_db, run_ff):
+    # Issue #94: databases of equal age (copies of one template carry its
+    # datfrozenxid) came back in whatever order the server returned them, so
+    # two runs of one cluster could visit them differently.  Created in
+    # reverse name order, so that creation order (which is what a heap scan
+    # of pg_database tends to return) disagrees with name order.
+    later = make_db(name="ffz_tie_break")
+    earlier = make_db(name="ffa_tie_break")
+    ages = database_ages(cluster, later, earlier)
+    assert ages[later.name] == ages[earlier.name], ages
+    mark = cluster.log_offset()
+
+    result = run_ff(*FREEZE_ALL, "-v")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert databases_in_order_of_work(cluster, mark, later, earlier) == [
+        earlier.name, later.name,
+    ]
+
+
 def test_time_limited_default_run_stops_in_the_database_older_by_either_age(
     cluster, make_db, run_ff
 ):
@@ -1082,3 +1102,47 @@ def test_no_freeze_leaves_other_sessions_temp_tables_alone(db, run_ff):
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert targets(db.script_vacuums()) == [("public", "t_dead")]
+
+
+# -- schemas whose names only look like temporary ones ---------------------------
+#
+# Issue #94: the temporary-schema filters were LIKE 'pg_temp%' and
+# 'pg_toast_temp%', where "_" matches any one character, so a user's schema
+# named pgxtemp or "pg-temp" was taken for another session's temporary
+# schema and its tables were never selected.
+
+
+LOOKALIKE_SCHEMAS = [
+    pytest.param("pgxtemp", id="pgxtemp"),
+    pytest.param("pg-temp", id="hyphen-temp"),
+    pytest.param("pg-toast-temp", id="hyphen-toast-temp"),
+]
+
+
+@pytest.mark.parametrize("schema", LOOKALIKE_SCHEMAS)
+def test_no_freeze_selects_a_table_in_a_schema_that_only_looks_like_a_temp_one(
+    db, run_ff, schema
+):
+    db.create_schema(schema)
+    db.create_table("t", schema=schema, rows=1000)
+    db.make_dead_tuples("t", schema=schema)
+
+    result = run_ff("--no-freeze", "-d", db.name)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert targets(db.script_vacuums()) == [(schema, "t")]
+
+
+@pytest.mark.parametrize("schema", LOOKALIKE_SCHEMAS)
+def test_freeze_selects_a_table_in_a_schema_that_only_looks_like_a_temp_one(
+    db, run_ff, schema
+):
+    db.create_schema(schema)
+    table = db.create_table("t", schema=schema)
+    before = db.frozenxids()
+
+    result = run_ff(*FREEZE_ALL, "-d", db.name)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert db.frozen_since(before) == {table}
+    assert (schema, "t") in targets(db.script_vacuums())
