@@ -90,6 +90,16 @@ def toast_relfrozenxid(db, name):
     )[0][0]
 
 
+def script_backend_pid(db):
+    """The pid of the script's session in `db`, or None."""
+    rows = db.cluster.execute(
+        "postgres",
+        "SELECT pid FROM pg_stat_activity WHERE application_name = %s AND datname = %s",
+        (SCRIPT_APP, db.name),
+    )
+    return rows[0][0] if rows else None
+
+
 @contextlib.contextmanager
 def toast_page_pinned(db, toast):
     """Keep a freezing VACUUM of `toast` from finishing: an open cursor's
@@ -470,6 +480,44 @@ def test_error_on_the_toast_statement_is_a_failed_table(db, start_ff, tmp_path):
     assert db.frozen_since(before) == {("public", "t_next")}
 
 
+def test_failed_split_query_skips_the_database_as_one_whose_tables_could_not_be_listed(
+    make_db, start_ff, tmp_path
+):
+    # The split query is the last statement of the session-settings block,
+    # so its failure belongs to the same handler as a failure of the table
+    # list: the database is skipped before any table is touched, and the
+    # next database is still done.  The script is stopped just before the
+    # query and its backend terminated meanwhile, so that the query meets a
+    # lost connection.
+    one, two = make_db("one"), make_db("two")
+    one.create_table("t_one")
+    two.create_table("t_two")
+    before_one, before_two = one.frozenxids(), two.frozenxids()
+    gate = StatementGate(tmp_path / "gate", SPLIT_QUERY)
+
+    proc = start_ff(*FREEZE_ALL, "-d", f"{one.name},{two.name}", env=gate.env)
+    try:
+        gate.wait_until_held()
+        pid = script_backend_pid(one)
+        assert pid is not None
+        one.cluster.execute("postgres", "SELECT pg_terminate_backend(%s)", (pid,))
+        wait_for(lambda: script_backend_pid(one) is None, what="the script's backend to go")
+    finally:
+        gate.release()
+    stdout, stderr = proc.communicate(timeout=PROMPT)
+
+    assert proc.returncode == 1, stdout + stderr
+    assert "Traceback" not in stderr
+    assert f"skipping database {one.name} (couldn't list its tables: " in stderr
+    assert stderr.splitlines()[-2:] == [
+        "Not all tables were vacuumed.",
+        f"Databases skipped or left unfinished: {one.name}",
+    ]
+    assert one.script_vacuums() == []
+    assert one.frozen_since(before_one) == set()
+    assert two.frozen_since(before_two) == {("public", "t_two")}
+
+
 # -- an interrupt ---------------------------------------------------------------------
 
 
@@ -511,3 +559,49 @@ def test_signal_during_the_toast_statement_cancels_it_and_names_the_parent(
     ]
     assert toast_after == toast_before
     assert len(db.script_vacuum_statements()) == 2
+
+
+def test_enforced_time_cancel_during_the_toast_statement_is_a_time_limited_stop(
+    db, start_ff, script_clock
+):
+    # With --enforce-time the cancel of a VACUUM at the time limit is a
+    # normal stop (exit 0) that names the table, and the TOAST table's
+    # statement is no exception: it is cancelled on the pinned page after
+    # the script's clock is moved past the deadline, and the table after
+    # this one is never started.
+    toast = create_toasted_table(db, "t_held")
+    db.create_table("t_later")
+    toast_before = toast_relfrozenxid(db, "t_held")
+
+    with toast_page_pinned(db, toast):
+        proc = start_ff(
+            *FREEZE_ALL, "--enforce-time", "-m", "1", "-d", db.name,
+            env=script_clock.env,
+        )
+
+        def waiting():
+            rows = db.execute(
+                "SELECT pid FROM pg_stat_activity WHERE application_name = %s "
+                "AND wait_event_type = 'BufferPin' AND query LIKE %s",
+                (SCRIPT_APP, f"VACUUM % {toast}%"),
+            )
+            return rows[0][0] if rows else None
+
+        pid = wait_for(waiting, what="the TOAST table's VACUUM to wait")
+        script_clock.advance(3600)
+        db.cluster.execute("postgres", "SELECT pg_cancel_backend(%s)", (pid,))
+        stdout, stderr = proc.communicate(timeout=PROMPT)
+        toast_after = toast_relfrozenxid(db, "t_held")
+
+    assert proc.returncode == 0, stdout + stderr
+    assert stderr == ""
+    assert stdout.splitlines() == [
+        "Vacuuming halted due to timeout",
+        (f"Work remains: VACUUM of public.t_held in database {db.name} "
+         "was cancelled at the time limit."),
+    ]
+    assert toast_after == toast_before
+    # Both statements of the one table, and nothing for t_later.
+    assert [v.table for v in db.script_vacuum_statements()] == [
+        "t_held", toast.removeprefix("pg_toast."),
+    ]
