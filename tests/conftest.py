@@ -268,13 +268,16 @@ def silent_server(cluster):
 
 @pytest.fixture
 def start_ff(cluster):
-    """start_ff(*args, env=None, cwd=None, port=None) -> Popen, for tests
-    that must act while the script is running.  Anything still alive is
-    killed afterwards.  `port` is only for a silent_server."""
+    """start_ff(*args, env=None, cwd=None, port=None, ignore_sighup=False)
+    -> Popen, for tests that must act while the script is running.  Anything
+    still alive is killed afterwards.  `port` is only for a silent_server;
+    `ignore_sighup=True` starts the script the way `nohup` does."""
     started = []
 
-    def launcher(*args, env=None, cwd=None, port=None):
-        proc = cluster.start_ff(*args, env=env, cwd=cwd, port=port)
+    def launcher(*args, env=None, cwd=None, port=None, ignore_sighup=False):
+        proc = cluster.start_ff(
+            *args, env=env, cwd=cwd, port=port, ignore_sighup=ignore_sighup
+        )
         started.append(proc)
         return proc
 

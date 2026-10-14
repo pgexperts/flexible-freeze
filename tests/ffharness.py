@@ -31,6 +31,7 @@ import os
 import pwd
 import re
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -412,7 +413,8 @@ def coverage_env():
     }
 
 
-def start_ff(host, port, *args, env=None, cwd=None, merge_streams=False):
+def start_ff(host, port, *args, env=None, cwd=None, merge_streams=False,
+             ignore_sighup=False):
     """Start the script and return the Popen object.
 
     This is the only place in the test suite that launches the script.
@@ -423,16 +425,37 @@ def start_ff(host, port, *args, env=None, cwd=None, merge_streams=False):
     streams were written.  `merge_streams` gives the script one pipe for
     both, as `2>&1` does, for the tests of that order; proc.stderr is then
     None and nothing says which stream a line came from.
+
+    `ignore_sighup` starts the script with SIGHUP ignored, which is how
+    `nohup` runs a command.  The test process ignores the signal itself
+    while it starts the child and puts back what it had as soon as Popen
+    returns, which is after the child's exec: an ignored signal is
+    inherited through fork and exec, where a handler is reset by exec.
+    That is preferred to a preexec_fn, which runs Python between fork and
+    exec.  The cost is that a SIGHUP sent to pytest in that moment is
+    lost, and that it works on the main thread only (signal.signal()
+    refuses elsewhere).  Without the option the script inherits what the
+    test process has: the default action, unless pytest was itself started
+    with the signal ignored.
     """
-    return subprocess.Popen(
-        ff_command(host, port, args),
-        env=child_env({**coverage_env(), **(env or {})}),
-        cwd=cwd,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT if merge_streams else subprocess.PIPE,
-        text=True,
-    )
+    def launch():
+        return subprocess.Popen(
+            ff_command(host, port, args),
+            env=child_env({**coverage_env(), **(env or {})}),
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT if merge_streams else subprocess.PIPE,
+            text=True,
+        )
+
+    if not ignore_sighup:
+        return launch()
+    previous = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    try:
+        return launch()
+    finally:
+        signal.signal(signal.SIGHUP, previous)
 
 
 def run_ff(host, port, *args, env=None, cwd=None, timeout=RUN_TIMEOUT,
@@ -1020,12 +1043,16 @@ class Cluster:
 
     # -- the script ---------------------------------------------------------
 
-    def start_ff(self, *args, env=None, cwd=None, port=None):
+    def start_ff(self, *args, env=None, cwd=None, port=None, ignore_sighup=False):
         """Start the script against this cluster; returns a Popen.
 
         `port` is for a SilentServer in this cluster's socket directory.
+        `ignore_sighup`: see the module-level start_ff.
         """
-        return start_ff(self.sockdir, port or self.port, *args, env=env, cwd=cwd)
+        return start_ff(
+            self.sockdir, port or self.port, *args, env=env, cwd=cwd,
+            ignore_sighup=ignore_sighup,
+        )
 
     def run_ff(self, *args, env=None, cwd=None, timeout=RUN_TIMEOUT, port=None,
                merge_streams=False):

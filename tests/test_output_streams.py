@@ -48,10 +48,21 @@ MASKED = "dbpass='********'"
 # How long an interrupted script is given to exit.
 PROMPT = 15.0
 
-BOTH_SIGNALS = pytest.mark.parametrize(
+# The SIGHUP cases need a script the signal can reach: see the same
+# parametrization in test_signals.py.
+EACH_SIGNAL = pytest.mark.parametrize(
     "signum, status",
-    [(signal.SIGINT, 130), (signal.SIGTERM, 143)],
-    ids=["SIGINT", "SIGTERM"],
+    [
+        pytest.param(signal.SIGINT, 130, id="SIGINT"),
+        pytest.param(signal.SIGTERM, 143, id="SIGTERM"),
+        pytest.param(
+            signal.SIGHUP, 129, id="SIGHUP",
+            marks=pytest.mark.skipif(
+                signal.getsignal(signal.SIGHUP) is signal.SIG_IGN,
+                reason="SIGHUP is ignored in this process, and so in the script it starts",
+            ),
+        ),
+    ],
 )
 
 
@@ -619,7 +630,7 @@ def test_log_file_is_complete_and_closed_when_the_run_cannot_start(
     assert_closed(open_files_probe, logfile)
 
 
-@BOTH_SIGNALS
+@EACH_SIGNAL
 def test_log_file_is_complete_and_closed_after_a_signal(
     db, start_ff, tmp_path, open_files_probe, signum, status
 ):
@@ -720,7 +731,7 @@ def test_failing_run_goes_on_and_exits_1_when_nobody_is_reading_stderr(
     assert_lines_in_order("\n".join(log_body(logfile)), whole_run_in_order(db))
 
 
-@BOTH_SIGNALS
+@EACH_SIGNAL
 def test_interrupted_run_keeps_its_exit_status_when_nobody_is_reading_stderr(
     db, start_ff, tmp_path, open_files_probe, signum, status
 ):

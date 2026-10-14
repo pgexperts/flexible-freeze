@@ -11,13 +11,53 @@
 # at its time limit, 1 when work was missed.  The cases where work is missed
 # are in test_run_outcome.py.
 
-from ffharness import FREEZE_ALL, assert_lines_in_order
+import contextlib
+
+import pytest
+from ffharness import FREEZE_ALL, assert_lines_in_order, wait_for
 
 T1 = ("public", "t1")
+
+# How long a script whose statement was ended from outside is given to exit.
+PROMPT = 15.0
 
 
 def output(result):
     return result.stdout + result.stderr
+
+
+@contextlib.contextmanager
+def database_listing_held_up(cluster):
+    """Keep the query that lists the databases from finishing.
+
+    The query waits for a lock on pg_statistic in the postgres database,
+    which planning it needs and opening a session does not
+    (test_signals.py has the longer account).  Every other new query in
+    that database waits there too, so the script is watched, and acted on,
+    from the session that holds the lock.
+
+    Yields a cursor of that session.
+    """
+    holder = cluster.connect(autocommit=False)
+    try:
+        with holder.cursor() as cur:
+            cur.execute("LOCK TABLE pg_catalog.pg_statistic IN ACCESS EXCLUSIVE MODE")
+            yield cur
+    finally:
+        holder.close()
+
+
+def backend_waiting_to_list(cur):
+    """The process id of the backend waiting for the lock that `cur`'s
+    session holds on pg_statistic, or None.  Nothing but the script is
+    running, so that backend is its own.  pg_locks, unlike pg_stat_activity,
+    is read afresh by each query of a transaction."""
+    cur.execute(
+        "SELECT pid FROM pg_locks WHERE NOT granted "
+        "AND relation = 'pg_catalog.pg_statistic'::regclass"
+    )
+    row = cur.fetchone()
+    return row[0] if row else None
 
 
 def test_unreachable_database_is_skipped_and_the_run_continues(db, run_ff):
@@ -29,9 +69,19 @@ def test_unreachable_database_is_skipped_and_the_run_continues(db, run_ff):
     result = run_ff(*FREEZE_ALL, "-d", f"ff_no_such_database,{db.name}")
 
     assert result.returncode == 1
-    assert "skipping database ff_no_such_database (couldn't connect: " in result.stderr
     assert "Traceback" not in result.stderr
     assert db.frozen_since(before) == {T1}
+    # The driver's message ends in a line break.  It is taken off, so that
+    # the report is one line and closes its own parenthesis.
+    skipped, *summary = result.stderr.splitlines()
+    assert skipped.startswith(
+        "skipping database ff_no_such_database (couldn't connect: "
+    )
+    assert skipped.endswith('database "ff_no_such_database" does not exist)')
+    assert summary == [
+        "Not all tables were vacuumed.",
+        "Databases skipped or left unfinished: ff_no_such_database",
+    ]
 
 
 def test_zero_minute_limit_halts_before_the_first_table(db, run_ff):
@@ -161,10 +211,63 @@ def test_failure_to_list_databases_is_fatal(cluster, run_ff):
     result = run_ff(*FREEZE_ALL, "-U", "ff_no_such_role")
 
     assert result.returncode == 1
-    assert (
-        "Could not list databases: connection to database postgres failed: "
-        in result.stderr
-    )
     assert result.stdout == ""
     assert "Traceback" not in result.stderr
     assert cluster.statements(since=mark) == []
+    # One line, and no blank one after it for the line break that the
+    # driver's message ends in.
+    (report,) = result.stderr.splitlines()
+    assert report.startswith(
+        "Could not list databases: connection to database postgres failed: "
+    )
+    assert report.endswith('role "ff_no_such_role" does not exist')
+
+
+@pytest.mark.parametrize(
+    "ended_by, reason",
+    [
+        ("pg_cancel_backend", "canceling statement due to user request"),
+        ("pg_terminate_backend", "terminating connection due to administrator command"),
+    ],
+    ids=["query cancelled", "connection lost"],
+)
+def test_failed_database_listing_query_is_fatal(
+    cluster, db, start_ff, tmp_path, ended_by, reason
+):
+    # The connection was made and the query for the list then fails.  That
+    # is the end of the run, like a connection that could not be made, and
+    # it is reported the same way: by the script, on stderr and in the log
+    # file, not by a traceback that only stderr gets.
+    #
+    # --lock-timeout 0, so that on a slow machine the wait cannot end by
+    # itself before the test has ended it.
+    db.create_table("t1")
+    before = db.frozenxids()
+    logfile = tmp_path / "ff.log"
+
+    with database_listing_held_up(cluster) as cur:
+        proc = start_ff(*FREEZE_ALL, "--lock-timeout", "0", "-l", str(logfile))
+        backend = wait_for(
+            lambda: backend_waiting_to_list(cur),
+            what="the script to wait in its database list",
+        )
+        cur.execute(f"SELECT {ended_by}(%s)", (backend,))
+        stdout, stderr = proc.communicate(timeout=PROMPT)
+
+    assert proc.returncode == 1
+    assert "Traceback" not in stderr
+    assert stdout == ""
+    report = stderr.splitlines()
+    # Beginning and end, because for a connection that is lost the driver
+    # puts the server's severity in front of the message.
+    assert report[0].startswith(
+        "Could not list databases: query in database postgres failed: "
+    )
+    assert report[0].endswith(reason)
+    # Whatever lines the driver adds after the server's message, the report
+    # does not end in a blank one.
+    assert report[-1].strip()
+    # The log file has the header of the run and then the same report.
+    assert logfile.read_text().endswith("\n" + stderr)
+    assert db.script_statements() == []
+    assert db.frozen_since(before) == set()
