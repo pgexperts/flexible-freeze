@@ -12,9 +12,9 @@ registration and the whole run execute at import. It cannot be imported.
 | Argument parsing | Options, defaults, the per-database exclusion map | module level, `parser`, `args`, `database_table_map` |
 | Output | Plain, verbose and debug printing; password masking | `_print`, `verbose_print`, `debug_print`, `args_for_display` |
 | Connection | The only place a connection is made; sets autocommit and an empty `search_path` | `dbconnect` |
-| Name matching | Compares a user-supplied table name with a selected table | `table_named_in` |
-| Database list | `-d`, else `pg_database` via the `postgres` database | module level, `dblist` |
-| Table selection | Two queries: freeze mode (by XID age) and `--no-freeze` mode (by dead-tuple fraction) | module level, `tabquery` |
+| Name matching | Compares a user-supplied table name with a table: in Python for the exclusions, in SQL for `--table` | `table_named_in`, `TABLE_LOOKUP_QUERY` |
+| Database list | `-d`, else every connectable non-template database in `pg_database`, read via the `postgres` database | module level, `dblist` |
+| Table selection | Three queries: freeze mode (by the greater of XID and MultiXact age), `--no-freeze` mode (by dead-tuple fraction), and the `--table` lookup, which replaces either | module level, `tabquery`, `FREEZE_AGE_SQL`, `TABLE_LOOKUP_QUERY` |
 | Vacuum loop | Exclusions, pause, time check, `statement_timeout`, VACUUM, server messages | module level, `for db in dblist` |
 | Run outcome | What was and was not done; the only input to the summary and the exit status | `RunOutcome`, `outcome`, the summary block at the end of the file |
 | Interruption | SIGINT and SIGTERM: the handler records the signal; the psycopg2 wait callback cancels the running statement and applies `connect_timeout`; the pause ends early; a second signal stops waiting for the server | `signal_handler`, `interrupt_signal`, `interrupt_repeated`, `wait_for_server`, `pause`, `exit_if_interrupted` |
@@ -35,9 +35,15 @@ registration and the whole run execute at import. It cannot be imported.
   is printed and is the VACUUM target, verbatim. Breaks: quoting or otherwise
   rewriting it produces a wrong or malformed target. `nspname` and `relname`
   are for matching only.
-- **All user-supplied table names are compared with `table_named_in`.**
-  Breaks: `-T`, `--exclude-table-in-database` and `--table` stop agreeing on
-  what a name means (ADR 0007).
+- **Exclusion names are compared with `table_named_in`; the `--table` name
+  is matched by `TABLE_LOOKUP_QUERY`, which spells out the same three
+  forms.** Breaks: change one without the other and `-T`,
+  `--exclude-table-in-database` and `--table` stop agreeing on what a name
+  means (ADR 0007).
+- **The `--table` value reaches the server as a query parameter.** It is the
+  only user-supplied text in any query. Breaks: formatted into the statement
+  it is SQL injection as the connecting role. Because that statement has
+  parameters, its literal percent signs are doubled.
 - **Connections are autocommit.** Breaks: VACUUM cannot run in a transaction
   block.
 - **`args.dbpass` is never printed; print `args_for_display()` instead.**
@@ -83,10 +89,18 @@ registration and the whole run execute at import. It cannot be imported.
 
 - With no `-H`/`-p` the script connects to the local default server and
   works through every database. Never run it by hand to "try something".
-- A failed table, a database that cannot be connected to or listed (ADR
-  0004), and a `--table` that matches nothing do not stop the run; each is
-  recorded and makes the exit status 1. A lost connection ends that database
-  only, and there is no reconnect.
+- A failed table and a database that cannot be connected to or listed (ADR
+  0004) do not stop the run; each is recorded and makes the exit status 1.
+  A lost connection ends that database only, and there is no reconnect.
+- A `--table` name that no table in a database has is recorded, and
+  printed for that database with `-v` only; it makes the exit status 1 only
+  when the name
+  was found in none of the databases examined (`table_found_nowhere`). A
+  table that exists and is excluded counts as found.
+- `--table` bypasses the selection: age, size and dead-row thresholds do not
+  apply, and neither does the selections' exclusion of the system schemas.
+  It finds ordinary tables and materialized views outside the temporary
+  schemas, and its matches still go through the exclusions.
 - Exit status: 0 complete or stopped at the time limit, 1 work missed (or
   the run could not start), 2 bad arguments, 130 stopped by SIGINT, 143
   stopped by SIGTERM (128 + the signal number; these outrank 0 and 1). A
@@ -130,9 +144,16 @@ registration and the whole run execute at import. It cannot be imported.
   `wait_for_server` does, to the attempt as a whole and not per host.
 - The wait callback is process-wide in psycopg2 and changes how every query
   and connection attempt waits, not only VACUUM.
-- The default database list excludes `postgres`, `template0` and `template1`
-  by name.
-- Freeze mode caps the table list at 1000; `--no-freeze` mode has no cap.
+- The default database list is every database with `datallowconn` and not
+  `datistemplate`, `postgres` included. The list is still read through a
+  connection to `postgres`.
+- Neither selection caps its list; the time window is the only bound.
+- `--freezeage` is compared with one number per table, `FREEZE_AGE_SQL`: the
+  greatest of the XID age and the MultiXact age of the table and of its
+  TOAST table. `--minsizemb` is compared with `pg_table_size`, in both
+  modes.
+- Both selections leave out `pg_catalog`, `information_schema` and the
+  temporary schemas, and neither selects partitioned tables.
 - Tests assert on the parsed VACUUM statement (`ffharness.parse_vacuum`), not
   on its literal text. Keep it that way when the statement's spelling
   changes.
@@ -144,8 +165,8 @@ registration and the whole run execute at import. It cannot be imported.
 
 Parse arguments → build the database list (`-d`, or `pg_database` ordered by
 `age(datfrozenxid)`) → for each database: `dbconnect` → set cost limits and
-`client_min_messages` → run the selection query → apply `--table`, then
-exclusions → for each table: pause if a vacuum came before → time check →
+`client_min_messages` → run the selection query, or with `--table` the
+lookup of that name → apply exclusions → for each table: pause if a vacuum came before → time check →
 set `statement_timeout` → VACUUM → record the result in `outcome` → close the
 connection → summary and exit status from `outcome`.
 
@@ -159,9 +180,10 @@ loops break at their next test of `interrupt_signal`, closing the connection
 - Add or change an option: the `parser.add_argument` block; mirror it in the
   usage block of `README.md`, which is a hand-maintained copy of `--help`.
 - Change which tables are selected: the two `tabquery` strings. Keep the
-  three leading columns.
+  three leading columns. What `--table` can find is `TABLE_LOOKUP_QUERY`.
 - Change the VACUUM statement: where `exquery` is built in the loop.
-- Change how names match: `table_named_in`, and `tests/test_table_names.py`.
+- Change how names match: `table_named_in` and the three forms in
+  `TABLE_LOOKUP_QUERY`, together, and `tests/test_table_names.py`.
 - Change connection behaviour: `dbconnect`, and
   `tests/test_connection_setup.py`.
 - Add a way for a run to fall short: a field on `RunOutcome`, its term in

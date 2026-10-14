@@ -818,7 +818,9 @@ class Cluster:
         )
 
     def user_databases(self):
-        """Names of the databases the script's default list would consider."""
+        """Names of the databases tests have made: all but postgres and the
+        two built-in templates.  (The script's default list also takes in
+        postgres, and goes by datallowconn and datistemplate.)"""
         rows = self.execute(
             "postgres",
             "SELECT datname FROM pg_database WHERE datname NOT IN "

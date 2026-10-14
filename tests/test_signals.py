@@ -51,7 +51,7 @@ BOTH_SIGNALS = pytest.mark.parametrize(
 
 # Blocks VACUUM (which takes the same lock) but not the table-listing query.
 BLOCKS_VACUUM = "SHARE UPDATE EXCLUSIVE"
-# Blocks everything, the listing query's pg_relation_size() included.
+# Blocks everything, the listing query's pg_table_size() included.
 BLOCKS_LISTING = "ACCESS EXCLUSIVE"
 
 

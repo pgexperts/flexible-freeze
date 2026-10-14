@@ -54,7 +54,7 @@ parser.add_argument("-m", "--minutes", dest="run_min",
                     help="Number of minutes to run before halting.  Defaults to 2 hours")
 parser.add_argument("-s", "--minsizemb", dest="minsizemb",
                     type=non_negative_int, default=0,
-                    help="Minimum table size to vacuum/freeze (in MB).  Default is 0.")
+                    help="Minimum table size to vacuum/freeze (in MB).  The size is the table's data including its TOAST table, without its indexes.  Default is 0.")
 parser.add_argument("-d", "--databases", dest="dblist",
                     help="Comma-separated list of databases to vacuum, if not all of them")
 parser.add_argument("-T", "--exclude-table", action="append", dest="tables_to_exclude",
@@ -75,7 +75,7 @@ parser.add_argument("--pause", dest="pause_time", type=non_negative_int, default
                     help="seconds to pause between vacuums.  Default is 10.")
 parser.add_argument("--freezeage", dest="freezeage",
                     type=non_negative_int, default=10000000,
-                    help="freeze tables older than this many XIDs; a table whose age is exactly this is not selected.  Default 10m XIDs.  Ignored with --no-freeze")
+                    help="freeze tables older than this many XIDs.  A table's age is the greatest of its transaction ID age and its MultiXact ID age, and those of its TOAST table; a table whose age is exactly this is not selected.  Default 10m XIDs.  Ignored with --no-freeze")
 parser.add_argument("--costdelay", dest="costdelay", 
                     type=non_negative_int, default = 20,
                     help="vacuum_cost_delay setting in ms.  Default 20")
@@ -104,7 +104,7 @@ parser.add_argument("-w", "--password", dest="dbpass",
 # --table is listed first so that it is the spelling shown in the usage line;
 # -st is kept because existing invocations use it.
 parser.add_argument("--table", "-st", dest="table",
-                  help="only process tables with this name: a bare name matches in every schema, SCHEMA.TABLE only that table.  -st is an older spelling of this option")
+                  help="only process tables with this name: a bare name matches in every schema, SCHEMA.TABLE only that table.  The table is vacuumed whatever its age, size or dead rows: --freezeage, --minsizemb and the --no-freeze thresholds do not apply to it; exclusions still do.  -st is an older spelling of this option")
 
 args = parser.parse_args()
 
@@ -301,11 +301,70 @@ def pause(seconds):
 #   - the regclass text, exactly as the script prints it; or
 #   - the bare table name, which matches that table in every schema; or
 #   - schema.table, written plain, without any SQL quoting.
-# Used for --table, --exclude-table and --exclude-table-in-database alike.
+# Used for --exclude-table and --exclude-table-in-database.  --table goes by
+# the same three forms, but in SQL: see TABLE_LOOKUP_QUERY.
 def table_named_in(names, tabrow):
     regclass_text, nspname, relname = tabrow
     forms = (regclass_text, relname, "%s.%s" % (nspname, relname))
     return any(name in forms for name in names)
+
+# The age a freezing run goes by: the greatest of the transaction ID age and
+# the MultiXact ID age, of the table and of its TOAST table.  Each of the four
+# is a wraparound horizon in its own right.  The server forces a vacuum on
+# whichever comes due first (autovacuum_freeze_max_age for one counter,
+# autovacuum_multixact_freeze_max_age for the other), and a TOAST table has
+# its own relfrozenxid and relminmxid, which can be older than its parent's.
+# Going by transaction ID age alone leaves a table that is quiet on that
+# counter and far gone on the other unselected until the server steps in.
+# greatest() ignores NULLs, which is what a table without a TOAST table
+# supplies for the last two.
+#
+# Written for the aliases the queries below use: pg_class is the table, toast
+# its TOAST table.
+FREEZE_AGE_SQL = """greatest(age(pg_class.relfrozenxid), mxid_age(pg_class.relminmxid),
+                    age(toast.relfrozenxid), mxid_age(toast.relminmxid))"""
+
+# --table: the table is looked up by name instead of being picked out of the
+# mode's selection.  Naming a table is a request to vacuum that table; the
+# age, size and dead-row thresholds are there to choose tables when nobody
+# has, and applied to a named table they turned "below a threshold" into
+# "not found".  The result goes through the exclusions like any other list.
+#
+# pg_class and not to_regclass(): to_regclass resolves a bare name through
+# search_path, which is empty in every session here (see dbconnect), so it
+# returns NULL for the very form most command lines use.  It also returns
+# one relation, where a bare name means that table in every schema.
+#
+# The three alternatives are the three forms table_named_in() accepts and
+# have to stay in step with it: this is the one place a user-supplied name
+# is matched in SQL.  Everything is compared as text because the name type
+# cuts a longer value down to 63 bytes, and would match on what was left.
+#
+# What can be found is what either mode can vacuum: ordinary tables and
+# materialized views.  The temporary schemas are left out because they hold
+# other sessions' tables (this one creates none), which the server passes
+# over without saying so.  The system schemas are not left out, unlike in
+# the two selections: a catalog named outright is vacuumed like any table.
+#
+# The name travels as a query parameter and never as text pasted into the
+# statement.  psycopg2 %-formats a statement that has parameters, hence the
+# doubled percent signs in the LIKE patterns.
+#
+# Oldest first, as in a freezing run, so that a name present in many schemas
+# is worked through in order of need inside the time window.
+TABLE_LOOKUP_QUERY = """SELECT pg_class.oid::regclass AS full_table_name,
+                nspname, pg_class.relname
+            FROM pg_class JOIN pg_namespace ON pg_class.relnamespace = pg_namespace.oid
+                LEFT OUTER JOIN pg_class as toast
+                    ON pg_class.reltoastrelid = toast.oid
+            WHERE pg_class.relkind IN ('r', 'm')
+                AND nspname NOT LIKE 'pg_temp%%'
+                AND nspname NOT LIKE 'pg_toast_temp%%'
+                AND %(name)s::text IN (pg_class.relname::text,
+                    nspname::text || '.' || pg_class.relname::text,
+                    pg_class.oid::regclass::text)
+            ORDER BY {freeze_age} DESC, nspname, pg_class.relname;""".format(
+                freeze_age=FREEZE_AGE_SQL)
 
 # What a run did and did not get done.  The loops below only record here;
 # the closing summary and the exit status are worked out from this record,
@@ -331,8 +390,13 @@ class RunOutcome(object):
         # Databases not worked through: could not connect, could not list
         # the tables, or lost the connection part-way.
         self.skipped_databases = []
-        # Databases in which --table matched nothing.
+        # --table: the databases in which no table has that name, and
+        # whether one has it anywhere.  A miss in one database is expected
+        # when the name is given for a list of databases (by default every
+        # database), so it is only a name found in none of them that counts
+        # as missed work.  A table that exists but is excluded was found.
         self.table_missing_in = []
+        self.table_found = False
         # The run stopped at the time limit.  With --enforce-time that can
         # be in the middle of a vacuum, which is then the cancelled table.
         self.time_limited = False
@@ -351,7 +415,12 @@ class RunOutcome(object):
     # the designed way for a nightly run to end, and exits 0.
     def work_was_missed(self):
         return bool(self.failed_tables or self.unvacuumed_tables
-                    or self.skipped_databases or self.table_missing_in)
+                    or self.skipped_databases or self.table_found_nowhere())
+
+    # False when no database was examined at all; those are in
+    # skipped_databases, and nothing is known about the table.
+    def table_found_nowhere(self):
+        return bool(self.table_missing_in) and not self.table_found
 
 def tables_for_display(tables):
     return ', '.join("{t} in database {d}".format(t=t, d=d) for t, d in tables)
@@ -425,7 +494,13 @@ if args.logfile:
     verbose_print('arguments: %s' % str(args_for_display()))
 
 # do we have a database list?
-# if not, connect to "postgres" database and get a list of non-system databases
+# if not, connect to "postgres" database and get a list of every database
+# that can be vacuumed.  That includes postgres itself: its datfrozenxid
+# holds back the cluster's oldest transaction ID like any other database's.
+# The two catalog flags, rather than names, decide what is left out: a
+# database that refuses connections (template0, and any other marked so)
+# could only ever be reported as skipped, on every run, and a template is
+# by its flag not a database that holds the cluster's data.
 if args.dblist is None:
     conn = None
     try:
@@ -440,7 +515,7 @@ if args.dblist is None:
     cur = conn.cursor()
     try:
         cur.execute("""SELECT datname FROM pg_database
-            WHERE datname NOT IN ('postgres','template1','template0')
+            WHERE datallowconn AND NOT datistemplate
             ORDER BY age(datfrozenxid) DESC""")
     except Exception:
         # Only the cancellation an interrupt asked for is dealt with here;
@@ -503,15 +578,32 @@ for db in dblist:
     # The one cursor for everything done in this database.
     cur = conn.cursor()
 
+    # Parameters for tabquery.  None for the two selections, which are
+    # complete statements: psycopg2 leaves a statement without parameters
+    # alone, single percent signs included.
+    tabparams = None
+
+    # if only one table is desired, look it up; see TABLE_LOOKUP_QUERY
+    if args.table:
+        tabquery = TABLE_LOOKUP_QUERY
+        tabparams = {'name': args.table}
     # if vacuuming, get list of top tables to vacuum
-    if args.skip_freeze:
+    #
+    # pg_stat_user_tables lists the temporary tables of every session.  The
+    # server passes over another session's without a word, so one selected
+    # here would be counted as vacuumed and selected again on every run.
+    #
+    # table_bytes: see the note on pg_table_size at the freeze query.
+    elif args.skip_freeze:
         tabquery = """WITH deadrow_tables AS (
                 SELECT relid::regclass as full_table_name,
                     schemaname as nspname, relname,
                     n_dead_tup::numeric / NULLIF(n_dead_tup + n_live_tup, 0) as dead_pct,
-                    pg_relation_size(relid) as table_bytes
+                    pg_table_size(relid) as table_bytes
                 FROM pg_stat_user_tables
                 WHERE n_dead_tup > 100
+                AND schemaname NOT LIKE 'pg_temp%'
+                AND schemaname NOT LIKE 'pg_toast_temp%'
                 AND ( (now() - last_autovacuum) > INTERVAL '1 hour'
                     OR last_autovacuum IS NULL )
                 AND ( (now() - last_vacuum) > INTERVAL '1 hour'
@@ -523,26 +615,38 @@ for db in dblist:
             AND table_bytes >= {0} * 2 ^ 20
             ORDER BY dead_pct DESC, table_bytes DESC;""".format(args.minsizemb)
     else:
-    # if freezing, get list of top tables to freeze
-    # includes TOAST tables in case the toast table has older rows
+    # if freezing, get list of top tables to freeze, oldest first; what
+    # "oldest" means is at FREEZE_AGE_SQL.
+    #
+    # Materialized views ('m') are taken with the ordinary tables: they have
+    # a relfrozenxid and a relminmxid that age in the same way.
+    #
+    # table_bytes is pg_table_size, the table with its TOAST table and
+    # without its indexes.  The age above counts the TOAST table, so the
+    # size has to as well: measured on the heap alone, --minsizemb dropped
+    # a small table whose large TOAST table was the old part.
+    #
+    # There is no LIMIT.  The time window is what bounds a run; a cap on the
+    # list ended a run that still had time, with the tables past the cap
+    # never mentioned.
         tabquery = """WITH tabfreeze AS (
                 SELECT pg_class.oid::regclass AS full_table_name,
                 nspname, pg_class.relname,
-                greatest(age(pg_class.relfrozenxid), age(toast.relfrozenxid)) as freeze_age,
-                pg_relation_size(pg_class.oid) as table_bytes
+                {2} as freeze_age,
+                pg_table_size(pg_class.oid) as table_bytes
             FROM pg_class JOIN pg_namespace ON pg_class.relnamespace = pg_namespace.oid
                 LEFT OUTER JOIN pg_class as toast
                     ON pg_class.reltoastrelid = toast.oid
             WHERE nspname not in ('pg_catalog', 'information_schema')
                 AND nspname NOT LIKE 'pg_temp%'
-                AND pg_class.relkind = 'r'
+                AND pg_class.relkind IN ('r', 'm')
             )
             SELECT full_table_name, nspname, relname
             FROM tabfreeze
             WHERE freeze_age > {0}
             AND table_bytes >= {1} * 2 ^ 20
-            ORDER BY freeze_age DESC, table_bytes DESC
-            LIMIT 1000;""".format(args.freezeage, args.minsizemb)
+            ORDER BY freeze_age DESC, table_bytes DESC;""".format(
+                args.freezeage, args.minsizemb, FREEZE_AGE_SQL)
 
     # From here on the connection is closed on every way out of this
     # database: the skips below, the end of its table list, a stop at the
@@ -556,7 +660,7 @@ for db in dblist:
             # keep the server's warnings from this session.
             cur.execute("SET client_min_messages = warning")
 
-            cur.execute(tabquery)
+            cur.execute(tabquery, tabparams)
             verbose_print("getting list of tables")
 
             # rows of (regclass text, schema name, table name); see table_named_in()
@@ -569,14 +673,20 @@ for db in dblist:
             continue
         outcome.databases_listed += 1
 
-        #if only one table is desired
+        # --table: the list is that table, in every schema that has one of
+        # the name.  An empty list says only that this database has no such
+        # table; whether that matters is decided at the end of the run, when
+        # it is known whether any database had it.  So it is said with -v
+        # only: a name given for every database is expected to be missing
+        # from most of them, and a line for each, on every run, is noise in
+        # a scheduler's mail.  A name found nowhere is in the summary at any
+        # verbosity, with the databases that were looked in.
         if args.table:
-            # a bare name can match in more than one schema; all of them are kept
-            tablist = [tabrow for tabrow in tablist if table_named_in([args.table], tabrow)]
             if not tablist:
-                _print("specified single table {0} was not found (or excluded) in database {1}".format(args.table, db))
+                verbose_print("specified single table {0} does not exist in database {1}".format(args.table, db))
                 outcome.table_missing_in.append(db)
                 continue
+            outcome.table_found = True
 
         # Note which exclusion values apply to this list.  Done for the whole
         # list here rather than in the loop below: that loop stops at the
@@ -595,12 +705,22 @@ for db in dblist:
         for tabrow in tablist:
             # the regclass text: used for all output and as the VACUUM target
             table = tabrow[0]
+            # An exclusion outranks --table.  In a --table run it is said
+            # at every verbosity, and in words of its own: the table was
+            # asked for by name, and leaving it out quietly reads as a run
+            # that did what it was asked.
             if db in database_table_map and table_named_in(database_table_map[db], tabrow):
-                debug_print("skipping table {t} in database {d} per --exclude-table-in-database argument".format(t=table, d=db))
+                if args.table:
+                    _print("specified single table {t} is excluded in database {d} by --exclude-table-in-database; not vacuuming it".format(t=table, d=db))
+                else:
+                    debug_print("skipping table {t} in database {d} per --exclude-table-in-database argument".format(t=table, d=db))
                 continue
             elif args.tables_to_exclude and table_named_in(args.tables_to_exclude, tabrow):
-                verbose_print(
-                    "skipping table {t} per --exclude-table argument".format(t=table))
+                if args.table:
+                    _print("specified single table {t} is excluded in database {d} by --exclude-table; not vacuuming it".format(t=table, d=db))
+                else:
+                    verbose_print(
+                        "skipping table {t} per --exclude-table argument".format(t=table))
                 continue
             else:
                 verbose_print("processing table {t}".format(t=table))
@@ -752,8 +872,8 @@ if outcome.unvacuumed_tables:
     _print("Tables not counted as vacuumed: " + tables_for_display(outcome.unvacuumed_tables))
 if outcome.skipped_databases:
     _print("Databases skipped or left unfinished: " + ', '.join(outcome.skipped_databases))
-if outcome.table_missing_in:
-    _print("Databases where --table {t} matched no selected table: {d}".format(
+if outcome.table_found_nowhere():
+    _print("Databases where --table {t} matched no table: {d}".format(
         t=args.table, d=', '.join(outcome.table_missing_in)))
 
 if outcome.time_limited or outcome.interrupted_by is not None:

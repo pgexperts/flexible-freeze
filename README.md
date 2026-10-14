@@ -27,7 +27,8 @@ Requires psycopg2
       -m RUN_MIN, --minutes RUN_MIN
                             Number of minutes to run before halting. Defaults to 2 hours
       -s MINSIZEMB, --minsizemb MINSIZEMB
-                            Minimum table size to vacuum/freeze (in MB). Default is 0.
+                            Minimum table size to vacuum/freeze (in MB). The size is the table's data including its TOAST table,
+                            without its indexes. Default is 0.
       -d DBLIST, --databases DBLIST
                             Comma-separated list of databases to vacuum, if not all of them
       -T TABLES_TO_EXCLUDE, --exclude-table TABLES_TO_EXCLUDE
@@ -43,8 +44,9 @@ Requires psycopg2
       --vacuum              Same as --no-freeze (deprecated spelling; use --no-freeze instead)
       --pause PAUSE_TIME    seconds to pause between vacuums. Default is 10.
       --freezeage FREEZEAGE
-                            freeze tables older than this many XIDs; a table whose age is exactly this is not selected. Default 10m
-                            XIDs. Ignored with --no-freeze
+                            freeze tables older than this many XIDs. A table's age is the greatest of its transaction ID age and
+                            its MultiXact ID age, and those of its TOAST table; a table whose age is exactly this is not selected.
+                            Default 10m XIDs. Ignored with --no-freeze
       --costdelay COSTDELAY
                             vacuum_cost_delay setting in ms. Default 20
       --costlimit COSTLIMIT
@@ -65,7 +67,8 @@ Requires psycopg2
                             a .pgpass file or PGSERVICE
       --table TABLE, -st TABLE
                             only process tables with this name: a bare name matches in every schema, SCHEMA.TABLE only that table.
-                            -st is an older spelling of this option
+                            The table is vacuumed whatever its age, size or dead rows: --freezeage, --minsizemb and the --no-freeze
+                            thresholds do not apply to it; exclusions still do. -st is an older spelling of this option
 
 Notes:
 
@@ -76,9 +79,17 @@ The minutes time limit is normally only enforced at the start of vacuuming each 
 If you do not specify a `--enforce_time`, `flexible_freeze` will issue a `SET statement_timeout = 0` statement before each operation
 to avoid cancellation by a system- or role-wide `statement_timeout` value.
 
-Normally flexible_freeze.py does VACUUM FREEZE ANALYZE, starting with the tables with the oldest transaction IDs.  If you set `--no-freeze`, though, it will instead do VACUUM ANALYZE, starting with the tables with the most dead rows.  If you are doing both, do the FREEZE first.
+Normally flexible_freeze.py does VACUUM FREEZE ANALYZE, starting with the oldest tables.  If you set `--no-freeze`, though, it will instead do VACUUM ANALYZE, starting with the tables with the most dead rows.  If you are doing both, do the FREEZE first.
 
-`--freezeage` selects tables whose transaction ID age is older than the value given; a table whose age is exactly that value is not selected, so even `--freezeage 0` does not select a table whose age is 0, such as one frozen a moment ago.  It applies to freezing only and is ignored with `--no-freeze`.  In `--no-freeze` mode the tables are chosen by fixed thresholds that cannot be changed from the command line: more than 100 dead rows, more than 5% of the table's rows dead, and no vacuum, manual or by autovacuum, in the last hour.  `--vacuum` is a deprecated spelling of `--no-freeze`.
+When freezing, a table's age is the greatest of four numbers: its transaction ID age (`age(relfrozenxid)`), its MultiXact ID age (`mxid_age(relminmxid)`), and the same two for its TOAST table.  Each of them can force an anti-wraparound vacuum on its own.  Ordinary tables and materialized views are frozen, in every schema except `pg_catalog` and `information_schema`; there is no limit on how many tables a run selects, other than the time window.
+
+`--freezeage` selects tables whose age, as just defined, is older than the value given; a table whose age is exactly that value is not selected, so even `--freezeage 0` does not select a table whose age is 0, such as one frozen a moment ago.  The one value is compared with both the transaction ID age and the MultiXact ID age.  It applies to freezing only and is ignored with `--no-freeze`.  In `--no-freeze` mode the tables are chosen by fixed thresholds that cannot be changed from the command line: more than 100 dead rows, more than 5% of the table's rows dead, and no vacuum, manual or by autovacuum, in the last hour.  `--vacuum` is a deprecated spelling of `--no-freeze`.
+
+`--minsizemb` goes by `pg_table_size()`: the table's own data together with its TOAST table, free space map and visibility map, and without its indexes.  A table with a small main part and a large TOAST table is therefore as large as its TOAST table makes it.  This is the same in both modes.
+
+If no `-d` is given, `flexible_freeze` works on every database that accepts connections and is not a template (`datallowconn` and `NOT datistemplate` in `pg_database`), oldest `datfrozenxid` first.  That includes the `postgres` database.  It connects to `postgres` to read the list.
+
+Limitations: partitioned tables themselves are never selected, only their partitions.  Autovacuum does not analyze a partitioned table either, so the statistics kept for the parent as a whole go stale unless you run `ANALYZE` on it yourself.  Foreign tables are not selected, and neither are temporary tables, which only the session that owns them can vacuum.
 
 `--minutes`, `--minsizemb`, `--pause`, `--freezeage`, `--costdelay` and `--costlimit` take whole numbers and may not be negative.  Empty entries in the `-d` list are ignored, so a doubled or trailing comma is harmless, but a `-d` that names no database at all is an error.
 
@@ -86,7 +97,9 @@ You can specify `--no-analyze` to skip the ANALYZE step.
 
 Table names given to `-T`, `--exclude-table-in-database` and `--table` can be written three ways: a bare table name (`orders`), which matches a table of that name in every schema; `schema.table` (`sales.orders`), written plain without SQL quoting, which matches only that table; or the name exactly as `flexible_freeze` prints it (for example `public."Orders"`).  Names are case-sensitive.
 
-`flexible_freeze` runs every session with an empty `search_path`, as `vacuumdb` does, so table names in its output are always schema-qualified (`public.orders`).  On PostgreSQL 16 and earlier, this means the ANALYZE of a table with an expression index can fail if the index's function depends on `search_path`; give such functions an explicit `SET search_path`, or schema-qualify the names they use.
+`--table` does not go through the selection: the named table is vacuumed whatever its age, its size or its dead rows, in either mode, provided it is an ordinary table or a materialized view.  `-T` and `--exclude-table-in-database` still apply to it, and an excluded table is reported as excluded.  `--table` can also name a system catalog (`--table pg_catalog.pg_statistic`), which a run without `--table` never selects.  When the name is in none of the schemas of a database, `flexible_freeze` goes on to the next database, and with `-v` says that the table does not exist there.  That is an error (exit status 1) only if the table was found in none of the databases of the run; the summary then lists the databases that were looked in.
+
+`flexible_freeze` runs every session with an empty `search_path`, as `vacuumdb` does, so table names in its output are schema-qualified (`public.orders`).  The one exception is a table in `pg_catalog`, which can only come up when `--table` names it: PostgreSQL searches that schema whatever the `search_path`, so such a table is printed, and vacuumed, by its bare name (`pg_statistic`).  On PostgreSQL 16 and earlier, this means the ANALYZE of a table with an expression index can fail if the index's function depends on `search_path`; give such functions an explicit `SET search_path`, or schema-qualify the names they use.
 
 Connection settings other than host, port, user and password are taken from the standard libpq environment variables (`PGSSLMODE`, `PGSERVICE`, `PGCONNECT_TIMEOUT` and so on).  The `-H`, `-U`, `-p`, `-w` and `-d` values are passed to the server as given; they cannot carry additional connection options.  The connection timeout (`PGCONNECT_TIMEOUT`, or `connect_timeout` in a service file) limits each connection attempt as a whole: if `-H` lists several hosts, a host that does not answer uses up the timeout instead of being passed over for the next one.
 
@@ -100,7 +113,7 @@ Exit status:
 
     0   every selected table was vacuumed, or the run stopped at the time limit
     1   at least one table failed or was not vacuumed, a database was skipped
-        or left unfinished, or --table matched no table in a database; also
+        or left unfinished, or --table matched no table in any database; also
         when the run could not start (no databases, database list or logfile
         unavailable)
     2   invalid command-line arguments

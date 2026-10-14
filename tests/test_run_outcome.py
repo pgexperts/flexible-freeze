@@ -7,7 +7,7 @@
 #
 #   0  every selected table was vacuumed, or the run stopped at its time limit
 #   1  a table failed or was not vacuumed, a database was skipped or left
-#      unfinished, or --table matched nothing in a database
+#      unfinished, or --table matched nothing in any database
 #
 # Also here, because they decide the same summary: the pause between vacuums
 # and the report of exclusions that matched nothing.
@@ -19,7 +19,7 @@
 #   With no lock_timeout the VACUUM waits instead, which gives the test time
 #   to cancel or terminate the script's backend, or to move its clock.
 # * The table-listing query fails the same way behind an ACCESS EXCLUSIVE
-#   lock: it calls pg_relation_size() on every candidate.
+#   lock: it calls pg_table_size() on every candidate.
 # * Deadlines are reached through the script_clock fixture; the script's
 #   window cannot be shorter than a minute otherwise.
 
@@ -35,7 +35,7 @@ TIMESTAMPED = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[^:]*: .+")
 
 # Blocks VACUUM (which takes the same lock) but not the table-listing query.
 BLOCKS_VACUUM = "SHARE UPDATE EXCLUSIVE"
-# Blocks everything, the listing query's pg_relation_size() included.
+# Blocks everything, the listing query's pg_table_size() included.
 BLOCKS_LISTING = "ACCESS EXCLUSIVE"
 
 
@@ -349,27 +349,84 @@ def test_rejected_session_setting_skips_the_database(db, run_ff):
     ]
 
 
-def test_table_option_that_matches_nothing_fails_the_run(make_db, run_ff):
+def test_table_option_that_matches_in_no_database_fails_the_run(make_db, run_ff):
     one, two = make_db("one"), make_db("two")
-    one.create_table("items")
-    two.create_table("orders")
-    before_two = two.frozenxids()
+    for database in (one, two):
+        database.create_table("items")
 
     result = run_ff(
         *FREEZE_ALL, "-t", "--table", "orders", "-d", f"{one.name},{two.name}"
     )
 
     assert result.returncode == 1
-    assert two.frozen_since(before_two) == {("public", "orders")}
+    assert one.script_vacuums() == two.script_vacuums() == []
     lines = result.stdout.splitlines()
-    # Every line carries the timestamp, the not-found message included.
     for line in lines:
         assert TIMESTAMPED.fullmatch(line), line
     messages = [line.split(": ", 1)[1] for line in lines]
+    # Without -v the summary is all there is, and it names the databases;
+    # the line for each database is a -v message (test_table_names.py).
     assert messages == [
-        f"specified single table orders was not found (or excluded) in database {one.name}",
         "Not all tables were vacuumed.",
-        f"Databases where --table orders matched no selected table: {one.name}",
+        f"Databases where --table orders matched no table: {one.name}, {two.name}",
+    ]
+
+
+def test_table_option_missing_from_one_database_is_not_a_failure(make_db, run_ff):
+    # A name given for several databases need not be in each of them.  The
+    # miss is kept out of the summary and of the exit status, and without -v
+    # out of the output altogether: this is a complete, clean run.
+    one, two = make_db("one"), make_db("two")
+    one.create_table("items")
+    two.create_table("orders")
+    before_two = two.frozenxids()
+
+    result = run_ff(
+        *FREEZE_ALL, "--table", "orders", "-d", f"{one.name},{two.name}"
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == "All tables vacuumed.\n"
+    assert result.stderr == ""
+    assert two.frozen_since(before_two) == {("public", "orders")}
+
+
+def test_table_option_excluded_where_it_exists_is_not_a_failure(make_db, run_ff):
+    # The table was found, so the name is not a mistake; that an exclusion
+    # then kept it from being vacuumed is reported, and nothing more.
+    one, two = make_db("one"), make_db("two")
+    one.create_table("items")
+    two.create_table("orders")
+
+    result = run_ff(
+        *FREEZE_ALL, "--table", "orders", "-T", "orders",
+        "-d", f"{one.name},{two.name}",
+    )
+
+    assert result.returncode == 0
+    assert one.script_vacuums() == two.script_vacuums() == []
+    assert result.stdout.splitlines() == [
+        (f"specified single table public.orders is excluded in database {two.name} "
+         "by --exclude-table; not vacuuming it"),
+        "All tables vacuumed.",
+    ]
+
+
+def test_table_option_missing_and_a_skipped_database_reports_both(db, run_ff):
+    # The database that could not be reached might have held the table, but
+    # nothing is known about it; the name counts as found nowhere among the
+    # databases that were examined.
+    db.create_table("items")
+
+    result = run_ff(
+        *FREEZE_ALL, "--table", "orders", "-d", f"{db.name},{NO_SUCH_DB}"
+    )
+
+    assert result.returncode == 1
+    assert result.stdout.splitlines()[-3:] == [
+        "Not all tables were vacuumed.",
+        f"Databases skipped or left unfinished: {NO_SUCH_DB}",
+        f"Databases where --table orders matched no table: {db.name}",
     ]
 
 
