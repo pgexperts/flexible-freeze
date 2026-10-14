@@ -20,7 +20,7 @@ Requires psycopg2
     usage: flexible_freeze.py [-h] [-m RUN_MIN] [-s MINSIZEMB] [-d DBLIST] [-T TABLES_TO_EXCLUDE]
                               [--exclude-table-in-database EXCLUDE_TABLE_IN_DATABASE] [--no-freeze] [--no-analyze] [--vacuum]
                               [--pause PAUSE_TIME] [--freezeage FREEZEAGE] [--costdelay COSTDELAY] [--costlimit COSTLIMIT] [-t]
-                              [--enforce-time] [-l LOGFILE] [-v] [--debug] [-U DBUSER] [-H DBHOST] [-p DBPORT] [-w DBPASS] [-st TABLE]
+                              [--enforce-time] [-l LOGFILE] [-v] [--debug] [-U DBUSER] [-H DBHOST] [-p DBPORT] [-w DBPASS] [--table TABLE]
 
     optional arguments:
       -h, --help            show this help message and exit
@@ -36,12 +36,15 @@ Requires psycopg2
       --exclude-table-in-database EXCLUDE_TABLE_IN_DATABASE
                             Argument is of form 'DATABASENAME.TABLENAME' or 'DATABASENAME.SCHEMANAME.TABLENAME': exclude the named
                             table, but only when processing the named database. You can pass this option multiple times.
-      --no-freeze           Do VACUUM ANALYZE instead of VACUUM ANALYZE FREEZE
+      --no-freeze           Do VACUUM ANALYZE instead of VACUUM FREEZE ANALYZE. Tables are then chosen by fixed thresholds instead
+                            of by age: more than 100 dead rows, more than 5% of rows dead, and not vacuumed (manually or by
+                            autovacuum) in the last hour. --freezeage is ignored.
       --no-analyze          Do not do an ANALYZE as part of the VACUUM operation
-      --vacuum              Do VACUUM ANALYZE instead of VACUUM ANALYZE FREEZE (deprecated option; use --no-freeze instead)
+      --vacuum              Same as --no-freeze (deprecated spelling; use --no-freeze instead)
       --pause PAUSE_TIME    seconds to pause between vacuums. Default is 10.
       --freezeage FREEZEAGE
-                            minimum age for freezing. Default 10m XIDs
+                            freeze tables older than this many XIDs; a table whose age is exactly this is not selected. Default 10m
+                            XIDs. Ignored with --no-freeze
       --costdelay COSTDELAY
                             vacuum_cost_delay setting in ms. Default 20
       --costlimit COSTLIMIT
@@ -60,8 +63,9 @@ Requires psycopg2
       -w DBPASS, --password DBPASS
                             database password. Visible to other local users in the process list for the whole run; prefer PGPASSWORD,
                             a .pgpass file or PGSERVICE
-      -st TABLE, --table TABLE
-                            only process tables with this name: a bare name matches in every schema, SCHEMA.TABLE only that table
+      --table TABLE, -st TABLE
+                            only process tables with this name: a bare name matches in every schema, SCHEMA.TABLE only that table.
+                            -st is an older spelling of this option
 
 Notes:
 
@@ -71,6 +75,10 @@ If you do not specify a `--enforce_time`, `flexible_freeze` will issue a `SET st
 to avoid cancellation by a system- or role-wide `statement_timeout` value.
 
 Normally flexible_freeze.py does VACUUM FREEZE ANALYZE, starting with the tables with the oldest transaction IDs.  If you set `--no-freeze`, though, it will instead do VACUUM ANALYZE, starting with the tables with the most dead rows.  If you are doing both, do the FREEZE first.
+
+`--freezeage` selects tables whose transaction ID age is older than the value given; a table whose age is exactly that value is not selected, so even `--freezeage 0` does not select a table whose age is 0, such as one frozen a moment ago.  It applies to freezing only and is ignored with `--no-freeze`.  In `--no-freeze` mode the tables are chosen by fixed thresholds that cannot be changed from the command line: more than 100 dead rows, more than 5% of the table's rows dead, and no vacuum, manual or by autovacuum, in the last hour.  `--vacuum` is a deprecated spelling of `--no-freeze`.
+
+`--minutes`, `--minsizemb`, `--pause`, `--freezeage`, `--costdelay` and `--costlimit` take whole numbers and may not be negative.  Empty entries in the `-d` list are ignored, so a doubled or trailing comma is harmless, but a `-d` that names no database at all is an error.
 
 You can specify `--no-analyze` to skip the ANALYZE step. 
 
