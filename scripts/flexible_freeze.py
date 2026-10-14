@@ -524,16 +524,36 @@ FREEZE_AGE_SQL = """greatest(age(pg_class.relfrozenxid), mxid_age(pg_class.relmi
 # is matched in SQL.  Everything is compared as text because the name type
 # cuts a longer value down to 63 bytes, and would match on what was left.
 #
-# What can be found is what either mode can vacuum: ordinary tables and
-# materialized views.  The temporary schemas are left out because they hold
-# other sessions' tables (this one creates none), which the server passes
-# over without saying so.  The system schemas are not left out, unlike in
-# the two selections: a catalog named outright is vacuumed like any table.
+# What is vacuumed is what either mode can vacuum: ordinary tables ('r') and
+# materialized views ('m'), which is all TABLE_LOOKUP_QUERY returns.  When
+# it returns nothing, TABLE_KIND_QUERY looks for the same name among three
+# kinds this script does not vacuum and an operator would still call a
+# table, so that the run can say the relation is there and what it is:
+# partitioned tables ('p'), foreign tables ('f') and views ('v'); see
+# UNVACUUMABLE_KINDS.  A partitioned table is not expanded into its
+# partitions.  Every other kind of relation (index, sequence, TOAST table,
+# composite type, partitioned index) is reported as a name no table has,
+# exactly like a name that nothing has.
+#
+# The temporary schemas are left out of both queries because they hold
+# other sessions' relations (this one creates none); the server passes over
+# such a table without saying so.  The system schemas are not left out,
+# unlike in the two selections: a catalog named outright is vacuumed like
+# any table.
 #
 # The name travels as a query parameter and never as text pasted into the
 # statement.  psycopg2 %-formats a statement that has parameters, hence the
 # doubled percent signs in the LIKE patterns.
 #
+# TABLE_NAME_MATCH_SQL is the part the two queries share, so that a name
+# cannot mean one thing when a table is looked for and another when its
+# kind is.
+TABLE_NAME_MATCH_SQL = """nspname NOT LIKE 'pg_temp%%'
+                AND nspname NOT LIKE 'pg_toast_temp%%'
+                AND %(name)s::text IN (pg_class.relname::text,
+                    nspname::text || '.' || pg_class.relname::text,
+                    pg_class.oid::regclass::text)"""
+
 # Oldest first, as in a freezing run, so that a name present in many schemas
 # is worked through in order of need inside the time window.
 TABLE_LOOKUP_QUERY = """SELECT pg_class.oid::regclass AS full_table_name,
@@ -542,13 +562,31 @@ TABLE_LOOKUP_QUERY = """SELECT pg_class.oid::regclass AS full_table_name,
                 LEFT OUTER JOIN pg_class as toast
                     ON pg_class.reltoastrelid = toast.oid
             WHERE pg_class.relkind IN ('r', 'm')
-                AND nspname NOT LIKE 'pg_temp%%'
-                AND nspname NOT LIKE 'pg_toast_temp%%'
-                AND %(name)s::text IN (pg_class.relname::text,
-                    nspname::text || '.' || pg_class.relname::text,
-                    pg_class.oid::regclass::text)
+                AND {name_match}
             ORDER BY {freeze_age} DESC, nspname, pg_class.relname""".format(
-                freeze_age=FREEZE_AGE_SQL)
+                name_match=TABLE_NAME_MATCH_SQL, freeze_age=FREEZE_AGE_SQL)
+
+# The kinds of relation that --table names in its message when the lookup
+# above finds no table to vacuum, by pg_class.relkind, with the words used
+# for each.  TABLE_KIND_QUERY takes its list of kinds from here.
+UNVACUUMABLE_KINDS = {
+    'p': 'partitioned table',
+    'f': 'foreign table',
+    'v': 'view',
+}
+
+# Sent only when TABLE_LOOKUP_QUERY has returned nothing: a run whose name
+# matches a table issues the statements it always did.  Rows of (regclass
+# text, relkind), in a fixed order because each gets a line of output.
+# relkind is cast because its type, "char", is not text to every driver.
+TABLE_KIND_QUERY = """SELECT pg_class.oid::regclass AS full_table_name,
+                pg_class.relkind::text
+            FROM pg_class JOIN pg_namespace ON pg_class.relnamespace = pg_namespace.oid
+            WHERE pg_class.relkind IN ({kinds})
+                AND {name_match}
+            ORDER BY nspname, pg_class.relname""".format(
+                kinds=', '.join("'%s'" % kind for kind in UNVACUUMABLE_KINDS),
+                name_match=TABLE_NAME_MATCH_SQL)
 
 # One run per database at a time.  Two runs in the same database (a nightly
 # run still going when the next one starts, a second cron entry) select the
@@ -956,6 +994,17 @@ for db in dblist:
 
             # rows of (regclass text, schema name, table name); see table_named_in()
             tablist = cur.fetchall()
+
+            # --table found no table to vacuum.  Before that is put down
+            # as "no such table", see whether the name is there as a kind
+            # of relation this script does not vacuum; see TABLE_KIND_QUERY.
+            # Inside this try: a failure here is a failure to list this
+            # database's tables like any other.
+            unvacuumable = []
+            if args.table is not None and not tablist:
+                execute(cur, TABLE_KIND_QUERY, tabparams)
+                # rows of (regclass text, relkind)
+                unvacuumable = cur.fetchall()
         except Exception as err:
             if interrupt_signal is not None:
                 break
@@ -972,9 +1021,21 @@ for db in dblist:
         # from most of them, and a line for each, on every run, is noise in
         # a scheduler's mail.  A name found nowhere is in the summary at any
         # verbosity, with the databases that were looked in.
+        #
+        # A partitioned table, foreign table or view of that name changes
+        # what the line says and nothing else: the database still has no
+        # table of the name that can be vacuumed, and is recorded as such.
+        # Each such relation gets a line, under the name the script would
+        # print for a table.  The hint for a partitioned table is advice
+        # only; the parent is never expanded into its partitions here.
         if args.table is not None:
             if not tablist:
-                verbose_print("specified single table {0} does not exist in database {1}".format(args.table, db))
+                for relation, relkind in unvacuumable:
+                    verbose_print("specified single table {t} exists in database {d} but is a {k} and cannot be vacuumed by this script{hint}".format(
+                        t=relation, d=db, k=UNVACUUMABLE_KINDS[relkind],
+                        hint="; name its partitions with --table instead" if relkind == 'p' else ""))
+                if not unvacuumable:
+                    verbose_print("specified single table {0} does not exist in database {1}".format(args.table, db))
                 outcome.table_missing_in.append(db)
                 continue
             outcome.table_found = True

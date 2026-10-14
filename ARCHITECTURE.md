@@ -15,9 +15,9 @@ registration and the whole run execute at import. It cannot be imported.
 | Output | Progress, verbose and debug printing; failure reports, which go to stderr and to the log file; password masking | `_print`, `verbose_print`, `failure_print`, `debug_print`, `stamped`, `log_file`, `args_for_display` |
 | Connection | The only place a connection is made; sets autocommit and an empty `search_path` | `dbconnect` |
 | Statements (ADR 0017) | The only place a statement is sent; appends the `--comment` text, which `comment_text` has vetted at argument parsing | `execute`, `comment_text` |
-| Name matching | Compares a user-supplied table name with a table: in Python for the exclusions, in SQL for `--table` | `table_named_in`, `TABLE_LOOKUP_QUERY` |
+| Name matching | Compares a user-supplied table name with a table: in Python for the exclusions, in SQL for `--table` | `table_named_in`, `TABLE_NAME_MATCH_SQL` (in `TABLE_LOOKUP_QUERY` and `TABLE_KIND_QUERY`) |
 | Database list (ADR 0013) | `-d`, in the order given, else every connectable non-template database in `pg_database`, by the greater of XID and MultiXact age, read via the `postgres` database in a session with the run's `lock_timeout`; a failure to connect or to read the list is reported with `failure_print` and ends the run (exit 1) | module level, `dblist` |
-| Table selection (ADR 0012) | Three queries: freeze mode (by the greater of XID and MultiXact age), `--no-freeze` mode (by dead-tuple fraction), and the `--table` lookup, which replaces either | module level, `tabquery`, `FREEZE_AGE_SQL`, `TABLE_LOOKUP_QUERY` |
+| Table selection (ADR 0012) | Three queries: freeze mode (by the greater of XID and MultiXact age), `--no-freeze` mode (by dead-tuple fraction), and the `--table` lookup, which replaces either; when that lookup finds no table, a second one asks whether the name is a partitioned table, a foreign table or a view, for the message only | module level, `tabquery`, `FREEZE_AGE_SQL`, `TABLE_LOOKUP_QUERY`, `TABLE_KIND_QUERY`, `UNVACUUMABLE_KINDS` |
 | Vacuum loop | Exclusions, pause, time check, `statement_timeout`, VACUUM, server messages | module level, `for db in dblist` |
 | Lock handling (ADR 0014, 0015) | `SKIP_LOCKED` on every VACUUM; the session's `lock_timeout` (`--lock-timeout`); one advisory lock per database against overlapping runs (`--no-advisory-lock`) | `ADVISORY_LOCK_KEY`, the session settings and `vacuum_options` in the database loop |
 | Run outcome (ADR 0009) | What was and was not done; the only input to the summary and the exit status | `RunOutcome`, `outcome`, the summary block at the end of the file |
@@ -40,15 +40,23 @@ registration and the whole run execute at import. It cannot be imported.
   rewriting it produces a wrong or malformed target. `nspname` and `relname`
   are for matching only.
 - **Exclusion names are compared with `table_named_in`; the `--table` name
-  is matched by `TABLE_LOOKUP_QUERY`, which spells out the same three
-  forms.** Breaks: change one without the other and `-T`,
-  `--exclude-table-in-database` and `--table` stop agreeing on what a name
-  means (ADR 0007).
+  is matched by `TABLE_NAME_MATCH_SQL`, which spells out the same three
+  forms** and is the one copy of them in SQL: `TABLE_LOOKUP_QUERY` and
+  `TABLE_KIND_QUERY` both take it. Breaks: change one without the other and
+  `-T`, `--exclude-table-in-database` and `--table` stop agreeing on what a
+  name means (ADR 0007); give the two queries conditions of their own and a
+  name is one thing when a table is looked for and another when its kind is
+  reported.
+- **`TABLE_KIND_QUERY` is sent only when `TABLE_LOOKUP_QUERY` returned no
+  row, and its rows are never vacuumed.** Breaks: sent every time, a run
+  that finds its table issues a statement it did not before; fed into the
+  table list, a view or a foreign table gets a VACUUM the server declines
+  and a partitioned table one that vacuums every partition unasked.
 - **The `--table` value reaches the server as a query parameter.** Apart
   from the `--comment` text (next invariant) it is the
   only user-supplied text in any query. Breaks: formatted into the statement
-  it is SQL injection as the connecting role. Because that statement has
-  parameters, its literal percent signs are doubled.
+  it is SQL injection as the connecting role. Because those two statements
+  have parameters, their literal percent signs are doubled.
 - **Every statement is sent with `execute(cur, ...)`, never with a cursor's
   own `execute`, and is passed in without a closing semicolon.** `execute`
   appends the `--comment` text as ` /* text */`. The text cannot end the
@@ -176,6 +184,16 @@ registration and the whole run execute at import. It cannot be imported.
   when the name
   was found in none of the databases examined (`table_found_nowhere`). A
   table that exists and is excluded counts as found.
+- A `--table` name that is a partitioned table, a foreign table or a view
+  in a database, and no table there, is still a name no table has in that
+  database: same record (`table_missing_in`), same summary line, same exit
+  status. Only the `-v` line differs: one for each such relation, saying
+  that it exists, what it is and that this script cannot vacuum it, with a
+  hint to name the partitions for a partitioned table. Nothing is expanded:
+  the partitions are vacuumed only when they are named. Any other kind of
+  relation (index, sequence, TOAST table, composite type, partitioned
+  index) and anything in another session's temporary schema is said not to
+  exist, like a name nothing has.
 - `--table` bypasses the selection: age, size and dead-row thresholds do not
   apply, and neither does the selections' exclusion of the system schemas.
   It finds ordinary tables and materialized views outside the temporary
@@ -313,7 +331,9 @@ loops break at their next test of `interrupt_signal`, closing the connection
   `COLUMNS=130 python scripts/flexible_freeze.py --help` on Python 3.11 or
   3.12; 3.13 prints each option's value name once, so its output differs).
 - Change which tables are selected: the two `tabquery` strings. Keep the
-  three leading columns. What `--table` can find is `TABLE_LOOKUP_QUERY`.
+  three leading columns. What `--table` can find is `TABLE_LOOKUP_QUERY`;
+  which other kinds of relation it names in its message instead of "does
+  not exist" is `UNVACUUMABLE_KINDS`.
 - Change the order of the databases: the `ORDER BY` of the query that reads
   the list. `tests/test_selection.py` builds two databases that differ in
   both ages (`databases_behind_on_different_horizons`); databases made the
@@ -325,7 +345,7 @@ loops break at their next test of `interrupt_signal`, closing the connection
   elsewhere that need a VACUUM to be running hold it up with a pinned page
   (`vacuum_held_up`), since a lock no longer holds it.
 - Change how names match: `table_named_in` and the three forms in
-  `TABLE_LOOKUP_QUERY`, together, and `tests/test_table_names.py`.
+  `TABLE_NAME_MATCH_SQL`, together, and `tests/test_table_names.py`.
 - Change connection behaviour: `dbconnect`, and
   `tests/test_connection_setup.py`.
 - Add a statement (ADR 0017): send it with `execute(cur, statement, params)`, without

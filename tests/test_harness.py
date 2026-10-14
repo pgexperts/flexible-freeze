@@ -24,12 +24,21 @@ PORT = ffharness.TEST_PORT
 # Linux ceiling is 2**22), so no process has it.
 NO_SUCH_PID = 2**22 + 1
 
+# A database for runs that only have to get past the script's own parser.
+NO_SUCH_DB = "ff_no_such_database"
+
 
 @pytest.fixture
 def sockdir(tmp_path):
     """A directory carrying the harness marker, standing in for a cluster's."""
     (tmp_path / ffharness.MARKER).write_text("")
     return str(tmp_path)
+
+
+@pytest.fixture
+def offline(sockdir):
+    """A Cluster object on a marker directory; no server is started."""
+    return ffharness.Cluster("/nonexistent/bin", sockdir, PORT, "nobody")
 
 
 # -- the launcher's target ---------------------------------------------------
@@ -58,6 +67,32 @@ def test_command_refuses_a_host_that_is_not_a_harness_directory(sockdir, tmp_pat
     for host in (None, "", "localhost", "/tmp", str(unmarked), f"{sockdir},localhost"):
         with pytest.raises(UnsafeInvocation):
             ffharness.ff_command(host, port, [])
+
+
+# Kinds of port text a test may hand over: empty, one port, a list, not a
+# port at all, and the default server's number.
+PORT_TEXTS = ["", "6543", "6543,6544", "not-a-port", str(ffharness.FORBIDDEN_PORT)]
+
+
+@pytest.mark.parametrize("port", PORT_TEXTS)
+def test_host_is_checked_when_the_port_is_text(sockdir, tmp_path, port):
+    unmarked = tmp_path / "unmarked"
+    unmarked.mkdir()
+    hosts = (
+        None, "", "localhost", "127.0.0.1", "/", "/tmp", str(unmarked), unmarked,
+        f"{sockdir},localhost", f"localhost,{sockdir}", f"{sockdir},{sockdir}",
+        os.path.relpath(sockdir), f"{sockdir} host=elsewhere", f"{sockdir}\n",
+    )
+    for host in hosts:
+        with pytest.raises(UnsafeInvocation):
+            ffharness.ff_command(host, port, [])
+
+
+def test_host_given_as_a_path_object_reaches_the_script_as_text(sockdir):
+    argv = ffharness.ff_command(Path(sockdir), "6543,6544", [])
+
+    assert argv[-4:] == ["-H", sockdir, "-p", "6543,6544"]
+    assert type(argv[-3]) is str
 
 
 @pytest.mark.parametrize("port", [None, 0, -1, ffharness.FORBIDDEN_PORT])
@@ -147,6 +182,29 @@ def test_command_refuses_arguments_that_redirect_the_script(sockdir, args, port)
         ffharness.ff_command(sockdir, port, args)
 
 
+@pytest.mark.parametrize("port", [PORT, *PORT_TEXTS])
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["-H"], ["--host"], ["--hos", "x"], ["-tH", "x"], ["-vtvHx"], ["-p"],
+        ["--por=1"], ["-vp", "1"], ["-vtp"],
+        ["-c", "x hostaddr=192.0.2.1"], ["-l", "servicefile=/x"],
+        ["-T", "HOST = x"], ["-w", "x\nport=1"],
+    ],
+)
+def test_arguments_naming_a_target_are_refused_whatever_the_port(sockdir, args, port):
+    with pytest.raises(UnsafeInvocation):
+        ffharness.ff_command(sockdir, port, args)
+
+
+@pytest.mark.parametrize("port", [PORT, *PORT_TEXTS])
+def test_libpq_variables_are_refused_whatever_the_port(sockdir, port):
+    for name in ("PGHOST", "PGHOSTADDR", "PGPORT", "PGSERVICE", "PGSERVICEFILE",
+                 "PGDATABASE", "PGUSER", "PGSYSCONFDIR"):
+        with pytest.raises(UnsafeInvocation):
+            ffharness.run_ff(sockdir, port, "--help", env={name: "elsewhere"})
+
+
 def test_command_allows_the_other_options(sockdir):
     args = [
         "--pause", "3", "--print-timestamps", "-t", "-v", "-T", "people",
@@ -181,6 +239,108 @@ def test_child_environment_admits_only_the_connect_timeout(monkeypatch):
     for redirecting in ("PGHOST", "PGPORT", "PGSERVICE", "PGHOSTADDR"):
         with pytest.raises(UnsafeInvocation):
             ffharness.child_env({redirecting: "elsewhere"})
+
+
+# -- the cluster's own launchers ---------------------------------------------
+#
+# Cluster.run_ff / start_ff are what the fixtures hand to every test.  They
+# pass the cluster's own port to ff_command unless a test gives one, so that
+# port has to be a checked number, and a test's value has to arrive as it was
+# given.  None of this needs a server: the runs below end at --help, at the
+# script's parser, or at libpq's refusal to connect.
+
+
+@pytest.mark.parametrize(
+    "port",
+    [None, 0, -1, "", "not-a-port", "6543,6544", ffharness.FORBIDDEN_PORT,
+     str(ffharness.FORBIDDEN_PORT)],
+)
+def test_cluster_cannot_be_built_on_a_port_that_is_not_a_safe_number(sockdir, port):
+    with pytest.raises(UnsafeInvocation):
+        ffharness.Cluster("/nonexistent/bin", sockdir, port, "nobody")
+
+
+def test_cluster_port_is_a_checked_number_even_when_given_as_text(sockdir):
+    # The default path of run_ff/start_ff hands Cluster.port to ff_command.
+    # It must be an int there, or it would take the unchecked text branch.
+    cluster = ffharness.Cluster("/nonexistent/bin", sockdir, str(PORT), "nobody")
+
+    assert type(cluster.port) is int
+    assert cluster.port == PORT
+    assert cluster.sockdir == sockdir
+
+
+def test_cluster_launchers_use_the_number_path_by_default(offline, sockdir, monkeypatch):
+    seen = []
+    real = ffharness.ff_command
+
+    def spy(host, port, args):
+        seen.append((host, port))
+        return real(host, port, args)
+
+    monkeypatch.setattr(ffharness, "ff_command", spy)
+
+    result = offline.run_ff("--help")
+    proc = offline.start_ff("--help")
+    proc.communicate(timeout=60)
+
+    assert result.returncode == 0
+    assert proc.returncode == 0
+    assert seen == [(sockdir, PORT), (sockdir, PORT)]
+    assert all(type(port) is int for _, port in seen)
+    assert result.args[-4:] == ["-H", sockdir, "-p", str(PORT)]
+    assert proc.args[-4:] == ["-H", sockdir, "-p", str(PORT)]
+
+
+@pytest.mark.parametrize("port", [0, False, -1, ffharness.FORBIDDEN_PORT])
+def test_cluster_launchers_refuse_a_bad_port_number(offline, port):
+    # 0 and False were once replaced by the cluster's own port
+    # (`port or self.port`); they are now checked like any other number.
+    with pytest.raises(UnsafeInvocation):
+        offline.run_ff("--help", port=port)
+    with pytest.raises(UnsafeInvocation):
+        offline.start_ff("--help", port=port)
+
+
+@pytest.mark.parametrize("port", PORT_TEXTS)
+def test_cluster_launchers_hand_port_text_on_with_the_host_pinned(offline, sockdir, port):
+    result = offline.run_ff("--help", port=port)
+    proc = offline.start_ff("--help", port=port)
+    proc.communicate(timeout=60)
+
+    assert result.args[-4:] == ["-H", sockdir, "-p", port]
+    assert proc.args[-4:] == ["-H", sockdir, "-p", port]
+
+
+@pytest.mark.parametrize("port", ["-Helsewhere", "--host=elsewhere", "1 host=elsewhere"])
+def test_cluster_launchers_refuse_port_text_that_names_a_host(offline, port):
+    with pytest.raises(UnsafeInvocation):
+        offline.run_ff("--help", port=port)
+    with pytest.raises(UnsafeInvocation):
+        offline.start_ff("--help", port=port)
+
+
+def test_cluster_start_ff_does_not_replace_an_empty_port(offline):
+    # No server is needed: the script must stop at its own parser.  Had the
+    # empty string been replaced by the cluster's port, the run would have
+    # gone on to a failed connection (exit 1) instead.
+    proc = offline.start_ff("-d", NO_SUCH_DB, port="")
+    stdout, stderr = proc.communicate(timeout=60)
+
+    assert proc.returncode == 2
+    assert stdout == ""
+    assert "argument -p/--port: must name a port: ''" in stderr
+
+
+def test_cluster_run_with_port_text_stays_in_the_socket_directory(offline, sockdir):
+    # A port list for the one pinned host: the script accepts it, the dump
+    # shows the host untouched, and libpq refuses before any attempt.
+    result = offline.run_ff("--debug", "-d", NO_SUCH_DB, port="6543,6544")
+
+    assert result.returncode == 1
+    assert f"dbhost={sockdir!r}" in result.stderr
+    assert "dbport='6543,6544'" in result.stderr
+    assert "connection to server at" not in result.stderr
 
 
 # -- coverage of the script --------------------------------------------------
@@ -756,6 +916,49 @@ def test_run_ignores_libpq_variables_in_the_callers_environment(
 
     assert result.returncode == 0
     assert db.frozen_since(before) == {table}
+
+
+def test_fixture_run_with_port_text_ignores_the_callers_libpq_variables(
+    db, cluster, run_ff, monkeypatch
+):
+    # The same with the port given as text, which takes the launcher's other
+    # branch.  Only variables the harness's own connections override
+    # explicitly are set: the test process shares this environment with them.
+    monkeypatch.setenv("PGHOST", "/nonexistent/ff-elsewhere")
+    monkeypatch.setenv("PGPORT", "1")
+    monkeypatch.setenv("PGUSER", "ff_no_such_role")
+    table = db.create_table("t1")
+    before = db.frozenxids()
+
+    result = run_ff(*FREEZE_ALL, "-d", db.name, port=str(cluster.port))
+
+    assert result.returncode == 0
+    assert db.frozen_since(before) == {table}
+
+
+def test_start_ff_fixture_hands_port_text_to_the_script(db, cluster, start_ff):
+    port = f"0{cluster.port}"
+    table = db.create_table("t1")
+    before = db.frozenxids()
+
+    proc = start_ff(*FREEZE_ALL, "--debug", "-d", db.name, port=port)
+    _, stderr = proc.communicate(timeout=60)
+
+    assert proc.returncode == 0
+    assert f"dbport={port!r}" in stderr
+    assert db.frozen_since(before) == {table}
+
+
+def test_start_ff_fixture_does_not_replace_an_empty_port(cluster, start_ff):
+    mark = cluster.log_offset()
+
+    proc = start_ff(port="")
+    stdout, stderr = proc.communicate(timeout=60)
+
+    assert proc.returncode == 2
+    assert stdout == ""
+    assert "argument -p/--port: must name a port: ''" in stderr
+    assert cluster.statements(since=mark) == []
 
 
 def test_statement_log_separates_script_from_harness(db, run_ff):
