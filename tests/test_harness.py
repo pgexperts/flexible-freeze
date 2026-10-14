@@ -1,12 +1,13 @@
 # Tests of the harness itself: the guards that keep a script run, the cluster
 # teardown and the sweep for abandoned clusters confined to the throwaway
-# cluster, the coverage environment for script subprocesses, and the VACUUM
-# statement parser the other test files rely on.  Most of them build
-# commands without launching anything, so they run even where no PostgreSQL
-# binaries are installed.
+# cluster, the coverage environment for script subprocesses, the start with
+# SIGHUP ignored, and the VACUUM statement parser the other test files rely
+# on.  Most of them build commands without launching anything, so they run
+# even where no PostgreSQL binaries are installed.
 
 import os
 import re
+import signal
 import sys
 import tempfile
 import time
@@ -791,6 +792,48 @@ def test_statement_log_leaves_out_the_drivers_session_setup(db, run_ff):
     assert db.script_statements()[0] == (
         "SELECT pg_catalog.set_config('search_path', '', false)"
     )
+
+
+# start_ff(ignore_sighup=True) makes the test process ignore SIGHUP for as
+# long as it takes to start the script.  Under a pytest that was itself
+# started with the signal ignored (nohup pytest) there is nothing for it to
+# put back, and so nothing to observe.
+SIGHUP_NOT_IGNORED_HERE = pytest.mark.skipif(
+    signal.getsignal(signal.SIGHUP) is signal.SIG_IGN,
+    reason="SIGHUP is ignored in this process already",
+)
+
+
+@SIGHUP_NOT_IGNORED_HERE
+def test_start_with_sighup_ignored_puts_the_test_process_back(db, start_ff):
+    # While the cluster runs conftest has its own handler on SIGHUP; a start
+    # with the signal ignored must leave that as it found it.
+    before = signal.getsignal(signal.SIGHUP)
+    assert before is not signal.SIG_IGN
+
+    proc = start_ff(*FREEZE_ALL, "-d", db.name, ignore_sighup=True)
+
+    assert signal.getsignal(signal.SIGHUP) is before
+    assert proc.wait(timeout=ffharness.RUN_TIMEOUT) == 0
+
+
+@SIGHUP_NOT_IGNORED_HERE
+@pytest.mark.parametrize(
+    "args, env",
+    [(("-H", "localhost"), None), ((), {"PGHOST": "localhost"})],
+    ids=["host argument", "libpq variable"],
+)
+def test_start_with_sighup_ignored_still_refuses_another_target(start_ff, args, env):
+    # The launcher's guards run inside the window in which the test process
+    # ignores SIGHUP: a refusal there must still be raised, and must not
+    # leave the signal ignored.
+    before = signal.getsignal(signal.SIGHUP)
+    assert before is not signal.SIG_IGN
+
+    with pytest.raises(UnsafeInvocation):
+        start_ff(*args, env=env, ignore_sighup=True)
+
+    assert signal.getsignal(signal.SIGHUP) is before
 
 
 def test_only_the_scram_role_is_asked_for_a_password(cluster):

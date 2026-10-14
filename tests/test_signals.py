@@ -15,7 +15,8 @@
 # running.
 #
 # SIGHUP has one exception: a run that was started with the signal ignored,
-# which is what nohup does, leaves it ignored and is not stopped by it.
+# which is what nohup does, leaves it ignored and is not stopped by it.  And
+# a platform that has no SIGHUP must not keep the script from running.
 #
 # How a signal is made to arrive at a known point.  Each test waits for a
 # state it can observe before signalling, never for a length of time:
@@ -463,6 +464,27 @@ def test_run_started_with_sighup_ignored_still_stops_on_sigterm(db, start_ff):
     assert db.frozen_since(before) == set()
 
 
+def test_run_on_a_platform_without_sighup(db, run_ff, tmp_path):
+    # The other case in which SIGHUP is left alone.  The script is started
+    # through a sitecustomize module that takes SIGHUP out of the signal
+    # module, which is what the script finds on a platform that has no such
+    # signal.  (Found through PYTHONPATH, as in test_interpreter.py.)
+    (tmp_path / "sitecustomize.py").write_text("import signal\ndel signal.SIGHUP\n")
+    inherited = os.environ.get("PYTHONPATH")
+    path = [str(tmp_path)] + ([inherited] if inherited else [])
+    db.create_table("t1")
+    before = db.frozenxids()
+
+    result = run_ff(
+        *FREEZE_ALL, "-d", db.name, env={"PYTHONPATH": os.pathsep.join(path)}
+    )
+
+    assert result.stderr == ""
+    assert result.stdout == "All tables vacuumed.\n"
+    assert result.returncode == 0
+    assert db.frozen_since(before) == {("public", "t1")}
+
+
 # -- between two statements ---------------------------------------------------
 
 
@@ -653,7 +675,9 @@ def test_signal_during_the_database_listing_query_ends_the_run(
                 )
                 return cur.fetchall()
 
-            proc = start_ff(*FREEZE_ALL)
+            # The listing session has a lock timeout too; it must not end
+            # the wait (exit 1) before the signal does.
+            proc = start_ff(*FREEZE_ALL, *WAIT_FOR_LOCKS)
             wait_for(script_is_waiting, what="the script to wait in its database list")
             proc.send_signal(signal.SIGTERM)
             code, stdout, stderr = finish(proc)

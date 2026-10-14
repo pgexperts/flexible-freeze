@@ -1,8 +1,8 @@
 # Tests for which databases and tables a run covers: the default database
-# list, -d, -T, --exclude-table-in-database, --table and --minsizemb, and
-# what the two selection queries pick (issue #41): materialized views,
-# MultiXact age, no cap on the list, size including TOAST, and no temporary
-# tables of other sessions.
+# list and its order, -d, -T, --exclude-table-in-database, --table and
+# --minsizemb, and what the two selection queries pick (issue #41):
+# materialized views, MultiXact age, no cap on the list, size including
+# TOAST, and no temporary tables of other sessions.
 #
 # Most tests prove the selection from relfrozenxid, which moves for exactly
 # the tables that were frozen; where it cannot show the point (a table
@@ -29,8 +29,10 @@ def targets(vacuums):
 def databases_processed(result):
     """The database list a -v run announced, as a set.
 
-    A set because the default list is ordered by age(datfrozenxid), and
-    databases made from the same template are the same age.
+    A set because the default list is ordered by age (the greater of
+    age(datfrozenxid) and mxid_age(datminmxid)), and databases made from the
+    same template are the same age.  The tests of the order build databases
+    that differ in age (databases_behind_on_different_horizons).
     """
     announced = [
         match.group(1)
@@ -184,6 +186,138 @@ def test_default_database_list_goes_by_the_catalog_flags(
     finally:
         # A template cannot be dropped, and the fixture drops this database.
         cluster.execute("postgres", f"ALTER DATABASE {flagged.name} {restore}")
+
+
+# -- the order of the databases ---------------------------------------------------
+
+
+def databases_in_order_of_work(cluster, since, *databases):
+    """Those of `databases` the script sent statements to since the log
+    offset `since`, in the order in which it first did."""
+    names = [database.name for database in databases]
+    visited = []
+    for record in cluster.statements(since=since):
+        if record.dbname in names and record.dbname not in visited:
+            visited.append(record.dbname)
+    return visited
+
+
+def databases_behind_on_different_horizons(make_db):
+    """Two databases: one behind on MultiXact IDs and up to date on
+    transaction IDs, and one a little behind on transaction IDs and up to
+    date on MultiXact IDs.  Returns (the first, the second).
+
+    The first is the one closer to wraparound: its MultiXact age is greater
+    than either age of the second.  Ordered by transaction ID age alone the
+    second comes first.  Both facts are asserted here, so that a test built
+    on this cannot pass on a state that does not tell the two orders apart.
+
+    How the state is built.  A database's two horizons are the oldest of
+    its tables', and a freeze moves a table's as far as the transactions
+    still open allow, which is not the same for the two:
+
+    * a transaction that holds a row lock keeps relminmxid, in every
+      database, from passing the MultiXact counter as it stood when the
+      lock was taken.  With one open in a third database and MultiXact IDs
+      consumed after it, a freeze of the first database leaves its MultiXact
+      age at the number consumed;
+    * a transaction that has a transaction ID keeps relfrozenxid from
+      passing that ID, but only in its own database and in the shared
+      catalogs.  One in the second database, taken before the first is
+      frozen, makes the second the older of the two by transaction ID,
+      though it is frozen later (with the row lock gone, so that its
+      MultiXact age comes down).
+
+    The shared catalogs have a pg_class row, with horizons of its own, in
+    each database, and both transactions held those back in the first.  They
+    are frozen there again at the end, when nothing is open.
+    """
+    multixact_old, xid_old = make_db("multixact_old"), make_db("xid_old")
+    elsewhere = make_db("elsewhere")
+    consumed = 40
+
+    elsewhere.execute("CREATE TABLE ff_held AS SELECT 1 AS id")
+    row_lock = elsewhere.connect(autocommit=False)
+    xid_pin = xid_old.connect(autocommit=False)
+    try:
+        with row_lock.cursor() as cur:
+            cur.execute("SELECT id FROM ff_held FOR SHARE")
+        consume_multixacts(elsewhere, consumed)
+        with xid_pin.cursor() as cur:
+            cur.execute("SELECT pg_current_xact_id()")
+        # A transaction ID that is later than the pinned one and is no
+        # longer in use: the freeze that follows can go no further than the
+        # last one completed.
+        elsewhere.execute("SELECT pg_current_xact_id()")
+        multixact_old.execute("VACUUM (FREEZE)")
+        # Ended, not merely closed: a backend takes a moment to go away
+        # after its client has, and the next freeze must not find it.
+        row_lock.rollback()
+        xid_old.execute("VACUUM (FREEZE)")
+        xid_pin.rollback()
+    finally:
+        row_lock.close()
+        xid_pin.close()
+    shared = multixact_old.execute(
+        "SELECT oid::regclass::text FROM pg_class WHERE relisshared AND relkind = 'r'"
+    )
+    multixact_old.execute("VACUUM (FREEZE) " + ", ".join(name for (name,) in shared))
+
+    ages = {
+        name: (xid_age, multixact_age)
+        for name, xid_age, multixact_age in elsewhere.execute(
+            "SELECT datname, age(datfrozenxid), mxid_age(datminmxid) FROM pg_database"
+        )
+    }
+    behind_on_multixacts, behind_on_xids = ages[multixact_old.name], ages[xid_old.name]
+    # By transaction ID age alone the second database is the older one...
+    assert behind_on_xids[0] > behind_on_multixacts[0], ages
+    # ... and it is the first database's MultiXact age that is the greatest
+    # of the four, by a margin that the few transaction IDs a run of the
+    # script might use cannot close.
+    assert behind_on_multixacts[1] >= consumed, ages
+    assert max(behind_on_xids) < consumed // 2, ages
+    return multixact_old, xid_old
+
+
+def test_default_database_order_goes_by_the_greater_of_the_two_ages(
+    cluster, make_db, run_ff
+):
+    # Issue #66: ordered by age(datfrozenxid) alone, the database that is
+    # closest to wraparound through its MultiXact IDs was worked on after
+    # one with less to worry about, and in a run with a time limit might
+    # not be reached.
+    multixact_old, xid_old = databases_behind_on_different_horizons(make_db)
+    mark = cluster.log_offset()
+
+    result = run_ff(*FREEZE_ALL, "-v")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert databases_processed(result) >= {multixact_old.name, xid_old.name}
+    assert databases_in_order_of_work(cluster, mark, multixact_old, xid_old) == [
+        multixact_old.name, xid_old.name,
+    ]
+
+
+def test_databases_option_is_worked_through_in_the_order_given(
+    cluster, make_db, run_ff
+):
+    # With -d the order is the operator's, whatever the ages say: neither
+    # order of two databases that differ in both ages is rearranged.
+    multixact_old, xid_old = databases_behind_on_different_horizons(make_db)
+
+    for first, second in ((xid_old, multixact_old), (multixact_old, xid_old)):
+        mark = cluster.log_offset()
+
+        result = run_ff(*FREEZE_ALL, "-d", f"{first.name},{second.name}")
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert databases_in_order_of_work(cluster, mark, multixact_old, xid_old) == [
+            first.name, second.name,
+        ]
+
+
+# -- which tables are left out ----------------------------------------------------
 
 
 def test_exclude_table_by_bare_name(db, run_ff):

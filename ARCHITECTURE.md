@@ -16,7 +16,7 @@ registration and the whole run execute at import. It cannot be imported.
 | Connection | The only place a connection is made; sets autocommit and an empty `search_path` | `dbconnect` |
 | Statements (ADR 0017) | The only place a statement is sent; appends the `--comment` text, which `comment_text` has vetted at argument parsing | `execute`, `comment_text` |
 | Name matching | Compares a user-supplied table name with a table: in Python for the exclusions, in SQL for `--table` | `table_named_in`, `TABLE_LOOKUP_QUERY` |
-| Database list (ADR 0013) | `-d`, else every connectable non-template database in `pg_database`, read via the `postgres` database in a session with the run's `lock_timeout`; a failure to connect or to read the list is reported with `failure_print` and ends the run (exit 1) | module level, `dblist` |
+| Database list (ADR 0013) | `-d`, in the order given, else every connectable non-template database in `pg_database`, by the greater of XID and MultiXact age, read via the `postgres` database in a session with the run's `lock_timeout`; a failure to connect or to read the list is reported with `failure_print` and ends the run (exit 1) | module level, `dblist` |
 | Table selection (ADR 0012) | Three queries: freeze mode (by the greater of XID and MultiXact age), `--no-freeze` mode (by dead-tuple fraction), and the `--table` lookup, which replaces either | module level, `tabquery`, `FREEZE_AGE_SQL`, `TABLE_LOOKUP_QUERY` |
 | Vacuum loop | Exclusions, pause, time check, `statement_timeout`, VACUUM, server messages | module level, `for db in dblist` |
 | Lock handling (ADR 0014, 0015) | `SKIP_LOCKED` on every VACUUM; the session's `lock_timeout` (`--lock-timeout`); one advisory lock per database against overlapping runs (`--no-advisory-lock`) | `ADVISORY_LOCK_KEY`, the session settings and `vacuum_options` in the database loop |
@@ -269,6 +269,12 @@ registration and the whole run execute at import. It cannot be imported.
 - The default database list is every database with `datallowconn` and not
   `datistemplate`, `postgres` included. The list is still read through a
   connection to `postgres`.
+- The default list is ordered by
+  `greatest(age(datfrozenxid), mxid_age(datminmxid))`, oldest first, the
+  same measure of age as a table's (`FREEZE_AGE_SQL`). A `-d` list never
+  goes through that query and keeps the order it was written in.
+  Databases of equal age (copies of one template, until something in them
+  is frozen) come in whatever order the server returns.
 - Neither selection caps its list; the time window is the only bound (ADR
   0012, which superseded 0003).
 - `--freezeage` is compared with one number per table, `FREEZE_AGE_SQL`: the
@@ -286,8 +292,8 @@ registration and the whole run execute at import. It cannot be imported.
 
 ## Flow
 
-Parse arguments → build the database list (`-d`, or `pg_database` ordered by
-`age(datfrozenxid)`, read after `SET lock_timeout`; a failure there exits 1) → for each database: `dbconnect` → set cost limits,
+Parse arguments → build the database list (`-d` as written, or `pg_database` ordered by
+the greater of `age(datfrozenxid)` and `mxid_age(datminmxid)`, read after `SET lock_timeout`; a failure there exits 1) → for each database: `dbconnect` → set cost limits,
 `client_min_messages` and `lock_timeout` → take the advisory lock, or skip
 the database if another run holds it → run the selection query, or with
 `--table` the lookup of that name → apply exclusions → for each table: pause
@@ -308,6 +314,10 @@ loops break at their next test of `interrupt_signal`, closing the connection
   3.12; 3.13 prints each option's value name once, so its output differs).
 - Change which tables are selected: the two `tabquery` strings. Keep the
   three leading columns. What `--table` can find is `TABLE_LOOKUP_QUERY`.
+- Change the order of the databases: the `ORDER BY` of the query that reads
+  the list. `tests/test_selection.py` builds two databases that differ in
+  both ages (`databases_behind_on_different_horizons`); databases made the
+  usual way are the same age and show nothing about the order.
 - Change the VACUUM statement: where `vacuum_options` and `exquery` are
   built in the loop. `SKIP_LOCKED` stays; see the invariant.
 - Change what a run does about locks: the session settings at the top of
