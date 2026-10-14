@@ -1,0 +1,24 @@
+# coverage.py configuration for measuring scripts/flexible_freeze.py.
+#
+# The script is never imported by the tests; it runs as a subprocess of the
+# harness.  With COVERAGE_PROCESS_START pointing at this file, coverage.py
+# (7.13 or later) starts itself in each of those subprocesses; the harness
+# only keeps the paths valid for them (tests/ffharness.py, coverage_env):
+#
+#   COVERAGE_PROCESS_START=$PWD/.coveragerc python -m pytest
+#   python -m coverage combine
+#   python -m coverage report
+#
+# The figure is informational.  CI prints it and never fails on it.
+
+[run]
+# One data file per script run (.coverage.<host>.<pid>.<random>), merged by
+# `coverage combine`; without this each run would overwrite the last.
+parallel = true
+# Only the script is of interest, not the harness or the driver.  The leading
+# wildcard keeps the pattern independent of the working directory, which the
+# launcher lets a test choose for the script.
+include = */scripts/flexible_freeze.py
+
+[report]
+show_missing = true

@@ -2,7 +2,7 @@
 # logfile.  Both places print the parsed argument namespace; the password is
 # replaced there by a fixed placeholder, and left as None when none was given.
 
-from ffharness import FREEZE_ALL
+from ffharness import FREEZE_ALL, SCRAM_ROLE
 
 # Distinctive enough that a substring search cannot hit anything else.
 SECRET = "s3cr3t-Zq7XvK-pw"
@@ -86,14 +86,27 @@ def test_without_a_password_the_logfile_line_shows_none(db, run_ff, tmp_path):
     assert "********" not in arguments[0]
 
 
-def test_guard_run_with_a_password_still_connects_and_vacuums(db, run_ff):
-    # Guard, expected to pass both before and after the change: masking the
-    # printed copy must not alter what reaches the connection.  The cluster
-    # uses trust auth, so the password is not itself checked.
+def test_guard_run_with_a_password_still_connects_and_vacuums(
+    cluster, db, make_role, run_ff, tmp_path
+):
+    # Masking the printed copy must not alter what reaches the connection.
+    # The run is made as SCRAM_ROLE, the one role the server asks for a
+    # password, with both places that print the masked copy active (--debug,
+    # and -l with -v): had the placeholder, or anything but SECRET, been
+    # sent, authentication would fail and nothing would be frozen.
+    role = make_role(name=SCRAM_ROLE, superuser=True, password=SECRET)
     db.create_table("t1")
     before = db.frozenxids()
+    logfile = tmp_path / "flexible_freeze.log"
 
-    result = run_ff(*FREEZE_ALL, "-w", SECRET, "-d", db.name)
+    result = run_ff(
+        *FREEZE_ALL, "-U", role, "-w", SECRET,
+        "--debug", "-v", "-l", str(logfile), "-d", db.name,
+    )
 
     assert result.returncode == 0, result.stdout + result.stderr
+    assert MASKED in result.stderr
+    assert MASKED in logfile.read_text()
+    assert SECRET not in result.stdout + result.stderr + logfile.read_text()
     assert db.frozen_since(before) == {("public", "t1")}
+    assert {record.user for record in cluster.statements(dbname=db.name)} == {role}

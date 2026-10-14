@@ -11,9 +11,13 @@
 # connection string, would parse as extra connection keywords.  The name is
 # created through the fixtures (never passed as a script argument), so the
 # harness's argument guards are not involved and need no weakening.
+#
+# Passwords are the exception to trust authentication in the test cluster:
+# the role ffharness.SCRAM_ROLE must present one, so a run as that role shows
+# whether the -w value arrived intact.
 
 import pytest
-from ffharness import FREEZE_ALL
+from ffharness import FREEZE_ALL, SCRAM_ROLE
 
 TARGET = ("public", "t_target")
 
@@ -100,18 +104,72 @@ def test_backslash_in_a_database_name_is_kept(make_db, run_ff):
     assert twin.frozen_since(twin_before) == set()
 
 
-def test_password_with_a_space_does_not_break_the_connection(db, run_ff):
-    # The cluster uses trust auth, so the password is not checked; the point
-    # is that the connection is still made.  In a connection string a space
-    # makes the value unparseable.
+@pytest.mark.parametrize(
+    "password",
+    [
+        # In libpq's key=value syntax an unquoted value ends at a space, a
+        # single quote at its start opens a quoted value, and a backslash
+        # escapes the character after it (at the end of the value, the
+        # separator before the next keyword).  Quotes elsewhere in a value
+        # are ordinary characters there; they are here for the shell-like
+        # forms a password is most often mangled in.  Passed as a parameter,
+        # every one of these must arrive as written.
+        pytest.param("pass word", id="space"),
+        pytest.param("'quoted", id="leading-single-quote"),
+        pytest.param("it's", id="single-quote"),
+        pytest.param('say "when"', id="double-quote"),
+        pytest.param("back\\slash", id="backslash"),
+        pytest.param("end\\", id="trailing-backslash"),
+        pytest.param(" a 'b' \\'c\\\\ \"d\" ", id="all-of-them"),
+    ],
+)
+def test_password_reaches_the_server_unaltered(
+    cluster, db, make_role, run_ff, password
+):
+    # SCRAM_ROLE is the one role the server asks for a password, so the run
+    # can only connect if the value given with -w is, byte for byte, the
+    # password the role was created with.
+    role = make_role(name=SCRAM_ROLE, superuser=True, password=password)
     db.create_table("t_target")
     before = db.frozenxids()
 
-    result = run_ff(*FREEZE_ALL, "-w", "pass word", "-d", db.name)
+    result = run_ff(*FREEZE_ALL, "-U", role, "-w", password, "-d", db.name)
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert db.frozen_since(before) == {TARGET}
     assert targets(db.script_vacuums()) == [TARGET]
+    assert {record.user for record in cluster.statements(dbname=db.name)} == {role}
+
+
+@pytest.mark.parametrize(
+    "password, given",
+    [
+        pytest.param("right-one", "wrong-one", id="different"),
+        # Near misses of the passwords above.  The server has to tell these
+        # apart from the real one for the test above to mean anything.
+        pytest.param("pass word", "pass", id="cut-at-the-space"),
+        pytest.param("back\\slash", "backslash", id="backslash-dropped"),
+        pytest.param("right-one", "********", id="the-masked-form"),
+    ],
+)
+def test_wrong_password_is_rejected(cluster, db, make_role, run_ff, password, given):
+    # No -d: the first connection is the one that lists the databases, and
+    # its failure ends the run.  (A -d run would report the database as
+    # skipped instead; what follows a skipped last database is issue #40.)
+    role = make_role(name=SCRAM_ROLE, superuser=True, password=password)
+    db.create_table("t_target")
+    before = db.frozenxids()
+    mark = cluster.log_offset()
+
+    result = run_ff(*FREEZE_ALL, "-U", role, "-w", given)
+
+    assert result.returncode == 1
+    output = result.stdout + result.stderr
+    assert "Could not list databases: connection to database postgres failed: " in output
+    assert "password authentication failed" in output
+    assert "Traceback" not in result.stderr
+    assert db.frozen_since(before) == set()
+    assert cluster.statements(since=mark) == []
 
 
 # -- empty search_path keeps name resolution in pg_catalog -------------------
@@ -129,6 +187,10 @@ def test_set_config_runs_on_every_connection(cluster, db, run_ff):
 
     assert result.returncode == 0, result.stdout + result.stderr
 
+    # Both lists hold the script's statements only.  What the driver sends
+    # for itself when a session starts is filtered out of the log by content
+    # (ffharness._DRIVER_SETUP), so index 0 is the script's first statement
+    # however the server is configured.
     postgres_statements = [
         record.sql for record in cluster.statements(dbname="postgres", since=mark)
     ]

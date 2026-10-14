@@ -231,6 +231,81 @@ def test_exclude_table_in_database_accepts_a_qualified_public_table(make_db, run
     assert two.frozen_since(before_two) == {("public", "t"), T_KEEP}
 
 
+def test_exclude_table_in_database_still_matches_the_printed_name(make_db, run_ff):
+    # The table part may be the regclass text the script prints, quotes and
+    # all.  Only the first dot of the argument separates the database, so
+    # the dot inside the printed name stays part of the table.
+    one, two = make_db("one"), make_db("two")
+    tables = [("Sales", "Order Items"), ("Sales", "kept")]
+    for database in (one, two):
+        build(database, *tables)
+    before_one, before_two = one.frozenxids(), two.frozenxids()
+
+    result = run_ff(
+        *FREEZE_ALL, "--debug",
+        "--exclude-table-in-database", f'{one.name}."Sales"."Order Items"',
+        "-d", f"{one.name},{two.name}",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (
+        f'skipping table "Sales"."Order Items" in database {one.name} '
+        "per --exclude-table-in-database argument"
+    ) in result.stderr
+    assert one.frozen_since(before_one) == {("Sales", "kept")}
+    assert two.frozen_since(before_two) == set(tables)
+
+
+def test_exclude_table_in_database_given_twice_for_one_database(make_db, run_ff):
+    # Each occurrence adds to the database's list rather than replacing it;
+    # one is qualified and one bare, to show the forms can be mixed.
+    one, two = make_db("one"), make_db("two")
+    tables = [("sales", "orders"), ("archive", "items"), T_KEEP]
+    for database in (one, two):
+        build(database, *tables)
+    before_one, before_two = one.frozenxids(), two.frozenxids()
+
+    result = run_ff(
+        *FREEZE_ALL,
+        "--exclude-table-in-database", f"{one.name}.sales.orders",
+        "--exclude-table-in-database", f"{one.name}.items",
+        "-d", f"{one.name},{two.name}",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert one.frozen_since(before_one) == {T_KEEP}
+    assert targets(one.script_vacuums()) == [T_KEEP]
+    assert two.frozen_since(before_two) == set(tables)
+
+
+def test_no_freeze_honours_exclude_table_in_database(make_db, run_ff):
+    # The exclusion is applied to the --no-freeze table list (from the
+    # statistics views) exactly as to the freeze list.
+    one, two = make_db("one"), make_db("two")
+    for database in (one, two):
+        database.create_schema("Sales")
+        for name in ("OrderItems", "skipped"):
+            database.create_table(name, schema="Sales", rows=1000)
+            database.make_dead_tuples(name, schema="Sales")
+
+    result = run_ff(
+        "--no-freeze",
+        "--exclude-table-in-database", f"{one.name}.Sales.skipped",
+        "-d", f"{one.name},{two.name}",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    vacuums = one.script_vacuums()
+    assert targets(vacuums) == [("Sales", "OrderItems")]
+    assert vacuums[0].options == {"ANALYZE"}
+    assert set(targets(two.script_vacuums())) == {
+        ("Sales", "OrderItems"), ("Sales", "skipped"),
+    }
+    one.wait_for_vacuum_count("OrderItems", 1, schema="Sales")
+    assert not one.is_analyzed("skipped", schema="Sales")
+    assert two.is_analyzed("skipped", schema="Sales")
+
+
 # -- --table ------------------------------------------------------------------
 
 
@@ -313,3 +388,72 @@ def test_table_option_reports_a_name_that_matches_nothing(make_db, run_ff):
     assert one.frozen_since(before_one) == set()
     assert one.script_vacuums() == []
     assert two.frozen_since(before_two) == {("sales", "orders")}
+
+
+def test_table_option_still_matches_the_printed_name(db, run_ff):
+    # As for -T: the regclass text the script prints, with its SQL quoting,
+    # is accepted as the table's name.
+    build(db, ("Sales", "Order Items"), ("Sales", "kept"))
+    before = db.frozenxids()
+
+    result = run_ff(
+        *FREEZE_ALL, "-v", "--table", '"Sales"."Order Items"', "-d", db.name
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'processing table "Sales"."Order Items"' in result.stdout.splitlines()
+    assert db.frozen_since(before) == {("Sales", "Order Items")}
+    assert targets(db.script_vacuums()) == [("Sales", "Order Items")]
+
+
+def test_no_freeze_table_option_selects_among_the_tables_with_dead_rows(db, run_ff):
+    # --table narrows whichever list the mode produced; here that is the
+    # --no-freeze list, and both tables are on it.
+    db.create_schema("Sales")
+    for name in ("OrderItems", "other"):
+        db.create_table(name, schema="Sales", rows=1000)
+        db.make_dead_tuples(name, schema="Sales")
+
+    result = run_ff("--no-freeze", "--table", "OrderItems", "-d", db.name)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    vacuums = db.script_vacuums()
+    assert targets(vacuums) == [("Sales", "OrderItems")]
+    assert vacuums[0].options == {"ANALYZE"}
+    db.wait_for_vacuum_count("OrderItems", 1, schema="Sales")
+    assert db.is_analyzed("OrderItems", schema="Sales")
+    assert not db.is_analyzed("other", schema="Sales")
+
+
+@pytest.mark.parametrize(
+    "selection",
+    [
+        # The default --freezeage is ten million; the table is a few
+        # transactions old.
+        pytest.param((), id="below-freezeage"),
+        pytest.param((*FREEZE_ALL, "--minsizemb", "1"), id="below-minsizemb"),
+        pytest.param(("--no-freeze",), id="no-dead-rows"),
+    ],
+)
+def test_table_option_reports_an_existing_table_the_selection_left_out(
+    db, run_ff, selection
+):
+    # Characterization of what the script does today, not of what it should
+    # do.  --table is looked up in the list the selection query returned, so
+    # a table that exists but did not pass the mode's filters gets the same
+    # message as a name that matches nothing, although it is neither missing
+    # nor excluded.  Issue #38 item 3 changes this (resolve the name directly
+    # and vacuum the table whatever the filters say); this test is expected
+    # to be rewritten with that fix.
+    build(db, ("public", "t_small"))
+    before = db.frozenxids()
+
+    result = run_ff(*selection, "--table", "t_small", "-d", db.name)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (
+        f"specified single table t_small was not found (or excluded) "
+        f"in database {db.name}"
+    ) in result.stdout.splitlines()
+    assert db.frozen_since(before) == set()
+    assert db.script_vacuums() == []

@@ -14,6 +14,7 @@ import re
 from ffharness import FREEZE_ALL, assert_lines_in_order
 
 T1 = ("public", "t1")
+SET_SEARCH_PATH = "SELECT pg_catalog.set_config('search_path', '', false)"
 TIMESTAMPED = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[^:]*: .+")
 
 
@@ -142,9 +143,13 @@ def test_session_settings_precede_the_work(db, run_ff):
     result = run_ff(*FREEZE_ALL, "-d", db.name)
 
     assert result.returncode == 0
+    # script_statements() holds the script's own statements only: anything
+    # the driver sends for itself at session start is filtered out by
+    # content, so the positions below do not depend on the server's settings
+    # (test_statement_log_leaves_out_the_drivers_session_setup).
     statements = db.script_statements()
     # The empty search_path is set first, before any other statement.
-    assert statements[0] == "SELECT pg_catalog.set_config('search_path', '', false)"
+    assert statements[0] == SET_SEARCH_PATH
     assert statements[1:3] == [
         "SET vacuum_cost_delay = 20",
         "SET vacuum_cost_limit = 2000",
@@ -155,6 +160,25 @@ def test_session_settings_precede_the_work(db, run_ff):
     assert statements[-1] == db.script_vacuums()[0].sql
 
 
+def test_session_settings_precede_the_work_on_a_non_iso_datestyle(db, run_ff):
+    # The same order, in a database where psycopg2 opens every session with
+    # a SET datestyle of its own.  That statement is not the script's and
+    # must not be taken for its first.
+    db.create_table("t1")
+    db.execute(f'ALTER DATABASE "{db.name}" SET datestyle = \'German, DMY\'')
+
+    result = run_ff(*FREEZE_ALL, "-d", db.name)
+
+    assert result.returncode == 0
+    statements = db.script_statements()
+    assert statements[:3] == [
+        SET_SEARCH_PATH,
+        "SET vacuum_cost_delay = 20",
+        "SET vacuum_cost_limit = 2000",
+    ]
+    assert statements[-2:] == ["SET statement_timeout = 0", db.script_vacuums()[0].sql]
+
+
 def test_cost_options_are_applied(db, run_ff):
     db.create_table("t1")
 
@@ -163,8 +187,9 @@ def test_cost_options_are_applied(db, run_ff):
     )
 
     assert result.returncode == 0
+    # The script's statements only; see test_session_settings_precede_the_work.
     statements = db.script_statements()
-    assert statements[0] == "SELECT pg_catalog.set_config('search_path', '', false)"
+    assert statements[0] == SET_SEARCH_PATH
     assert statements[1:3] == [
         "SET vacuum_cost_delay = 3",
         "SET vacuum_cost_limit = 700",
@@ -179,6 +204,7 @@ def test_enforce_time_sets_statement_timeout_to_window_plus_grace(db, run_ff):
     result = run_ff(*FREEZE_ALL, "--enforce-time", "-m", "10", "-d", db.name)
 
     assert result.returncode == 0
+    # The script's statements only; see test_session_settings_precede_the_work.
     statements = db.script_statements()
     assert statements[-1] == db.script_vacuums()[0].sql
     match = re.fullmatch(r"SET statement_timeout = '(\d+)s'", statements[-2])
