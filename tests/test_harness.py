@@ -564,6 +564,9 @@ def test_test_files_do_not_bypass_the_harness():
         # Not the same entry as TRUNCATE false, nor as TRUNCATE true.
         ("VACUUM (TRUNCATE) t1", {"TRUNCATE"}, ("public", "t1")),
         ("VACUUM (TRUNCATE true) t1", {"TRUNCATE true"}, ("public", "t1")),
+        # Empty entries are passed over, which the server would not do.
+        ("VACUUM (FREEZE,, ANALYZE,) t1", {"FREEZE", "ANALYZE"}, ("public", "t1")),
+        ("VACUUM () t1", set(), ("public", "t1")),
     ],
 )
 def test_parse_vacuum(statement, options, target):

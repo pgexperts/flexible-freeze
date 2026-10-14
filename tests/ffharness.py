@@ -210,9 +210,10 @@ def parse_vacuum(statement):
     more than this: one table, with its options either as keywords before
     the name (FULL, FREEZE, VERBOSE, ANALYZE) or as a parenthesised list in
     which each entry is an option name, alone or followed by one unquoted
-    word as its value (`TRUNCATE false`, `PARALLEL 2`).  Anything else is
-    an error: a quoted value, a value of several words, a column list, a
-    second table.
+    word as its value (`TRUNCATE false`, `PARALLEL 2`).  An empty entry, or
+    an empty list, is passed over, although the server refuses both.
+    Anything else is an error: a quoted value, a value of several words, a
+    column list, a second table.
 
     An entry with a value is reported as "NAME value", the value in lower
     case as the server reads a boolean word.  The meaning of a value is not
