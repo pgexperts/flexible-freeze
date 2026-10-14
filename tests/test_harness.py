@@ -574,6 +574,9 @@ def test_test_files_do_not_bypass_the_harness():
             ("public", "t1"),
         ),
         ('VACUUM "a/*b" /**/', set(), ("public", "a/*b")),
+        # Spaces and tabs, and nothing else, may come before the comment.
+        ("VACUUM (FREEZE) t1 \t /* a\tb */", {"FREEZE"}, ("public", "t1")),
+        ("VACUUM (FREEZE) t1/* c */", {"FREEZE"}, ("public", "t1")),
     ],
 )
 def test_parse_vacuum(statement, options, target):
@@ -611,6 +614,38 @@ def test_parse_vacuum_rejects_what_it_does_not_understand():
 def test_parse_vacuum_rejects_a_comment_outside_its_scope(statement):
     with pytest.raises(HarnessError):
         parse_vacuum(statement)
+
+
+# Every character str.splitlines() ends a line at.  A regular expression's
+# "." leaves out the first only, and its \s takes in all of them.
+LINE_BREAKS = "\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"
+
+
+@pytest.mark.parametrize("line_break", list(LINE_BREAKS), ids=ascii)
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "VACUUM (FREEZE) t1{0}/* c */",
+        "VACUUM (FREEZE) t1 {0} /* c */",
+        "VACUUM (FREEZE) t1 /*{0}*/",
+        "VACUUM (FREEZE) t1 /* c{0} */",
+        "VACUUM t1 /* c {0}d */",
+    ],
+    ids=["before", "before-among-spaces", "alone-inside", "inside", "inside-keyword-form"],
+)
+def test_parse_vacuum_rejects_a_comment_not_on_the_tables_line(statement, line_break):
+    assert len(f"a{line_break}b".splitlines()) == 2
+
+    with pytest.raises(HarnessError):
+        parse_vacuum(statement.format(line_break))
+
+
+def test_line_breaks_are_all_that_splitlines_knows():
+    # The list above, and the one the parser has, are written out by hand.
+    assert ffharness._LINE_BREAKS.encode().decode("unicode_escape") == LINE_BREAKS
+    for code in range(0x3000):
+        character = chr(code)
+        assert (len(f"a{character}b".splitlines()) == 2) == (character in LINE_BREAKS)
 
 
 @pytest.mark.parametrize(

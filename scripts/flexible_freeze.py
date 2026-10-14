@@ -237,11 +237,17 @@ def failure_print(some_message):
 # statement it cannot reach is not the script's: psycopg2 opens a session
 # with a SET datestyle of its own on a server whose DateStyle is not ISO.
 #
-# The comment goes at the very end, with a space on either side of the text,
-# so that a text beginning or ending with "/" or "*" cannot join up with a
-# delimiter.  A statement is passed in without a closing semicolon: after one
-# the comment would follow the statement instead of being part of it, and
-# the server's per-statement text (pg_stat_statements) would not have it.
+# The comment goes at the very end.  The space between the text and the
+# closing delimiter is needed: without it a text ending in "/" would run into
+# the delimiter as "/*/", and that "/*" opens a comment inside the comment,
+# with nothing left to close either of them.  That is the only case: a "/"
+# or "*" at the start of the text, or a "*" at its end, changes nothing
+# about where the comment begins and ends, and the space after the opening
+# delimiter is there only to match the other.
+#
+# A statement is passed in without a closing semicolon: after one the
+# comment would follow the statement instead of being part of it, and the
+# server's per-statement text (pg_stat_statements) would not have it.
 #
 # psycopg2 %-formats a statement if and only if it is given parameters, None
 # being the one value that counts as not given.  So a percent sign in the
