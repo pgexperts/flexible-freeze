@@ -758,6 +758,88 @@ def test_freezeage_applies_to_the_system_catalogs(db, run_ff):
     assert targets(db.script_vacuums()) == [table]
 
 
+def table_sizes(database, where):
+    """Map (schema, table) -> pg_table_size, the size --minsizemb is
+    compared with, for the tables and materialized views `where` admits."""
+    rows = database.execute(
+        "SELECT n.nspname, c.relname, pg_table_size(c.oid) "
+        "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+        f"WHERE c.relkind IN ('r', 'm') AND {where}"
+    )
+    return {(schema, table): size for schema, table, size in rows}
+
+
+def test_minsizemb_applies_to_the_system_catalogs(db, run_ff):
+    big = db.create_table("t_big", rows=12000, pad=100)
+    db.create_table("t_small")
+    # No catalog of a fresh database reaches 1 MB, so pg_description is
+    # made to, through its TOAST table, with one long comment that does not
+    # compress.
+    db.execute(
+        "DO $$ BEGIN EXECUTE format('COMMENT ON TABLE public.t_small IS %L', "
+        "(SELECT string_agg(md5(g::text), '') FROM generate_series(1, 80000) g)); "
+        "END $$"
+    )
+    catalogs = system_frozenxids(db)
+    sizes = table_sizes(db, "n.nspname IN ('pg_catalog', 'information_schema')")
+    large = {key for key, size in sizes.items() if size >= 2**20}
+    # Some catalogs, not all: the threshold has to divide them.
+    assert ("pg_catalog", "pg_description") in large
+    assert len(large) < len(sizes)
+
+    result = run_ff(
+        *FREEZE_ALL, "--minsizemb", "1", "--system-catalogs", "-d", db.name
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    vacuumed = tables_named(db.script_vacuums(), catalogs)
+    assert sorted(vacuumed) == sorted({big, *large})
+
+
+def test_system_catalogs_are_ordered_with_the_tables_by_age_then_size(db, run_ff):
+    # A spread of ages among the catalogs: three are frozen a little apart,
+    # five transaction IDs each, so that they come out youngest of all, and
+    # in the reverse of the order they were frozen in.
+    table = db.create_table("t")
+    catalogs = system_frozenxids(db)
+    refrozen = [("pg_catalog", name) for name in ("pg_am", "pg_proc", "pg_type")]
+    session = db.connect()
+    try:
+        with session.cursor() as cur:
+            for _, name in refrozen:
+                cur.execute(f"VACUUM (FREEZE) pg_catalog.{name}")
+                # One transaction ID each: the session is in autocommit.
+                for _ in range(5):
+                    cur.execute("SELECT pg_current_xact_id()")
+    finally:
+        session.close()
+    ages = freeze_ages(db, "true")
+    sizes = table_sizes(db, "true")
+
+    result = run_ff(*FREEZE_ALL, "--system-catalogs", "-d", db.name)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    vacuumed = tables_named(db.script_vacuums(), catalogs)
+    keys = [(ages[key], sizes[key]) for key in vacuumed]
+    assert keys == sorted(keys, reverse=True)
+    # The table, made before the three were frozen, comes just before them.
+    assert vacuumed[-4:] == [table, *refrozen]
+
+
+def test_time_limit_applies_with_the_system_catalogs_option(db, run_ff):
+    db.create_table("t")
+    catalogs = system_frozenxids(db)
+
+    result = run_ff(
+        *FREEZE_ALL, "-v", "-m", "0", "--system-catalogs", "-d", db.name
+    )
+
+    assert result.returncode == 0
+    assert "Reached time limit.  Exiting." in result.stdout.splitlines()
+    assert db.script_vacuums() == []
+    assert system_frozen_since(db, catalogs) == set()
+
+
 def test_exclusions_apply_to_the_system_catalogs(db, run_ff):
     # One catalog by each form an exclusion takes: a bare name, a
     # schema-qualified one, and one for this database only.
@@ -807,6 +889,71 @@ def test_system_catalogs_option_changes_nothing_about_a_table_run(db, run_ff):
     assert targets(db.script_vacuums()) == [table, table]
 
 
+def test_system_catalogs_option_changes_nothing_about_a_run_for_a_catalog(db, run_ff):
+    # A catalog named with --table is vacuumed without the option (the
+    # lookup does not leave out the system schemas), and the option adds
+    # nothing to that either.
+    catalogs = system_frozenxids(db)
+    runs = []
+    for extra in ((), ("--system-catalogs",)):
+        mark = db.cluster.log_offset()
+        result = run_ff(*FREEZE_ALL, *extra, "--table", "pg_class", "-d", db.name)
+        runs.append(
+            (
+                result.returncode, result.stdout, result.stderr,
+                db.script_statements(since=mark),
+            )
+        )
+
+    alone, with_option = runs
+    assert with_option == alone
+    assert alone[:3] == (0, "All tables vacuumed.\n", "")
+    assert tables_named(db.script_vacuums(), catalogs) == [PG_CLASS, PG_CLASS]
+
+
+# The shared catalogs present in every supported version.
+SHARED = {("pg_catalog", "pg_database"), ("pg_catalog", "pg_authid")}
+
+
+def shared_catalogs(database):
+    rows = database.execute(
+        "SELECT n.nspname, c.relname FROM pg_class c "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE c.relisshared AND c.relkind IN ('r', 'm')"
+    )
+    shared = set(rows)
+    assert SHARED <= shared
+    return shared
+
+
+def test_shared_catalogs_are_vacuumed_in_each_database(make_db, run_ff):
+    one, two = make_db("one"), make_db("two")
+    before = {database.name: system_frozenxids(database) for database in (one, two)}
+
+    result = run_ff(
+        *FREEZE_ALL, "--system-catalogs", "-d", f"{one.name},{two.name}"
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    for database in (one, two):
+        vacuumed = tables_named(database.script_vacuums(), before[database.name])
+        # Once in each database, and each moves that database's copy of
+        # relfrozenxid.
+        assert SHARED <= set(vacuumed)
+        assert len(vacuumed) == len(set(vacuumed))
+        assert SHARED <= system_frozen_since(database, before[database.name])
+
+
+def test_system_catalogs_option_with_the_default_database_list(db, run_ff):
+    db.create_table("t")
+    catalogs = system_frozenxids(db)
+
+    result = run_ff(*FREEZE_ALL, "--system-catalogs")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert {PG_CLASS, SQL_FEATURES} <= system_frozen_since(db, catalogs)
+
+
 def test_system_catalogs_as_a_role_that_may_not_vacuum_them(db, make_role, run_ff):
     # No privilege is checked beforehand.  The role is neither a superuser
     # nor the database's owner, so the server declines each catalog with a
@@ -842,6 +989,62 @@ def test_system_catalogs_as_a_role_that_may_not_vacuum_them(db, make_role, run_f
     assert f"information_schema.sql_features in database {db.name}" in uncounted
     assert len(uncounted) == len(catalogs)
     assert result.stdout == ""
+
+
+def declined_reports(stderr):
+    """The tables reported as drawing a message from the server, in order,
+    each checked to be followed by the server's WARNING.  Only the shape of
+    the report is relied on: the WARNING's wording differs between server
+    versions, and is translated."""
+    lines = stderr.splitlines()
+    declined = []
+    for number, line in enumerate(lines):
+        match = re.fullmatch(
+            r"VACUUMing (.*) drew a message from the server; "
+            r"not counting it as vacuumed\.",
+            line,
+        )
+        if match:
+            assert lines[number + 1].startswith("WARNING:"), stderr
+            declined.append(match.group(1))
+    return declined
+
+
+def test_system_catalogs_as_the_database_owner(db, cluster, make_role, run_ff):
+    # The owner of a database may vacuum every catalog in it except the
+    # shared ones, which belong to the cluster.  Each of those is declined
+    # by the server and reported, and only those.
+    role = make_role("dbowner")
+    cluster.execute("postgres", f'ALTER DATABASE "{db.name}" OWNER TO "{role}"')
+    catalogs = system_frozenxids(db)
+    shared = shared_catalogs(db)
+
+    result = run_ff(*FREEZE_ALL, "--system-catalogs", "-U", role, "-d", db.name)
+
+    assert result.returncode == 1
+    assert "Traceback" not in result.stderr
+    assert system_frozen_since(db, catalogs) == set(catalogs) - shared
+    # A pg_catalog table is printed under its bare name.
+    names = {table for _, table in shared}
+    assert sorted(declined_reports(result.stderr)) == sorted(names)
+    failures = result.stderr.splitlines()
+    assert failures[-1].startswith("Tables not counted as vacuumed: ")
+    uncounted = failures[-1].partition(": ")[2].split(", ")
+    assert sorted(uncounted) == sorted(f"{name} in database {db.name}" for name in names)
+
+
+def test_system_catalogs_as_a_member_of_pg_maintain(db, cluster, make_role, run_ff):
+    # pg_maintain may vacuum every relation, the shared catalogs included.
+    if cluster.server_version < 170000:
+        pytest.skip("pg_maintain is new in PostgreSQL 17")
+    role = make_role("maintain")
+    cluster.execute("postgres", f'GRANT pg_maintain TO "{role}"')
+    catalogs = system_frozenxids(db)
+
+    result = run_ff(*FREEZE_ALL, "--system-catalogs", "-U", role, "-d", db.name)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert system_frozen_since(db, catalogs) == set(catalogs)
 
 
 # -- what the --no-freeze query selects ------------------------------------------
