@@ -38,8 +38,10 @@ if sys.hexversion < 0x30B0000:
 # table (--pause), as a server error from SET (--costdelay, --costlimit), or
 # as a run that halts at once and still exits 0 (--minutes).  For --freezeage
 # and --minsizemb it is at best an obscure way of asking for every table.
-# Zero stays legal for all of them (-m 0 and --pause 0 are in use).  No upper
-# bounds are applied here; the server enforces its own on the cost settings.
+# Zero stays legal for all of them except --costlimit (-m 0 and --pause 0 are in
+# use; --costdelay 0 turns the cost delay off), which is positive_int below.
+# No upper bounds are applied for any of them; the server enforces its own on
+# the cost settings.
 def non_negative_int(text):
     try:
         value = int(text)
@@ -48,6 +50,16 @@ def non_negative_int(text):
         raise argparse.ArgumentTypeError("invalid int value: %r" % text)
     if value < 0:
         raise argparse.ArgumentTypeError("must not be negative: %r" % text)
+    return value
+
+# argparse type for --costlimit.  The server's minimum for vacuum_cost_limit is
+# 1, so a 0 that reached the SET in the database loop would be rejected there
+# and every database reported as skipped.  A negative value keeps
+# non_negative_int's message.
+def positive_int(text):
+    value = non_negative_int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1: %r" % text)
     return value
 
 # argparse type for --comment.  The text is put between /* and */ after every
@@ -109,7 +121,7 @@ parser.add_argument("--costdelay", dest="costdelay",
                     type=non_negative_int, default = 20,
                     help="vacuum_cost_delay setting in ms.  Default 20")
 parser.add_argument("--costlimit", dest="costlimit",
-                    type=non_negative_int, default = 2000,
+                    type=positive_int, default = 2000,
                     help="vacuum_cost_limit setting.  Default 2000")
 parser.add_argument("-t", "--print-timestamps", action="store_true",
                     dest="print_timestamps",
@@ -614,7 +626,9 @@ if args.exclude_table_in_database:
         # An empty database or table part ('.t', 'db.') has the right shape
         # but can never match anything, so the table it was meant to protect
         # would be vacuumed; it is rejected like a value with no dot at all.
-        if len(parts) != 2 or not parts[0] or not parts[1]:
+        # The same holds for 'db..t', whose table part '.t' is a qualified
+        # name with an empty schema.
+        if len(parts) != 2 or not parts[0] or not parts[1] or parts[1].startswith("."):
             print("invalid argument '{arg}' to flag --exclude-table-in-database: argument must be of the form DATABASE.TABLE or DATABASE.SCHEMA.TABLE".format(arg=elem), file=sys.stderr)
             exit(2)
         else:

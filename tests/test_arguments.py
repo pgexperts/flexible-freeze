@@ -121,7 +121,14 @@ def test_negative_value_attached_with_an_equals_sign_is_rejected(cluster, run_ff
     assert "must not be negative: '-1'" in result.stderr
 
 
-@pytest.mark.parametrize("option", NON_NEGATIVE_OPTIONS)
+# --costlimit is the one numeric option that zero is not legal for: the
+# server's minimum for vacuum_cost_limit is 1, and a 0 that got past the parser
+# would make every database look unlistable.  Upper bounds are left to the
+# server for both cost options, so none is tested here.
+ZERO_ACCEPTED_OPTIONS = [o for o in NON_NEGATIVE_OPTIONS if o != "--costlimit"]
+
+
+@pytest.mark.parametrize("option", ZERO_ACCEPTED_OPTIONS)
 def test_zero_is_accepted(run_ff, option):
     # Only acceptance by the parser is checked: the database is skipped, so
     # the value is never used.  How a run ends after skipping its last
@@ -131,6 +138,15 @@ def test_zero_is_accepted(run_ff, option):
 
     assert f"skipping database {NO_SUCH_DB} (couldn't connect: " in result.stderr
     assert "usage:" not in result.stderr
+
+
+def test_zero_costlimit_is_rejected_before_connecting(cluster, run_ff):
+    mark = cluster.log_offset()
+
+    result = run_ff("--costlimit", "0")
+
+    assert_rejected(result, cluster, mark)
+    assert "argument --costlimit: must be at least 1: '0'" in result.stderr
 
 
 def test_non_integer_value_keeps_the_usual_argparse_message(cluster, run_ff):
@@ -204,6 +220,20 @@ def test_exclude_table_in_database_rejects_an_empty_part(cluster, run_ff, value)
     assert_rejected(result, cluster, mark)
     assert (
         f"invalid argument '{value}' to flag --exclude-table-in-database: "
+        "argument must be of the form DATABASE.TABLE"
+    ) in result.stderr
+
+
+def test_exclude_table_in_database_rejects_an_empty_schema_part(cluster, run_ff):
+    # 'db..t' splits into ['db', '.t']: a table part that begins with a dot is
+    # a schema-qualified name with no schema, which can never match anything.
+    mark = cluster.log_offset()
+
+    result = run_ff(*FREEZE_ALL, "--exclude-table-in-database", "somedb..t")
+
+    assert_rejected(result, cluster, mark)
+    assert (
+        "invalid argument 'somedb..t' to flag --exclude-table-in-database: "
         "argument must be of the form DATABASE.TABLE"
     ) in result.stderr
 
