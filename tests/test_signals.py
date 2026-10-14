@@ -853,6 +853,9 @@ def test_connect_timeout_still_applies(run_ff, silent_server):
     # for the server itself so that a signal can be acted on, and libpq
     # then leaves connect_timeout to the script.  A server that accepts and
     # never answers must still be given up on, as an unreachable database.
+    # Only PGCONNECT_TIMEOUT is exercised here: a connect_timeout in a
+    # service file reaches the same read, but the harness refuses
+    # PGSERVICEFILE, so that source is untested by design (ADR 0011).
     started = time.monotonic()
     result = run_ff(
         "-d", "ff_one", env={"PGCONNECT_TIMEOUT": "2"}, port=silent_server.port
@@ -870,7 +873,12 @@ def test_connect_timeout_still_applies(run_ff, silent_server):
 # What libpq accepts as connect_timeout, and the script has to accept too:
 # an optional sign and ASCII digits, with white space around them.  A
 # negative value means no timeout.
-@pytest.mark.parametrize("value", [" 10", "10 ", "+5", "-5", "010"])
+@pytest.mark.parametrize(
+    "value",
+    [" 10", "10 ", "+5", "-5", "010",
+     # libpq reads this with strtol, which has no digit limit: 5
+     pytest.param("0" * 4400 + "5", id="leading-zeros-4400")],
+)
 def test_connect_timeout_libpq_accepts_is_accepted(db, run_ff, value):
     db.create_table("t1")
     before = db.frozenxids()
@@ -889,8 +897,10 @@ def test_connect_timeout_libpq_accepts_is_accepted(db, run_ff, value):
 # with one message (the value shown as JSON, so that it is plain ASCII on one
 # line), instead of blaming each database for it.
 @pytest.mark.parametrize(
-    "value", ["10s", "abc", "10.5", "1_0", "1e1", "0x10", "+", "", " ", "\u0663",
-              "2147483648", "-2147483649"]
+    "value",
+    ["10s", "abc", "10.5", "1_0", "1e1", "0x10", "+", "", " ", "\u0663",
+     "2147483648", "-2147483649", "99999999999", "-99999999999",
+     pytest.param("9" * 4301, id="digits-4301")],
 )
 @pytest.mark.parametrize("named", [False, True], ids=["listing", "named"])
 def test_connect_timeout_that_is_not_a_whole_number_ends_the_run(
