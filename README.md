@@ -11,7 +11,7 @@ This script is designed for doing VACUUM FREEZE or VACUUM ANALYZE
 runs on your database during known slow traffic periods. Takes a
 timeout so that it won't overrun your slow traffic period.
 
-Tested on Python 3.8, but should work on any supported Python 3.
+Tested on Python 3.10, but should work on any supported Python 3.
 
 Requires PostgreSQL 12 or later: every `VACUUM` is sent with `SKIP_LOCKED`, which older versions do not have.
 
@@ -83,7 +83,7 @@ The minutes time limit is normally only enforced at the start of vacuuming each 
 
 `--pause` is a pause between vacuums.  There is none after the last table, and a pause never runs past the end of the time window.
 
-If you do not specify a `--enforce_time`, `flexible_freeze` will issue a `SET statement_timeout = 0` statement before each operation
+If you do not specify a `--enforce-time`, `flexible_freeze` will issue a `SET statement_timeout = 0` statement before each operation
 to avoid cancellation by a system- or role-wide `statement_timeout` value.
 
 `flexible_freeze` does not wait for a table that another session has locked.  Each statement is sent as `VACUUM (FREEZE, ANALYZE, SKIP_LOCKED)` (without `FREEZE` or `ANALYZE` according to `--no-freeze` and `--no-analyze`), so a table held by an anti-wraparound autovacuum, a `CREATE INDEX` or anything else that conflicts with `VACUUM` is passed over at once.  The server reports that with a warning, and the table is then treated like any other the server declined to vacuum: its message is printed, the table is listed in the summary as not vacuumed, and the exit status is 1.  The table is selected again on the next run.
