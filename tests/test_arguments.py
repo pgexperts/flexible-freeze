@@ -459,6 +459,24 @@ def test_exclude_table_in_database_rejects_a_padded_table_part(
 
 @pytest.mark.parametrize(
     "value",
+    [" somedb.orders", "somedb .orders", "\tsomedb.orders", "somedb\n.orders"],
+    ids=["leading", "trailing", "tab", "newline"],
+)
+def test_exclude_table_in_database_rejects_a_padded_database_part(
+    cluster, run_ff, value
+):
+    mark = cluster.log_offset()
+
+    result = run_ff(*FREEZE_ALL, "--exclude-table-in-database", value)
+    assert_rejected(result, cluster, mark)
+    assert (
+        f"invalid argument '{value}' to flag --exclude-table-in-database: "
+        "database name must not have leading or trailing whitespace"
+    ) in result.stderr
+
+
+@pytest.mark.parametrize(
+    "value",
     ['somedb.."a..b"', 'somedb."a..b".'],
     ids=["empty-schema", "trailing"],
 )

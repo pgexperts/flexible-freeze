@@ -942,6 +942,12 @@ if args.exclude_table_in_database:
                 or any(not part for part in split_outside_quotes(parts[1]))):
             print("invalid argument '{arg}' to flag --exclude-table-in-database: argument must be of the form DATABASE.TABLE or DATABASE.SCHEMA.TABLE".format(arg=elem), file=sys.stderr)
             exit(2)
+        elif parts[0] != parts[0].strip():
+            print(("invalid argument '{arg}' to flag "
+                   "--exclude-table-in-database: database name must not have "
+                   "leading or trailing whitespace").format(arg=elem),
+                  file=sys.stderr)
+            exit(2)
         elif parts[1] != parts[1].strip():
             print(("invalid argument '{arg}' to flag "
                    "--exclude-table-in-database: table name must not have "
