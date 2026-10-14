@@ -257,3 +257,18 @@ def test_help_describes_the_options_as_they_behave(run_ff):
     assert "--comment COMMENT text to append as a comment" in text
     assert "/* COMMENT */, to every statement sent to the server" in text
     assert "It may not contain /* or */, a NUL or a line break" in text
+
+
+def test_help_gives_text_for_every_option_and_names_the_lock_timeout_value(run_ff):
+    # The options that had no help string at all, each checked by a phrase
+    # from its new help text; --lock-timeout's value is shown by its metavar.
+    result = run_ff("--help", env={"COLUMNS": "1000", "NO_COLOR": "1"})
+
+    assert result.returncode == 0
+    text = " ".join(result.stdout.split())
+    assert "prefix each line of output with the time it was printed" in text
+    assert "append output to this file instead of standard output" in text
+    assert "print progress as the run goes" in text
+    assert "print debugging output to standard error" in text
+    assert "[--lock-timeout SECONDS]" in text
+    assert "--lock-timeout SECONDS seconds to wait for a lock" in text

@@ -112,21 +112,25 @@ parser.add_argument("--costlimit", dest="costlimit",
                     type=non_negative_int, default = 2000,
                     help="vacuum_cost_limit setting.  Default 2000")
 parser.add_argument("-t", "--print-timestamps", action="store_true",
-                    dest="print_timestamps")
+                    dest="print_timestamps",
+                    help="prefix each line of output with the time it was printed")
 parser.add_argument("--enforce-time", dest="enforcetime", action="store_true",
                     help="enforce time limit by terminating vacuum")
 # What these two guard against is described where they are applied: at the
 # session settings in the database loop and at ADVISORY_LOCK_KEY.
 parser.add_argument("--lock-timeout", dest="lock_timeout",
-                    type=non_negative_int, default=10,
+                    type=non_negative_int, default=10, metavar="SECONDS",
                     help="seconds to wait for a lock before giving up (set as the session's lock_timeout).  A database whose table list cannot be read in that time is skipped, a table whose VACUUM runs into it is reported as failed, and the run goes on.  0 means wait without limit.  Default is 10.")
 parser.add_argument("--no-advisory-lock", dest="advisory_lock", action="store_false",
                     help="Do not guard against overlapping runs.  By default a run takes an advisory lock in each database while it works there, and skips a database in which another run holds that lock.")
-parser.add_argument("-l", "--log", dest="logfile")
+parser.add_argument("-l", "--log", dest="logfile",
+                    help="append output to this file instead of standard output.  A failure report goes to the file and to standard error")
 parser.add_argument("-v", "--verbose", action="store_true",
-                    dest="verbose")
+                    dest="verbose",
+                    help="print progress as the run goes, including each database and table it works on")
 parser.add_argument("--debug", action="store_true",
-                    dest="debug")
+                    dest="debug",
+                    help="print debugging output to standard error: the versions in use, the arguments, and each table skipped by an exclusion")
 parser.add_argument("-U", "--user", dest="dbuser",
                   help="database user")
 parser.add_argument("-H", "--host", dest="dbhost",

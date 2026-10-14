@@ -20,7 +20,7 @@ Requires psycopg2 2.9 or later, below 3 (`scripts/requirements.txt` names `psyco
     usage: flexible_freeze.py [-h] [-m RUN_MIN] [-s MINSIZEMB] [-d DBLIST] [-T TABLES_TO_EXCLUDE]
                               [--exclude-table-in-database EXCLUDE_TABLE_IN_DATABASE] [--no-freeze] [--no-analyze] [--no-truncate]
                               [--vacuum] [--pause PAUSE_TIME] [--freezeage FREEZEAGE] [--costdelay COSTDELAY]
-                              [--costlimit COSTLIMIT] [-t] [--enforce-time] [--lock-timeout LOCK_TIMEOUT] [--no-advisory-lock]
+                              [--costlimit COSTLIMIT] [-t] [--enforce-time] [--lock-timeout SECONDS] [--no-advisory-lock]
                               [-l LOGFILE] [-v] [--debug] [-U DBUSER] [-H DBHOST] [-p DBPORT] [-w DBPASS] [--table TABLE]
                               [-c COMMENT]
 
@@ -56,16 +56,20 @@ Requires psycopg2 2.9 or later, below 3 (`scripts/requirements.txt` names `psyco
       --costlimit COSTLIMIT
                             vacuum_cost_limit setting. Default 2000
       -t, --print-timestamps
+                            prefix each line of output with the time it was printed
       --enforce-time        enforce time limit by terminating vacuum
-      --lock-timeout LOCK_TIMEOUT
+      --lock-timeout SECONDS
                             seconds to wait for a lock before giving up (set as the session's lock_timeout). A database whose table
                             list cannot be read in that time is skipped, a table whose VACUUM runs into it is reported as failed,
                             and the run goes on. 0 means wait without limit. Default is 10.
       --no-advisory-lock    Do not guard against overlapping runs. By default a run takes an advisory lock in each database while it
                             works there, and skips a database in which another run holds that lock.
       -l LOGFILE, --log LOGFILE
-      -v, --verbose
-      --debug
+                            append output to this file instead of standard output. A failure report goes to the file and to standard
+                            error
+      -v, --verbose         print progress as the run goes, including each database and table it works on
+      --debug               print debugging output to standard error: the versions in use, the arguments, and each table skipped by
+                            an exclusion
       -U DBUSER, --user DBUSER
                             database user
       -H DBHOST, --host DBHOST
