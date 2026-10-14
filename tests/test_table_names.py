@@ -939,3 +939,177 @@ def test_table_option_reaches_a_system_catalog(db, run_ff):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "processing table pg_am" in result.stdout.splitlines()
     assert [vacuum.table for vacuum in db.script_vacuums()] == ["pg_am"]
+
+
+# -- the kind lookup in the rest of the run -----------------------------------
+#
+# What the second lookup meets: a server failure while it is the statement
+# running, the time limit and the exclusions in a run that sent it, and the
+# --comment text and the parameter in the statement itself.  (A signal
+# while it runs is in test_signals.py.)
+#
+# The two lookups read the same catalogs, so nothing on the server can hold
+# up the second and let the first through.  The script is therefore stopped
+# just before it sends the second (kind_lookup_gate); the test then locks
+# pg_class in that database and lets the script go, and the statement waits
+# on the server like any other.
+
+
+def catalog_locked(database):
+    """A session holding pg_class of `database` to itself; closing it lets go.
+
+    pg_class is a catalog of the one database, so the others, and the
+    harness's own queries through `postgres`, are not held up.
+    """
+    conn = database.connect(autocommit=False)
+    with conn.cursor() as cur:
+        cur.execute("LOCK TABLE pg_catalog.pg_class IN ACCESS EXCLUSIVE MODE")
+    return conn
+
+
+def view_and_table(make_db):
+    """Database `one` has only a view sales.orders; `two` has the table."""
+    one, two = make_db("one"), make_db("two")
+    build(one, ("sales", "items"))
+    one.execute("CREATE VIEW sales.orders AS SELECT * FROM sales.items")
+    build(two, ("sales", "orders"))
+    return one, two
+
+
+def test_failure_during_the_kind_lookup_skips_that_database_only(
+    make_db, start_ff, kind_lookup_gate
+):
+    one, two = view_and_table(make_db)
+    before_two = two.frozenxids()
+
+    proc = start_ff(
+        *FREEZE_ALL, "-v", "--lock-timeout", "1", "--table", "orders",
+        "-d", f"{one.name},{two.name}", env=kind_lookup_gate.env,
+    )
+    try:
+        kind_lookup_gate.wait_until_held()
+        blocker = catalog_locked(one)
+        try:
+            kind_lookup_gate.release()
+            stdout, stderr = proc.communicate(timeout=30.0)
+        finally:
+            blocker.close()
+    finally:
+        proc.kill()
+
+    assert "Traceback" not in stderr
+    assert proc.returncode == 1, stdout + stderr
+    assert (
+        f"skipping database {one.name} (couldn't list its tables: "
+        "canceling statement due to lock timeout"
+    ) in stderr
+    assert_lines_in_order(
+        stderr,
+        [
+            "Not all tables were vacuumed.",
+            f"Databases skipped or left unfinished: {one.name}",
+        ],
+    )
+    # A database whose lookup failed is not one where the name matched no
+    # table, and nothing was learnt about what the name is there.
+    assert "matched no table" not in stderr
+    assert "cannot be vacuumed" not in stdout
+    assert f"does not exist in database {one.name}" not in stdout
+    assert one.script_vacuums() == []
+    # The run went on to the next database.
+    assert two.frozen_since(before_two) == {("sales", "orders")}
+    assert_lines_in_order(
+        stdout, [f"working on database {two.name}", "1 tables in 1 databases"]
+    )
+
+
+def test_time_limit_is_met_after_a_database_where_the_name_is_a_view(
+    make_db, run_ff
+):
+    # The limit is tested before a table and nowhere else, so the database
+    # with nothing to vacuum is still looked in and still gets its line.
+    one, two = view_and_table(make_db)
+    before_two = two.frozenxids()
+
+    result = run_ff(
+        *FREEZE_ALL, "-v", "-m", "0", "--table", "orders",
+        "-d", f"{one.name},{two.name}",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stderr == ""
+    assert two.script_vacuums() == []
+    assert two.frozen_since(before_two) == set()
+    assert_lines_in_order(
+        result.stdout,
+        [
+            f"working on database {one.name}",
+            cannot_be_vacuumed("sales.orders", "view", one),
+            f"working on database {two.name}",
+            "Reached time limit.  Exiting.",
+            "Vacuuming halted due to timeout",
+            "after vacuuming 0 tables in 2 databases",
+        ],
+    )
+
+
+def test_exclusion_of_a_name_that_is_a_view_matches_no_table(db, run_ff):
+    # The exclusions are applied to the tables found.  A view is not one,
+    # so the value is reported as having matched nothing, as it was when
+    # the view was said not to exist.
+    build(db, ("sales", "items"))
+    db.execute("CREATE VIEW sales.orders AS SELECT * FROM sales.items")
+
+    result = run_ff(
+        *FREEZE_ALL, "-v", "--table", "orders", "-T", "orders",
+        "--exclude-table-in-database", f"{db.name}.sales.orders", "-d", db.name,
+    )
+
+    assert_counted_as_matching_no_table(result, "orders", db)
+    lines = result.stdout.splitlines()
+    assert cannot_be_vacuumed("sales.orders", "view", db) in lines
+    assert not any("is excluded in database" in line for line in lines)
+    assert (
+        "exclusions that matched no selected table: -T orders, "
+        f"--exclude-table-in-database {db.name}.sales.orders"
+    ) in lines
+    assert "0 tables in 1 databases" in lines
+    assert db.script_vacuums() == []
+
+
+def test_kind_lookup_carries_the_comment_and_takes_the_name_as_a_value(db, run_ff):
+    # The statement has a parameter, so a percent sign in the comment has to
+    # be doubled for the driver and arrive single; and the name is a value,
+    # whatever is in it.
+    build(db, ("sales", "items"))
+    db.execute("CREATE VIEW sales.orders AS SELECT * FROM sales.items")
+
+    result = run_ff(
+        *FREEZE_ALL, "-v", "--comment", "50% of nightly", "--table", "orders",
+        "-d", db.name,
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "Traceback" not in result.stderr
+    lookups = catalog_lookups(db)
+    assert len(lookups) == 2
+    assert all(s.endswith("/* 50% of nightly */") for s in lookups)
+    assert all("'orders'::text IN (" in s for s in lookups)
+    assert all("%%" not in s for s in lookups)
+    assert cannot_be_vacuumed("sales.orders", "view", db) in result.stdout.splitlines()
+
+    mark = db.cluster.log_offset()
+    hostile = "orders' OR relkind = 'v' OR 'x' = '"
+    result = run_ff(*FREEZE_ALL, "-v", "--table", hostile, "-d", db.name)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    lines = result.stdout.splitlines()
+    assert (
+        f"specified single table {hostile} does not exist in database {db.name}"
+    ) in lines
+    assert not any("cannot be vacuumed" in line for line in lines)
+    lookups = catalog_lookups(db, since=mark)
+    assert len(lookups) == 2
+    assert all(
+        "'orders'' OR relkind = ''v'' OR ''x'' = '''::text IN (" in s for s in lookups
+    )

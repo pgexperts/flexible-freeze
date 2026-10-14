@@ -253,6 +253,14 @@ def script_clock(tmp_path):
 
 
 @pytest.fixture
+def kind_lookup_gate(tmp_path):
+    """A ffharness.KindLookupGate.  Start the script with
+    `env=kind_lookup_gate.env`; it stops just before the --table kind lookup
+    until `kind_lookup_gate.release()`."""
+    return ffharness.KindLookupGate(tmp_path / "kind-lookup-gate")
+
+
+@pytest.fixture
 def open_files_probe(tmp_path):
     """A ffharness.OpenFilesProbe.  Start the script with
     `env=open_files_probe.env`; once it has exited, `files_left_open()` names

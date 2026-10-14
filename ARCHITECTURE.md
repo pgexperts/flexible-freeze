@@ -22,7 +22,7 @@ registration and the whole run execute at import. It cannot be imported.
 | Lock handling (ADR 0014, 0015) | `SKIP_LOCKED` on every VACUUM; the session's `lock_timeout` (`--lock-timeout`); one advisory lock per database against overlapping runs (`--no-advisory-lock`) | `ADVISORY_LOCK_KEY`, the session settings and `vacuum_options` in the database loop |
 | Run outcome (ADR 0009) | What was and was not done; the only input to the summary and the exit status | `RunOutcome`, `outcome`, the summary block at the end of the file |
 | Interruption (ADR 0011) | SIGINT, SIGTERM and SIGHUP (the last only if it was not already ignored when the script started): the handler records the signal; the psycopg2 wait callback cancels the running statement and applies `connect_timeout`; the pause ends early; a second signal stops waiting for the server | `signal_handler`, `interrupt_signal`, `interrupt_repeated`, `wait_for_server`, `pause`, `exit_if_interrupted` |
-| Test harness | Throwaway cluster (and a sweep of clusters a killed session left), the single launcher for the script, catalog and statement-log probes, a clock for the script that tests can move and stop, a probe for the files the script left open at exit, a socket that never answers, a start with SIGHUP ignored (`start_ff(ignore_sighup=True)`), a SCRAM role for password tests, per-subprocess coverage (`.coveragerc`) | `tests/ffharness.py`, `tests/conftest.py` |
+| Test harness | Throwaway cluster (and a sweep of clusters a killed session left), the single launcher for the script, catalog and statement-log probes, a clock for the script that tests can move and stop, a gate that stops the script just before one statement (`StatementGate`; `KindLookupGate`), a probe for the files the script left open at exit, a socket that never answers, a start with SIGHUP ignored (`start_ff(ignore_sighup=True)`), a SCRAM role for password tests, per-subprocess coverage (`.coveragerc`) | `tests/ffharness.py`, `tests/conftest.py` |
 
 ## Invariants
 
@@ -174,9 +174,10 @@ registration and the whole run execute at import. It cannot be imported.
   query and the fetch share one `try`; the message for both says "query".
   Nothing there is left to an uncaught exception, whose traceback would
   reach stderr and not the log file.
-- A failure in the session settings, the advisory-lock call or the listing
-  query is reported as "couldn't list its tables" and skips the database;
-  the message names only the last.
+- A failure in the session settings, the advisory-lock call, the listing
+  query or the `--table` kind lookup (`TABLE_KIND_QUERY`) is reported as
+  "couldn't list its tables" and skips the database; the message names
+  only the listing.
 - A lost connection ends that database only (recorded as unfinished, exit
   status 1), and there is no reconnect.
 - A `--table` name that no table in a database has is recorded, and
