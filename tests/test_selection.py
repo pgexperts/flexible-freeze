@@ -303,6 +303,73 @@ def test_default_database_order_goes_by_the_greater_of_the_two_ages(
     ]
 
 
+def database_ages(cluster, *databases):
+    """{name: (xid age, multixact age)} for `databases`, read in one
+    statement so that the rows are measured against the same counters.
+
+    For the tests that change the state after
+    databases_behind_on_different_horizons has checked it, and so have to
+    restate from pg_database the facts they depend on."""
+    rows = cluster.execute(
+        "postgres",
+        "SELECT datname, age(datfrozenxid), mxid_age(datminmxid) FROM pg_database",
+    )
+    wanted = {database.name for database in databases}
+    return {name: (xid, mxid) for name, xid, mxid in rows if name in wanted}
+
+
+def test_default_database_order_puts_the_greater_xid_age_first_too(
+    cluster, make_db, run_ff
+):
+    # The transaction ID half of greatest().  The test above shows the
+    # database that is behind on MultiXact IDs ahead of the one behind on
+    # transaction IDs, which an ORDER BY on mxid_age(datminmxid) alone would
+    # also do.  Here it is the other way round: once enough transaction IDs
+    # have gone by, the database that is behind on those has the greater
+    # age of the two, though the other still has the greater MultiXact age.
+    multixact_old, xid_old = databases_behind_on_different_horizons(make_db)
+    for _ in range(60):
+        cluster.execute("postgres", "SELECT pg_current_xact_id()")
+    ages = database_ages(cluster, multixact_old, xid_old)
+    assert max(ages[xid_old.name]) > max(ages[multixact_old.name]), ages
+    assert ages[multixact_old.name][1] > ages[xid_old.name][1], ages
+    mark = cluster.log_offset()
+
+    result = run_ff(*FREEZE_ALL, "-v")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert databases_in_order_of_work(cluster, mark, multixact_old, xid_old) == [
+        xid_old.name, multixact_old.name,
+    ]
+
+
+def test_time_limited_default_run_stops_in_the_database_older_by_either_age(
+    cluster, make_db, run_ff
+):
+    # What the order is for: a run that runs out of time stops in the
+    # database it is in, and every other time-limit test names its databases
+    # with -d.  --table narrows every database to one table, which only
+    # these two have, so the limit (-m 0, met at the first table of the run)
+    # is met in whichever of the two the script comes to first.  The other
+    # is then not connected to at all.
+    multixact_old, xid_old = databases_behind_on_different_horizons(make_db)
+    for database in (multixact_old, xid_old):
+        database.create_table("t_due")
+    ages = database_ages(cluster, multixact_old, xid_old)
+    assert ages[xid_old.name][0] > ages[multixact_old.name][0], ages
+    assert max(ages[multixact_old.name]) > max(ages[xid_old.name]), ages
+    mark = cluster.log_offset()
+
+    result = run_ff(*FREEZE_ALL, "-v", "-m", "0", "--table", "t_due")
+
+    assert "Reached time limit.  Exiting." in result.stdout.splitlines(), (
+        result.stdout + result.stderr
+    )
+    assert cluster.statements(dbname=multixact_old.name, since=mark) != []
+    assert cluster.statements(dbname=xid_old.name, since=mark) == []
+    assert multixact_old.script_vacuums(since=mark) == []
+
+
 def test_databases_option_is_worked_through_in_the_order_given(
     cluster, make_db, run_ff
 ):
