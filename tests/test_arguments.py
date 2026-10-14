@@ -163,6 +163,20 @@ def test_table_option_defaults_to_none(run_ff):
 # -- --table / -st ------------------------------------------------------------
 
 
+@pytest.mark.parametrize("option", ["--table", "-st"])
+@pytest.mark.parametrize("value", ["", " \t "])
+def test_empty_table_name_is_rejected_before_connecting(db, cluster, run_ff, option, value):
+    db.create_table("t")
+    before = db.frozenxids()
+    mark = cluster.log_offset()
+
+    result = run_ff(*FREEZE_ALL, option, value)
+
+    assert_rejected(result, cluster, mark)
+    assert "argument must name a table" in result.stderr
+    assert db.frozen_since(before) == set()
+
+
 def test_st_is_still_accepted_for_table(db, run_ff):
     db.create_table("t")
     db.create_table("t_other")

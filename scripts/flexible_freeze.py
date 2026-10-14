@@ -50,6 +50,11 @@ def non_negative_int(text):
         raise argparse.ArgumentTypeError("must not be negative: %r" % text)
     return value
 
+def non_empty_table(text):
+    if not text.strip():
+        raise argparse.ArgumentTypeError("argument must name a table")
+    return text
+
 parser = argparse.ArgumentParser()
 parser.add_argument("-m", "--minutes", dest="run_min",
                     type=non_negative_int, default=120,
@@ -112,7 +117,7 @@ parser.add_argument("-w", "--password", dest="dbpass",
                        ".pgpass file or PGSERVICE")
 # --table is listed first so that it is the spelling shown in the usage line;
 # -st is kept because existing invocations use it.
-parser.add_argument("--table", "-st", dest="table",
+parser.add_argument("--table", "-st", dest="table", type=non_empty_table,
                   help="only process tables with this name: a bare name matches in every schema, SCHEMA.TABLE only that table.  The table is vacuumed whatever its age, size or dead rows: --freezeage, --minsizemb and the --no-freeze thresholds do not apply to it; exclusions still do.  -st is an older spelling of this option")
 
 args = parser.parse_args()
@@ -702,7 +707,7 @@ for db in dblist:
     tabparams = None
 
     # if only one table is desired, look it up; see TABLE_LOOKUP_QUERY
-    if args.table:
+    if args.table is not None:
         tabquery = TABLE_LOOKUP_QUERY
         tabparams = {'name': args.table}
     # if vacuuming, get list of top tables to vacuum
@@ -825,7 +830,7 @@ for db in dblist:
         # from most of them, and a line for each, on every run, is noise in
         # a scheduler's mail.  A name found nowhere is in the summary at any
         # verbosity, with the databases that were looked in.
-        if args.table:
+        if args.table is not None:
             if not tablist:
                 verbose_print("specified single table {0} does not exist in database {1}".format(args.table, db))
                 outcome.table_missing_in.append(db)
@@ -854,13 +859,13 @@ for db in dblist:
             # asked for by name, and leaving it out quietly reads as a run
             # that did what it was asked.
             if db in database_table_map and table_named_in(database_table_map[db], tabrow):
-                if args.table:
+                if args.table is not None:
                     _print("specified single table {t} is excluded in database {d} by --exclude-table-in-database; not vacuuming it".format(t=table, d=db))
                 else:
                     debug_print("skipping table {t} in database {d} per --exclude-table-in-database argument".format(t=table, d=db))
                 continue
             elif args.tables_to_exclude and table_named_in(args.tables_to_exclude, tabrow):
-                if args.table:
+                if args.table is not None:
                     _print("specified single table {t} is excluded in database {d} by --exclude-table; not vacuuming it".format(t=table, d=db))
                 else:
                     verbose_print(
