@@ -128,6 +128,17 @@ registration and the whole run execute at import. It cannot be imported.
 - **Tests start the script only through `run_ff` / `start_ff`.** Breaks: a
   run without the forced host and port reaches whatever server libpq
   defaults to and vacuums it (ADR 0008).
+- **The harness pins the script's host, not its port.** `-H` is always the
+  throwaway cluster's socket directory, and any argument that names a host
+  or a port is refused (`UnsafeInvocation`). The `port=` keyword of
+  `run_ff` / `start_ff` is the one way to choose `-p`: a number is checked
+  (positive, not 5432), a string is handed to the script as it is, so that
+  a port list or an invalid port can be tested (only text that reads as a
+  host or port option, or carries a connection keyword, is refused). That
+  is safe because libpq uses the port only to pick a socket inside that
+  private directory, and every `PG*` variable is stripped; the reasoning
+  is in `ff_command`'s docstring. Breaks: the same freedom given to the host, or to arguments,
+  lets a test reach a real server.
 
 ## Landmines
 
@@ -193,6 +204,15 @@ registration and the whole run execute at import. It cannot be imported.
   comment the client encoding cannot encode fails in `dbconnect()`.
 - An empty or blank `--table` is refused at argument parsing (exit 2,
   `non_empty_table`, ADR 0007); the option is tested against `None`.
+- `-p` is one port or a comma-separated list, each from 1 to 65535
+  (`port_list`); an empty value or entry is refused (exit 2), never read
+  as the default port. `args.dbport` is the text as given, not a number,
+  because libpq is handed the list as text; `--debug` shows it quoted.
+  The number of ports is not compared with the number of hosts; libpq
+  does that when it connects.
+- Test files may not contain the default port's number as a literal
+  (`test_test_files_do_not_bypass_the_harness`); port tests use other
+  numbers.
 - `--no-truncate` adds `TRUNCATE false`; without it nothing about
   truncation is sent, so the table's `vacuum_truncate` still applies
   (ADR 0014). `TRUNCATE true` is never sent.

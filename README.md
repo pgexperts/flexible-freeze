@@ -75,7 +75,8 @@ Requires psycopg2 2.9 or later, below 3 (`scripts/requirements.txt` names `psyco
       -H DBHOST, --host DBHOST
                             database hostname
       -p DBPORT, --port DBPORT
-                            database port
+                            database port, from 1 to 65535; or a comma-separated list of ports, one for each host, when -H lists
+                            several hosts
       -w DBPASS, --password DBPASS
                             database password. Visible to other local users in the process list for the whole run; prefer
                             PGPASSWORD, a .pgpass file or PGSERVICE
@@ -127,6 +128,8 @@ An empty or blank `--table` value is an error in the command line (exit status 2
 `flexible_freeze` runs every session with an empty `search_path`, as `vacuumdb` does, so table names in its output are schema-qualified (`public.orders`).  The one exception is a table in `pg_catalog`, which can only come up when `--table` names it: PostgreSQL searches that schema whatever the `search_path`, so such a table is printed, and vacuumed, by its bare name (`pg_statistic`).  On PostgreSQL 16 and earlier, this means the ANALYZE of a table with an expression index can fail if the index's function depends on `search_path`; give such functions an explicit `SET search_path`, or schema-qualify the names they use.
 
 Connection settings other than host, port, user and password are taken from the standard libpq environment variables (`PGSSLMODE`, `PGSERVICE`, `PGCONNECT_TIMEOUT` and so on).  The `-H`, `-U`, `-p`, `-w` and `-d` values are passed to the server as given; they cannot carry additional connection options.  The connection timeout (`PGCONNECT_TIMEOUT`, or `connect_timeout` in a service file) limits each connection attempt as a whole: if `-H` lists several hosts, a host that does not answer uses up the timeout instead of being passed over for the next one.
+
+`-p` takes one port, or a comma-separated list of ports to go with a `-H` that lists several hosts (`-H db1,db2 -p 5432,6432`).  Each port must be a whole number from 1 to 65535.  An empty value, or an empty entry in the list (`5432,`), is an error in the command line (exit status 2); it is never read as the default port, so an unset variable in `-p "$PORT"` cannot send the run to the default server.  The value is passed to libpq as written, and it is libpq that matches the ports to the hosts when it connects: it takes one port for all the hosts or one port for each, and with a list of any other length every connection fails.
 
 A mistyped `-T` or `--exclude-table-in-database` value excludes nothing.  With `-v`, the end of the run lists the exclusion values that matched none of the selected tables.  That is not an error: a correct value also matches nothing when its table was not selected for vacuuming in that run.
 

@@ -87,6 +87,36 @@ def non_empty_table(text):
         raise argparse.ArgumentTypeError("argument must name a table")
     return text
 
+# argparse type for -p/--port.  Accepted: one port, or a comma-separated list
+# of ports, which is how libpq takes the ports for a -H that lists several
+# hosts.  Each entry must be a decimal integer from 1 to 65535, written as an
+# optional sign and ASCII digits and nothing else: no spaces, no underscores,
+# no other digits, although int() would take all of those.  An empty value
+# and an empty entry ("5432,") are refused, not read as "the default port":
+# an unset variable in `-p "$PORT"` must not send the run to the default
+# server.
+#
+# What this does not do, on purpose.  It returns the text exactly as given,
+# neither converted to a number nor tidied up, because the text is what libpq
+# is handed (see dbconnect); so --debug shows dbport as a string.  And it does
+# not compare the number of ports with the number of hosts: libpq does that
+# when it connects, and its answer then shows up as a failed connection.
+def port_list(text):
+    if not text:
+        raise argparse.ArgumentTypeError("must name a port: %r" % text)
+    for entry in text.split(","):
+        if not entry:
+            raise argparse.ArgumentTypeError("empty entry in the port list: %r" % text)
+        digits = entry[1:] if entry[0] in "+-" else entry
+        if not (digits.isascii() and digits.isdigit()):
+            # the wording argparse itself uses for type=int
+            raise argparse.ArgumentTypeError("invalid int value: %r" % entry)
+        # The length is tested first because int() refuses a digit string
+        # of more than a few thousand characters.
+        if len(digits.lstrip("0")) > 5 or not 1 <= int(entry) <= 65535:
+            raise argparse.ArgumentTypeError("must be from 1 to 65535: %r" % entry)
+    return text
+
 parser = argparse.ArgumentParser()
 parser.add_argument("-m", "--minutes", dest="run_min",
                     type=non_negative_int, default=120,
@@ -147,8 +177,8 @@ parser.add_argument("-U", "--user", dest="dbuser",
                   help="database user")
 parser.add_argument("-H", "--host", dest="dbhost",
                   help="database hostname")
-parser.add_argument("-p", "--port", dest="dbport", type=int,
-                  help="database port")
+parser.add_argument("-p", "--port", dest="dbport", type=port_list,
+                  help="database port, from 1 to 65535; or a comma-separated list of ports, one for each host, when -H lists several hosts")
 parser.add_argument("-w", "--password", dest="dbpass",
                   help="database password.  Visible to other local users in the "
                        "process list for the whole run; prefer PGPASSWORD, a "

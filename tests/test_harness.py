@@ -42,23 +42,83 @@ def test_command_pins_host_and_port_last(sockdir):
     ]
 
 
-def test_command_refuses_a_host_that_is_not_a_harness_directory(sockdir, tmp_path):
+# What the launcher is given as the port: a number of the harness's own
+# choosing, or a test's text for the script's -p.  Whatever is refused about
+# the host and the arguments is refused with either.
+NUMBER_OR_TEXT = pytest.mark.parametrize(
+    "port", [PORT, "6543,6544"], ids=["port-number", "port-text"]
+)
+
+
+@NUMBER_OR_TEXT
+def test_command_refuses_a_host_that_is_not_a_harness_directory(sockdir, tmp_path, port):
     unmarked = tmp_path / "unmarked"
     unmarked.mkdir()
     for host in (None, "", "localhost", "/tmp", str(unmarked), f"{sockdir},localhost"):
         with pytest.raises(UnsafeInvocation):
-            ffharness.ff_command(host, PORT, [])
+            ffharness.ff_command(host, port, [])
 
 
-@pytest.mark.parametrize(
-    "port",
-    [None, 0, -1, "not-a-port", ffharness.FORBIDDEN_PORT, str(ffharness.FORBIDDEN_PORT)],
-)
-def test_command_refuses_a_missing_or_default_port(sockdir, port):
+@pytest.mark.parametrize("port", [None, 0, -1, ffharness.FORBIDDEN_PORT])
+def test_command_refuses_a_missing_or_default_port_number(sockdir, port):
+    # A port that is not a string is one the harness chose, and has to be a
+    # usable number that is not the default server's.
     with pytest.raises(UnsafeInvocation):
         ffharness.ff_command(sockdir, port, [])
 
 
+@pytest.mark.parametrize(
+    "port",
+    [
+        str(PORT),
+        f"{PORT},{PORT}",
+        "6543,6544",
+        "",
+        " ",
+        "6543,",
+        ",6543",
+        "not-a-port",
+        "0",
+        "-1",
+        "65536",
+        "../x",
+        # The default server's number is no danger as text: with the host
+        # pinned it names a socket in the private directory.
+        str(ffharness.FORBIDDEN_PORT),
+    ],
+)
+def test_command_passes_port_text_on_unchanged(sockdir, port):
+    # A string is a test's own value for -p, there to exercise the script's
+    # checking of it.  It cannot redirect a run (see ff_command), so it is
+    # neither validated nor normalised; the host is pinned as ever.
+    argv = ffharness.ff_command(sockdir, port, ["-v"])
+
+    assert argv[-5:] == ["-v", "-H", sockdir, "-p", port]
+
+
+@pytest.mark.parametrize(
+    "port",
+    [
+        # read by argparse as an option of their own, not as the value of -p
+        "-Helsewhere",
+        "--host=elsewhere",
+        "--ho=elsewhere",
+        "-vHelsewhere",
+        "-p1",
+        "--port=1",
+        # a connection keyword, should the script ever format a connection string
+        "1 host=elsewhere",
+        "1 hostaddr=192.0.2.1",
+        "1 port=2",
+        "1 service = other",
+    ],
+)
+def test_command_refuses_port_text_that_reads_as_a_host_or_port_setting(sockdir, port):
+    with pytest.raises(UnsafeInvocation):
+        ffharness.ff_command(sockdir, port, [])
+
+
+@NUMBER_OR_TEXT
 @pytest.mark.parametrize(
     "args",
     [
@@ -81,9 +141,9 @@ def test_command_refuses_a_missing_or_default_port(sockdir, port):
         ["-d", "somedb service = other"],
     ],
 )
-def test_command_refuses_arguments_that_redirect_the_script(sockdir, args):
+def test_command_refuses_arguments_that_redirect_the_script(sockdir, args, port):
     with pytest.raises(UnsafeInvocation):
-        ffharness.ff_command(sockdir, PORT, args)
+        ffharness.ff_command(sockdir, port, args)
 
 
 def test_command_allows_the_other_options(sockdir):
