@@ -741,6 +741,13 @@ if args.logfile:
 # database that refuses connections (template0, and any other marked so)
 # could only ever be reported as skipped, on every run, and a template is
 # by its flag not a database that holds the cluster's data.
+#
+# The order is the script's own only here: the databases closest to
+# wraparound come first, since a run with a time limit may not reach the
+# last ones.  A database has two horizons, and either can force the
+# anti-wraparound work, so the order goes by the greater of its transaction
+# ID age and its MultiXact age, the measure the tables are selected by
+# (FREEZE_AGE_SQL).  A list given with -d is worked through as written.
 if args.dblist is None:
     conn = None
     try:
@@ -772,7 +779,7 @@ if args.dblist is None:
         execute(cur, "SET lock_timeout = '{0}s'".format(args.lock_timeout))
         execute(cur, """SELECT datname FROM pg_database
             WHERE datallowconn AND NOT datistemplate
-            ORDER BY age(datfrozenxid) DESC""")
+            ORDER BY greatest(age(datfrozenxid), mxid_age(datminmxid)) DESC""")
         for row in cur:
             dblist.append(row[0])
     except Exception as ex:

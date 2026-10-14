@@ -284,11 +284,12 @@ def test_database_list_that_cannot_be_fetched_is_fatal(cluster, db, run_ff, tmp_
     # the undecodable name's bytes unconverted, and the driver fails to
     # decode that row when the script iterates over the cursor.
     #
-    # That database is copied from one that was just frozen, so its
-    # datfrozenxid is younger than that of a copy of template0 and the
-    # script's ORDER BY age(datfrozenxid) DESC puts at least one good row
-    # before it.  The loop has therefore run before it fails, which is the
-    # case in which the loop variable must not be the name the message uses.
+    # That database is copied from one that was just frozen, so both of its
+    # horizons, datfrozenxid and datminmxid, are younger than those of a
+    # copy of template0, and the script's order, oldest first by the greater
+    # of the two ages, puts at least one good row before it.  The loop has
+    # therefore run before it fails, which is the case in which the loop
+    # variable must not be the name the message uses.
     logfile = tmp_path / "ff.log"
     db.create_table("t1")
     db.execute("VACUUM (FREEZE)")
@@ -304,9 +305,11 @@ def test_database_list_that_cannot_be_fetched_is_fatal(cluster, db, run_ff, tmp_
                 + db.name.encode()
             )
             try:
-                # The premise: a database that can be listed is older.
+                # The premise: a database that can be listed is older, by
+                # the age the script orders its list by.
                 cur.execute(
-                    "SELECT datname::text::bytea = %s, age(datfrozenxid) "
+                    "SELECT datname::text::bytea = %s, "
+                    "greatest(age(datfrozenxid), mxid_age(datminmxid)) "
                     "FROM pg_database WHERE datallowconn AND NOT datistemplate",
                     (UNDECODABLE_NAME,),
                 )
