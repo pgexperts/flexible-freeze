@@ -1050,8 +1050,8 @@ def test_statement_log_leaves_out_the_drivers_session_setup(db, run_ff):
     )
 
 
-# start_ff(ignore_sighup=True) makes the test process ignore SIGHUP for as
-# long as it takes to start the script.  Under a pytest that was itself
+# start_ff(ignore_signals=(signal.SIGHUP,)) makes the test process ignore
+# SIGHUP for as long as it takes to start the script.  Under a pytest that was itself
 # started with the signal ignored (nohup pytest) there is nothing for it to
 # put back, and so nothing to observe.
 SIGHUP_NOT_IGNORED_HERE = pytest.mark.skipif(
@@ -1067,7 +1067,7 @@ def test_start_with_sighup_ignored_puts_the_test_process_back(db, start_ff):
     before = signal.getsignal(signal.SIGHUP)
     assert before is not signal.SIG_IGN
 
-    proc = start_ff(*FREEZE_ALL, "-d", db.name, ignore_sighup=True)
+    proc = start_ff(*FREEZE_ALL, "-d", db.name, ignore_signals=(signal.SIGHUP,))
 
     assert signal.getsignal(signal.SIGHUP) is before
     assert proc.wait(timeout=ffharness.RUN_TIMEOUT) == 0
@@ -1087,7 +1087,7 @@ def test_start_with_sighup_ignored_still_refuses_another_target(start_ff, args, 
     assert before is not signal.SIG_IGN
 
     with pytest.raises(UnsafeInvocation):
-        start_ff(*args, env=env, ignore_sighup=True)
+        start_ff(*args, env=env, ignore_signals=(signal.SIGHUP,))
 
     assert signal.getsignal(signal.SIGHUP) is before
 

@@ -152,7 +152,7 @@ If the name belongs to a partitioned table, a foreign table or a view, and to no
 
 `flexible_freeze` runs every session with an empty `search_path`, as `vacuumdb` does, so table names in its output are schema-qualified (`public.orders`).  The one exception is a table in `pg_catalog`, which can only come up when `--table` names it or `--system-catalogs` is given: PostgreSQL searches that schema whatever the `search_path`, so such a table is printed, and vacuumed, by its bare name (`pg_statistic`).  On PostgreSQL 16 and earlier, this means the ANALYZE of a table with an expression index can fail if the index's function depends on `search_path`; give such functions an explicit `SET search_path`, or schema-qualify the names they use.
 
-Connection settings other than host, port, user and password are taken from the standard libpq environment variables (`PGSSLMODE`, `PGSERVICE`, `PGCONNECT_TIMEOUT` and so on).  The `-H`, `-U`, `-p`, `-w` and `-d` values are passed to the server as given; they cannot carry additional connection options.  The connection timeout (`PGCONNECT_TIMEOUT`, or `connect_timeout` in a service file) limits each connection attempt as a whole: if `-H` lists several hosts, a host that does not answer uses up the timeout instead of being passed over for the next one.
+Connection settings other than host, port, user and password are taken from the standard libpq environment variables (`PGSSLMODE`, `PGSERVICE`, `PGCONNECT_TIMEOUT` and so on).  The `-H`, `-U`, `-p`, `-w` and `-d` values are passed to the server as given; they cannot carry additional connection options.  The connection timeout (`PGCONNECT_TIMEOUT`, or `connect_timeout` in a service file) limits each connection attempt as a whole: if `-H` lists several hosts, a host that does not answer uses up the timeout instead of being passed over for the next one.  It must be a whole number of seconds (a negative one means no timeout), as for any libpq program; a value such as `10s` ends the run at the first connection with one message and exit status 2.
 
 `-p` takes one port, or a comma-separated list of ports to go with a `-H` that lists several hosts (`-H db1,db2 -p 5432,6432`).  Each port must be a whole number from 1 to 65535.  An empty value, or an empty entry in the list (`5432,`), is an error in the command line (exit status 2); it is never read as the default port, so an unset variable in `-p "$PORT"` cannot send the run to the default server.  The value is passed to libpq as written, and it is libpq that matches the ports to the hosts when it connects: it takes one port for all the hosts or one port for each, and with a list of any other length every connection fails.
 
@@ -186,7 +186,8 @@ Exit status:
         or left unfinished, or --table matched no table in any database; also
         when the run could not start (no databases, database list or logfile
         unavailable)
-    2   invalid command-line arguments
+    2   invalid command-line arguments, or a connect_timeout that is not a
+        whole number of seconds
     129 stopped by SIGHUP
     130 stopped by SIGINT (CTRL-C)
     143 stopped by SIGTERM
@@ -197,7 +198,7 @@ libpq's `PGPASSWORD`, `~/.pgpass` and `PGSERVICE` are honoured, so `-w` is not n
 
 CTRL-C (SIGINT) stops a run, and so do SIGTERM, which is what cron, systemd and `kill` send, and SIGHUP, which is what a run gets when the terminal or the ssh session it was started from goes away.  `flexible_freeze` cancels the vacuum in progress on the server, starts no further table or database, and prints its usual summary, which says that the run was interrupted and names the table whose vacuum was cut short.  That table is not counted as failed; as with a vacuum cancelled by `--enforce-time`, the table's `relfrozenxid` is not advanced (pages already frozen stay frozen) and it will be selected again on the next run.  A signal is also acted on while `flexible_freeze` is connecting, listing databases or tables, or pausing between vacuums.
 
-The one exception is a SIGHUP that was already being ignored when `flexible_freeze` started, which is how `nohup` runs a command: it stays ignored, and a hangup does not stop that run.  SIGINT and SIGTERM stop it as usual.
+The one exception is a SIGHUP or SIGINT that was already being ignored when `flexible_freeze` started: it stays ignored, and does not stop that run.  A SIGHUP is ignored in this way by `nohup`, and a SIGINT by the shell for a background job (`command &`) in a script or other non-interactive shell.  SIGTERM always stops the run, and so does whichever of SIGINT and SIGHUP was not ignored.
 
 After a signal `flexible_freeze` waits for the server to confirm that the vacuum was cancelled.  If that does not come (the server is not responding, or something between the two drops the cancel request), a second signal ends the wait; so does a cancel request that cannot be delivered at all.  The summary then says that the vacuum was not confirmed cancelled and may still be running on the server; check `pg_stat_activity`.  SIGKILL cannot be handled: it ends `flexible_freeze` at once, and the vacuum it was running carries on in the server until it is done.
 

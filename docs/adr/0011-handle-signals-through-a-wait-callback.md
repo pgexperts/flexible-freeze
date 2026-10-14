@@ -80,3 +80,25 @@ Declined in the same issue, and so still consequences of this record:
   callback, so a signal is not acted on until they return. Fixing it would need
   a thread or a non-blocking resolver, and this record rejected a worker
   thread.
+
+## Addendum (2026-10-13)
+
+SIGINT now respects an inherited ignore, as SIGHUP does (issue #97). A
+background job of a non-interactive shell (`cmd &` in a script) is started with
+SIGINT ignored, and CPython leaves an inherited ignore in place, so registering
+the handler unconditionally replaced the caller's protection and let a Ctrl-C
+meant for something else stop the run. The handler is now registered for SIGINT
+only when it is not already `SIG_IGN`. SIGTERM deliberately keeps the
+unconditional registration: an inherited ignore of it is rare, and the
+operator's kill must always stop the run. The harness's `start_ff` takes
+`ignore_signals=(...)` in place of `ignore_sighup=True`.
+
+The wait callback's replacement of `connect_timeout` also checks the value,
+which libpq no longer does under the callback. A value libpq would refuse
+(`10s`, `10.5`, an empty one, one outside the range of a C int) used to reach a
+bare `int()` and be reported as a connection failure of every database. It now
+ends the run at the first connection with one message and exit status 2, the
+status of a bad argument; the value can come from a service file, so it cannot
+be checked at parse time (record 0021). What libpq accepts is accepted: an
+optional sign and ASCII digits with white space around them, a negative value
+meaning no timeout.
