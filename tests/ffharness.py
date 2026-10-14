@@ -13,9 +13,11 @@
 #
 # * Run without -H/-p the script connects to whatever libpq finds by default
 #   and VACUUM FREEZEs every database there.  Every launch goes through
-#   ff_command()/child_env(), which pin host and port to the throwaway cluster
-#   and strip every PG* variable, and which raise UnsafeInvocation rather than
-#   build a command that could reach another server.
+#   ff_command()/child_env(), which pin the host to the throwaway cluster's
+#   socket directory, always supply a port, and strip every PG* variable, and
+#   which raise UnsafeInvocation rather than build a command that could reach
+#   another server.  The host is what confines a run; the port may be a
+#   test's own text (see ff_command).
 #
 # * The cluster listens on a unix socket only, in a private temporary
 #   directory, so its port number never competes with anything else on the
@@ -48,7 +50,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "flexible_freeze.py"
 
 # The port a developer's real server is most likely to use.  The harness
-# refuses to start a cluster on it or to aim the script at it.
+# refuses to start a cluster on it or to choose it as the script's port.  (A
+# test's own port text may say 5432: see ff_command for why that is safe.)
 FORBIDDEN_PORT = 5432
 
 # Only names the socket file inside the private directory; nothing listens on
@@ -302,8 +305,8 @@ def assert_lines_in_order(text, expected):
 # -- launching the script ---------------------------------------------------
 
 
-def check_target(host, port):
-    """Validate a (socket directory, port) pair and return it normalised.
+def check_host(host):
+    """Validate the script's -H value and return it as a string.
 
     The host must be a directory the harness created for its own cluster,
     recognised by the marker file.  That rules out a host name, an empty
@@ -320,13 +323,25 @@ def check_target(host, port):
             f"refusing to target host {host!r}: it is not the throwaway "
             "cluster's socket directory"
         )
+    return host
+
+
+def check_target(host, port):
+    """Validate a (socket directory, port number) pair and return it
+    normalised.
+
+    This is the check for a port the harness chose itself: the cluster's
+    own, or a SilentServer's beside it.  The host is checked by check_host;
+    the port must be a positive number other than FORBIDDEN_PORT.
+    """
+    host = check_host(host)
     try:
         port = int(port)
     except (TypeError, ValueError):
         raise UnsafeInvocation(f"refusing to target port {port!r}") from None
     if port <= 0 or port == FORBIDDEN_PORT:
         raise UnsafeInvocation(f"refusing to target port {port!r}")
-    return str(host), port
+    return host, port
 
 
 def child_env(extra=None):
@@ -360,8 +375,45 @@ def ff_command(host, port, args):
     driver as a parameter of its own, which makes them harmless, but the
     trailing -H could not override one if the script ever built a connection
     string out of them (see _DSN_REDIRECT).
+
+    `port` is a number or a string, and the two are treated differently.
+
+    A number is a port the harness chose (the cluster's, a SilentServer's)
+    and is checked as before, by check_target.
+
+    A string is a test's own text for the script's -p, and is handed over
+    exactly as given: a port list, an empty value, something that is no
+    port at all.  That is how the script's own checking of -p is tested.
+    It cannot take a run to another server, because the host stays pinned
+    (check_host) to the throwaway cluster's private socket directory and
+    libpq uses the port only to choose a socket in that directory,
+    "<host>/.s.PGSQL.<number>": it reads the value as an integer and
+    refuses one that is not, so text such as "../x" names no other path;
+    an empty value means libpq's built-in default number, still in that
+    directory; and a list of several ports against the one host is refused
+    before any attempt.  Nothing but this cluster and its SilentServers
+    listens there.  PGHOSTADDR, PGSERVICE and the rest, which could send a
+    connection elsewhere whatever the host, never reach the script
+    (child_env).
+
+    Two kinds of port text are still refused, by the patterns applied to
+    every other argument.  Text that argparse would read as a host or port
+    option ("-Hx", "--host=x") would be a caller-supplied -H in all but
+    name; as it happens the script would stop on it, -p being left without
+    a value.  And text carrying a host or port connection keyword
+    ("1 host=x") is inert only while the script passes the port as a
+    parameter of its own, which is what _DSN_REDIRECT is there not to rely
+    on.  Everything about the host is refused as it always was.
     """
-    host, port = check_target(host, port)
+    if isinstance(port, str):
+        host = check_host(host)
+        if _TARGET_OPTION.match(port) or _DSN_REDIRECT.search(port):
+            raise UnsafeInvocation(
+                f"refusing port text {port!r}: it reads as a host or port "
+                "option or connection keyword"
+            )
+    else:
+        host, port = check_target(host, port)
     for arg in args:
         if not isinstance(arg, str):
             raise TypeError(f"script arguments must be strings, got {arg!r}")
@@ -1046,11 +1098,13 @@ class Cluster:
     def start_ff(self, *args, env=None, cwd=None, port=None, ignore_sighup=False):
         """Start the script against this cluster; returns a Popen.
 
-        `port` is for a SilentServer in this cluster's socket directory.
+        `port` is a SilentServer's port number in this cluster's socket
+        directory, or a string to hand to the script's -p as it is (see
+        ff_command); without it the script gets this cluster's own port.
         `ignore_sighup`: see the module-level start_ff.
         """
         return start_ff(
-            self.sockdir, port or self.port, *args, env=env, cwd=cwd,
+            self.sockdir, self._script_port(port), *args, env=env, cwd=cwd,
             ignore_sighup=ignore_sighup,
         )
 
@@ -1058,12 +1112,19 @@ class Cluster:
                merge_streams=False):
         """Run the script against this cluster; returns a CompletedProcess.
 
-        `merge_streams`: see the module-level start_ff.
+        `port`: see start_ff.  `merge_streams`: see the module-level
+        start_ff.
         """
         return run_ff(
-            self.sockdir, port or self.port, *args, env=env, cwd=cwd, timeout=timeout,
-            merge_streams=merge_streams,
+            self.sockdir, self._script_port(port), *args, env=env, cwd=cwd,
+            timeout=timeout, merge_streams=merge_streams,
         )
+
+    def _script_port(self, port):
+        # Tested against None and not for truth: an empty string is a value
+        # a test passes on purpose, and must not turn into this cluster's
+        # port on the way.
+        return self.port if port is None else port
 
     def silent_server(self):
         """A SilentServer beside this cluster's socket; the caller closes it."""

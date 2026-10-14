@@ -235,8 +235,11 @@ def run_ff(cluster):
     merge_streams=False) -> CompletedProcess.
 
     Runs the script against the throwaway cluster with text stdout/stderr.
-    `port` is only for a silent_server.  `merge_streams=True` captures both
-    streams on stdout, in the order they were written (stderr is then None).
+    `port` is a silent_server's port number, or a string that becomes the
+    script's -p value as it is (a port list, an invalid port); the host is
+    the cluster's socket directory either way.  `merge_streams=True`
+    captures both streams on stdout, in the order they were written (stderr
+    is then None).
     """
     return cluster.run_ff
 
@@ -270,7 +273,7 @@ def silent_server(cluster):
 def start_ff(cluster):
     """start_ff(*args, env=None, cwd=None, port=None, ignore_sighup=False)
     -> Popen, for tests that must act while the script is running.  Anything
-    still alive is killed afterwards.  `port` is only for a silent_server;
+    still alive is killed afterwards.  `port`: as for run_ff;
     `ignore_sighup=True` starts the script the way `nohup` does."""
     started = []
 

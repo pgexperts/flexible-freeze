@@ -4,9 +4,10 @@
 # exit status 2, a message on stderr, nothing on stdout, no traceback, and no
 # connection to the server.
 #
-# The port option cannot be given a bad value here: the harness supplies -p
-# itself and refuses any argument that names a port, so its type is observed
-# through the argument dump of --debug instead.
+# The harness supplies -H and -p itself and refuses any argument that names a
+# host or a port.  A -p value is tested through the launcher's port keyword
+# instead: a string given there becomes the script's -p value as it is, with
+# the host still the throwaway cluster's socket directory.
 #
 # The tests for rejected values give no -d on purpose.  A value that slipped
 # through would then make the script connect and list the databases, which is
@@ -149,6 +150,14 @@ def test_zero_costlimit_is_rejected_before_connecting(cluster, run_ff):
     assert "argument --costlimit: must be at least 1: '0'" in result.stderr
 
 
+def test_costlimit_of_one_is_accepted(run_ff):
+    # The smallest value the server takes; 0 is the first one refused.
+    result = run_ff("--costlimit", "1", "-d", NO_SUCH_DB)
+
+    assert f"skipping database {NO_SUCH_DB} (couldn't connect: " in result.stderr
+    assert "usage:" not in result.stderr
+
+
 def test_non_integer_value_keeps_the_usual_argparse_message(cluster, run_ff):
     mark = cluster.log_offset()
 
@@ -164,16 +173,156 @@ def test_non_integer_value_keeps_the_usual_argparse_message(cluster, run_ff):
 # between Python versions, so each field is looked for on its own.
 
 
-def test_port_is_parsed_as_an_integer(cluster, run_ff):
+def test_port_is_kept_as_the_string_given(cluster, run_ff):
+    # The value goes to libpq as text, so that it can be a list (see below);
+    # it is not turned into a number on the way.
     result = run_ff("--debug", "-d", NO_SUCH_DB)
 
-    assert re.search(rf"\bdbport={cluster.port}\b", result.stderr)
+    assert re.search(rf"\bdbport='{cluster.port}'", result.stderr)
 
 
 def test_table_option_defaults_to_none(run_ff):
     result = run_ff("--debug", "-d", NO_SUCH_DB)
 
     assert re.search(r"\btable=None\b", result.stderr)
+
+
+# -- -p / --port --------------------------------------------------------------
+#
+# One port, or a comma-separated list of them for a -H that lists several
+# hosts; each a decimal integer from 1 to 65535.  The script checks that much
+# and passes the text on untouched.  Whether the number of ports fits the
+# number of hosts is libpq's to say, when it connects.
+
+
+def test_single_port_reaches_the_server(db, cluster, run_ff):
+    db.create_table("t")
+    before = db.frozenxids()
+
+    result = run_ff(*FREEZE_ALL, "-d", db.name, port=str(cluster.port))
+
+    assert result.returncode == 0
+    assert db.frozen_since(before) == {T}
+
+
+def test_port_text_is_passed_on_without_being_normalised(db, cluster, run_ff):
+    # A leading zero would not survive a conversion to a number and back.
+    # libpq reads the text as the cluster's port all the same.
+    port = f"0{cluster.port}"
+    db.create_table("t")
+    before = db.frozenxids()
+
+    result = run_ff(*FREEZE_ALL, "--debug", "-d", db.name, port=port)
+
+    assert result.returncode == 0
+    assert re.search(rf"\bdbport='{port}'", result.stderr)
+    assert db.frozen_since(before) == {T}
+
+
+def test_port_list_is_accepted_and_passed_on_unchanged(cluster, run_ff):
+    # Only the parser's part is checked.  The harness gives the script one
+    # host, and libpq will not connect with two ports for one host; that
+    # refusal comes after parsing, as a database that could not be connected
+    # to, and its wording is libpq's own.
+    ports = f"{cluster.port},{cluster.port}"
+
+    result = run_ff("--debug", "-d", NO_SUCH_DB, port=ports)
+
+    assert result.returncode != 2
+    assert "usage:" not in result.stderr
+    assert re.search(rf"\bdbport='{ports}'", result.stderr)
+    assert f"skipping database {NO_SUCH_DB} (couldn't connect: " in result.stderr
+
+
+@pytest.mark.parametrize("port", ["1", "65535", "1,65535"])
+def test_port_at_either_end_of_the_range_is_accepted(run_ff, port):
+    # Nothing listens on these in the cluster's socket directory, so the run
+    # gets no further than the parser and a failed connection.
+    result = run_ff("-d", NO_SUCH_DB, port=port)
+
+    assert f"skipping database {NO_SUCH_DB} (couldn't connect: " in result.stderr
+    assert "usage:" not in result.stderr
+
+
+def test_empty_port_is_rejected_before_connecting(cluster, run_ff):
+    # It must not be read as "no -p given": an unset variable in
+    # `-p "$PORT"` would then send the run to the default server.
+    mark = cluster.log_offset()
+
+    result = run_ff(port="")
+
+    assert_rejected(result, cluster, mark)
+    assert "argument -p/--port: must name a port: ''" in result.stderr
+
+
+@pytest.mark.parametrize("port", ["6543,", ",6543", "6543,,6544", ","])
+def test_empty_entry_in_a_port_list_is_rejected(cluster, run_ff, port):
+    mark = cluster.log_offset()
+
+    result = run_ff(port=port)
+
+    assert_rejected(result, cluster, mark)
+    assert f"argument -p/--port: empty entry in the port list: '{port}'" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "port, entry",
+    [
+        ("old", "old"),
+        ("6543,old", "old"),
+        ("6543x", "6543x"),
+        ("6543.0", "6543.0"),
+        ("0x1538", "0x1538"),
+        # Forms that Python's int() takes; libpq does not take the first.
+        ("6_543", "6_543"),
+        (" 6543", " 6543"),
+        ("6543, 6544", " 6544"),
+        (" ", " "),
+    ],
+)
+def test_port_that_is_not_an_integer_is_rejected(cluster, run_ff, port, entry):
+    mark = cluster.log_offset()
+
+    result = run_ff(port=port)
+
+    assert_rejected(result, cluster, mark)
+    assert f"argument -p/--port: invalid int value: {entry!r}" in result.stderr
+
+
+def test_port_in_digits_that_are_not_ascii_is_rejected(cluster, run_ff):
+    # Fullwidth digits: int() reads them as 6543 and libpq does not.  The
+    # value is left out of the comparison because how it is echoed depends
+    # on the encoding of the script's stderr.
+    mark = cluster.log_offset()
+
+    result = run_ff(port="".join(chr(0xFF10 + int(digit)) for digit in "6543"))
+
+    assert_rejected(result, cluster, mark)
+    assert "argument -p/--port: invalid int value: " in result.stderr
+
+
+@pytest.mark.parametrize(
+    "port, entry",
+    [
+        ("0", "0"),
+        ("-1", "-1"),
+        ("65536", "65536"),
+        ("6543,0", "0"),
+        ("65536,6543", "65536"),
+        ("00000", "00000"),
+        # longer than Python's int() will convert at all
+        ("9" * 5000, "9" * 5000),
+    ],
+    ids=["zero", "negative", "too-large", "zero-in-list", "too-large-in-list",
+         "zeros", "enormous"],
+)
+def test_port_out_of_range_is_rejected(cluster, run_ff, port, entry):
+    mark = cluster.log_offset()
+
+    result = run_ff(port=port)
+
+    assert_rejected(result, cluster, mark)
+    assert f"argument -p/--port: must be from 1 to 65535: {entry!r}" in result.stderr
 
 
 # -- --table / -st ------------------------------------------------------------
