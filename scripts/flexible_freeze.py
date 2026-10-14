@@ -147,6 +147,11 @@ parser.add_argument("--pause", dest="pause_time", type=non_negative_int, default
 parser.add_argument("--freezeage", dest="freezeage",
                     type=non_negative_int, default=10000000,
                     help="freeze tables older than this many XIDs.  A table's age is the greatest of its transaction ID age and its MultiXact ID age, and those of its TOAST table; a table whose age is exactly this is not selected.  Default 10m XIDs.  Ignored with --no-freeze")
+# Opt-in, so that the default selection stays what it was.  What it widens is
+# described at the freeze selection in the database loop; its one
+# restriction is checked after parsing, below.
+parser.add_argument("--system-catalogs", dest="system_catalogs", action="store_true",
+                    help="Also freeze the system catalogs (the tables in pg_catalog and information_schema), selected by age like any other table; by default they are left to autovacuum.  Not allowed with --no-freeze.  Needs a role that may vacuum them, normally a superuser")
 parser.add_argument("--costdelay", dest="costdelay", 
                     type=non_negative_int, default = 20,
                     help="vacuum_cost_delay setting in ms.  Default 20")
@@ -538,8 +543,8 @@ FREEZE_AGE_SQL = """greatest(age(pg_class.relfrozenxid), mxid_age(pg_class.relmi
 # The temporary schemas are left out of both queries because they hold
 # other sessions' relations (this one creates none); the server passes over
 # such a table without saying so.  The system schemas are not left out,
-# unlike in the two selections: a catalog named outright is vacuumed like
-# any table.
+# unlike in the two selections (the freeze selection takes them only with
+# --system-catalogs): a catalog named outright is vacuumed like any table.
 #
 # The name travels as a query parameter and never as text pasted into the
 # statement.  psycopg2 %-formats a statement that has parameters, hence the
@@ -722,6 +727,17 @@ if args.dblist is not None:
     if not named_dblist:
         print("invalid argument '{arg}' to flag --databases: argument must name at least one database".format(arg=args.dblist), file=sys.stderr)
         sys.exit(2)
+
+# --system-catalogs widens the freeze selection and nothing else.  The
+# --no-freeze selection reads pg_stat_user_tables, which has no row for a
+# system catalog, so the option could do nothing there; accepted in silence
+# it would read as "the catalogs too" on a run that never looks at one.
+# (--vacuum sets the same skip_freeze.)  With --table it is accepted and
+# idle: that run does not use a selection, and --table reaches a catalog
+# by name as it is.
+if args.system_catalogs and args.skip_freeze:
+    print("invalid combination of flags --system-catalogs and --no-freeze: system catalogs are selected only when freezing", file=sys.stderr)
+    sys.exit(2)
 
 # set times
 halt_time = time.time() + ( args.run_min * 60 )
@@ -932,6 +948,27 @@ for db in dblist:
     # There is no LIMIT.  The time window is what bounds a run; a cap on the
     # list ended a run that still had time, with the tables past the cap
     # never mentioned.
+    #
+    # Which schemas: every one except the temporary schemas and, unless
+    # --system-catalogs is given, pg_catalog and information_schema.  By
+    # default, then, the system catalogs are left to autovacuum (ADR 0012).
+    # With the option that one condition is replaced by "true" and nothing
+    # else changes, so a catalog is held to the same age and size
+    # thresholds, the same order and the same exclusions as any table.  No
+    # privilege is checked: a role that may not vacuum a catalog gets the
+    # server's WARNING for it, which is reported like any other table the
+    # server declined (see the check on conn.notices).  Without the option
+    # the statement is, byte for byte, what it was before the option
+    # existed.
+    #
+    # A shared catalog (pg_database, pg_authid) is selected in every
+    # database it is old in, and has to be: its relfrozenxid is kept in each
+    # database's own pg_class, and a VACUUM moves only the copy in the
+    # database it ran in.
+        if args.system_catalogs:
+            system_schema_filter = "true"
+        else:
+            system_schema_filter = "nspname not in ('pg_catalog', 'information_schema')"
         tabquery = """WITH tabfreeze AS (
                 SELECT pg_class.oid::regclass AS full_table_name,
                 nspname, pg_class.relname,
@@ -940,7 +977,7 @@ for db in dblist:
             FROM pg_class JOIN pg_namespace ON pg_class.relnamespace = pg_namespace.oid
                 LEFT OUTER JOIN pg_class as toast
                     ON pg_class.reltoastrelid = toast.oid
-            WHERE nspname not in ('pg_catalog', 'information_schema')
+            WHERE {3}
                 AND nspname NOT LIKE 'pg_temp%'
                 AND pg_class.relkind IN ('r', 'm')
             )
@@ -949,7 +986,8 @@ for db in dblist:
             WHERE freeze_age > {0}
             AND table_bytes >= {1} * 2 ^ 20
             ORDER BY freeze_age DESC, table_bytes DESC""".format(
-                args.freezeage, args.minsizemb, FREEZE_AGE_SQL)
+                args.freezeage, args.minsizemb, FREEZE_AGE_SQL,
+                system_schema_filter)
 
     # From here on the connection is closed on every way out of this
     # database: the skips below, the end of its table list, a stop at the

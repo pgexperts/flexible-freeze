@@ -11,13 +11,13 @@ registration and the whole run execute at import. It cannot be imported.
 
 | Component | Responsibility | Entry points |
 |---|---|---|
-| Argument parsing | Options, defaults, the per-database exclusion map | module level, `parser`, `args`, `database_table_map` |
+| Argument parsing | Options, defaults, the per-database exclusion map, the checks made after parsing (one of them between two options: `--system-catalogs` with `--no-freeze`) | module level, `parser`, `args`, `database_table_map` |
 | Output | Progress, verbose and debug printing; failure reports, which go to stderr and to the log file; password masking | `_print`, `verbose_print`, `failure_print`, `debug_print`, `stamped`, `log_file`, `args_for_display` |
 | Connection | The only place a connection is made; sets autocommit and an empty `search_path` | `dbconnect` |
 | Statements (ADR 0017) | The only place a statement is sent; appends the `--comment` text, which `comment_text` has vetted at argument parsing | `execute`, `comment_text` |
 | Name matching | Compares a user-supplied table name with a table: in Python for the exclusions, in SQL for `--table` | `table_named_in`, `TABLE_NAME_MATCH_SQL` (in `TABLE_LOOKUP_QUERY` and `TABLE_KIND_QUERY`) |
 | Database list (ADR 0013) | `-d`, in the order given, else every connectable non-template database in `pg_database`, by the greater of XID and MultiXact age, read via the `postgres` database in a session with the run's `lock_timeout`; a failure to connect or to read the list is reported with `failure_print` and ends the run (exit 1) | module level, `dblist` |
-| Table selection (ADR 0012) | Three queries: freeze mode (by the greater of XID and MultiXact age), `--no-freeze` mode (by dead-tuple fraction), and the `--table` lookup, which replaces either; when that lookup finds no table, a second one asks whether the name is a partitioned table, a foreign table or a view, for the message only | module level, `tabquery`, `FREEZE_AGE_SQL`, `TABLE_LOOKUP_QUERY`, `TABLE_KIND_QUERY`, `UNVACUUMABLE_KINDS` |
+| Table selection (ADR 0012) | Three queries: freeze mode (by the greater of XID and MultiXact age; with `--system-catalogs` the system schemas too), `--no-freeze` mode (by dead-tuple fraction), and the `--table` lookup, which replaces either; when that lookup finds no table, a second one asks whether the name is a partitioned table, a foreign table or a view, for the message only | module level, `tabquery`, `system_schema_filter`, `FREEZE_AGE_SQL`, `TABLE_LOOKUP_QUERY`, `TABLE_KIND_QUERY`, `UNVACUUMABLE_KINDS` |
 | Vacuum loop | Exclusions, pause, time check, `statement_timeout`, VACUUM, server messages | module level, `for db in dblist` |
 | Lock handling (ADR 0014, 0015) | `SKIP_LOCKED` on every VACUUM; the session's `lock_timeout` (`--lock-timeout`); one advisory lock per database against overlapping runs (`--no-advisory-lock`) | `ADVISORY_LOCK_KEY`, the session settings and `vacuum_options` in the database loop |
 | Run outcome (ADR 0009) | What was and was not done; the only input to the summary and the exit status | `RunOutcome`, `outcome`, the summary block at the end of the file |
@@ -195,7 +195,8 @@ registration and the whole run execute at import. It cannot be imported.
   index) and anything in another session's temporary schema is said not to
   exist, like a name nothing has.
 - `--table` bypasses the selection: age, size and dead-row thresholds do not
-  apply, and neither does the selections' exclusion of the system schemas.
+  apply, and neither does the selections' exclusion of the system schemas
+  (so `--system-catalogs` adds nothing to it).
   It finds ordinary tables and materialized views outside the temporary
   schemas, and its matches still go through the exclusions.
 - Exit status: 0 complete or stopped at the time limit, 1 work missed (or
@@ -301,6 +302,28 @@ registration and the whole run execute at import. It cannot be imported.
   modes.
 - Both selections leave out `pg_catalog`, `information_schema` and the
   temporary schemas, and neither selects partitioned tables.
+  `--system-catalogs` lifts the first two for the freeze selection, and
+  only that: the condition on those two schemas becomes `true`
+  (`system_schema_filter`) and the rest of the statement is untouched, so
+  thresholds, order and exclusions apply to a catalog as to any table.
+  Without the option the statement is byte for byte what it was before
+  the option existed. The `--no-freeze` selection cannot take catalogs
+  (`pg_stat_user_tables` has none), so the two options together are
+  refused after parsing (exit 2); with `--table` the option is accepted
+  and idle.
+- No privilege is checked for `--system-catalogs`. A role that may not
+  vacuum a catalog draws the server's WARNING for each one, so each is
+  "not vacuumed" (`outcome.unvacuumed_tables`) and the exit status is 1.
+- A shared catalog (`pg_database`, `pg_authid`) has a `relfrozenxid` in
+  every database's `pg_class`, and a VACUUM moves only the one in the
+  database it ran in. With `--system-catalogs` it is therefore selected,
+  and vacuumed, in each database; that is not a duplicate to remove.
+- A `pg_catalog` table's regclass text is its bare name even under the
+  empty `search_path` (`pg_class`, not `pg_catalog.pg_class`), so that is
+  what is printed and vacuumed, and `parse_vacuum` reports it in schema
+  `public`. `Database.frozenxids()` leaves both system schemas out; the
+  catalog tests in `tests/test_selection.py` have their own probes
+  (`system_frozenxids`, `tables_named`).
 - Tests assert on the parsed VACUUM statement (`ffharness.parse_vacuum`), not
   on its literal text. Keep it that way when the statement's spelling
   changes.
@@ -331,7 +354,9 @@ loops break at their next test of `interrupt_signal`, closing the connection
   `COLUMNS=130 python scripts/flexible_freeze.py --help` on Python 3.11 or
   3.12; 3.13 prints each option's value name once, so its output differs).
 - Change which tables are selected: the two `tabquery` strings. Keep the
-  three leading columns. What `--table` can find is `TABLE_LOOKUP_QUERY`;
+  three leading columns. The schemas the freeze selection covers are its
+  `WHERE`, of which `system_schema_filter` is the part `--system-catalogs`
+  switches. What `--table` can find is `TABLE_LOOKUP_QUERY`;
   which other kinds of relation it names in its message instead of "does
   not exist" is `UNVACUUMABLE_KINDS`.
 - Change the order of the databases: the `ORDER BY` of the query that reads

@@ -387,6 +387,39 @@ def test_exclude_table_in_database_rejects_an_empty_schema_part(cluster, run_ff)
     ) in result.stderr
 
 
+# -- --system-catalogs ----------------------------------------------------------
+
+
+@pytest.mark.parametrize("option", ["--no-freeze", "--vacuum"])
+@pytest.mark.parametrize("order", ["before", "after"])
+def test_system_catalogs_is_rejected_with_no_freeze(cluster, run_ff, option, order):
+    # The option widens the freeze selection and nothing else.  Taken
+    # silently with --no-freeze it would read as "the catalogs too" and do
+    # nothing; --vacuum is that option under its older name.
+    arguments = ["--system-catalogs", option]
+    if order == "after":
+        arguments.reverse()
+    mark = cluster.log_offset()
+
+    result = run_ff(*arguments)
+
+    assert_rejected(result, cluster, mark)
+    assert result.stderr == (
+        "invalid combination of flags --system-catalogs and --no-freeze: "
+        "system catalogs are selected only when freezing\n"
+    )
+
+
+def test_system_catalogs_and_no_freeze_are_rejected_with_table_too(cluster, run_ff):
+    # --table makes the option idle, not the combination acceptable.
+    mark = cluster.log_offset()
+
+    result = run_ff("--system-catalogs", "--no-freeze", "--table", "t")
+
+    assert_rejected(result, cluster, mark)
+    assert "invalid combination of flags --system-catalogs and --no-freeze" in result.stderr
+
+
 # -- the script source --------------------------------------------------------
 
 
@@ -422,6 +455,15 @@ def test_help_describes_the_options_as_they_behave(run_ff):
     # --freezeage: strictly older than, and unused with --no-freeze
     assert "freeze tables older than this many XIDs" in text
     assert "Ignored with --no-freeze" in text
+    # --system-catalogs: a flag, what it adds, the default, and its limits
+    assert "[--system-catalogs]" in text
+    assert (
+        "--system-catalogs Also freeze the system catalogs (the tables in "
+        "pg_catalog and information_schema)"
+    ) in text
+    assert "by default they are left to autovacuum" in text
+    assert "Not allowed with --no-freeze" in text
+    assert "normally a superuser" in text
     # the fixed thresholds of --no-freeze
     assert "more than 100 dead rows" in text
     assert "more than 5% of rows dead" in text
