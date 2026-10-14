@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 '''Flexible Freeze script for PostgreSQL databases
-Version 0.6
 (c) 2014, Josh Berkus, Quinn Weaver and PostgreSQL Experts Inc.
 Licensed under the 2-clause BSD License
 
@@ -11,6 +10,9 @@ vacuum freezes and vacuum analyzes, do the freezes first.
 Takes a timeout so that it won't overrun your slow traffic period.
 Note that this is the time to START a vacuum, so a large table
 may still overrun the vacuum period, unless you use the --enforce-time switch.
+
+The version is __version__ below (--version prints it); CHANGELOG.md says what
+changed in each.
 '''
 
 import os
@@ -23,6 +25,11 @@ import argparse
 import psycopg2
 import psycopg2.extensions
 import datetime
+
+# The one place the version is written.  It is kept out of the docstring
+# above so that there is nothing to keep in step with it; the tests spell the
+# expected --version line out, and CHANGELOG.md has a section for each release.
+__version__ = "0.7"
 
 def timestamp():
     now = time.time()
@@ -194,6 +201,11 @@ parser.add_argument("--table", "-st", dest="table", type=non_empty_table,
                   help="only process tables with this name: a bare name matches in every schema, SCHEMA.TABLE only that table.  The table is vacuumed whatever its age, size or dead rows: --freezeage, --minsizemb and the --no-freeze thresholds do not apply to it; exclusions still do.  -st is an older spelling of this option")
 parser.add_argument("-c", "--comment", dest="comment", type=comment_text,
                   help="text to append as a comment, /* COMMENT */, to every statement sent to the server, so that monitoring tools can recognise or ignore what this script runs.  It may not contain /* or */, a NUL or a line break")
+# The program name is spelled out, not taken from %(prog)s, because prog is
+# the file name, "flexible_freeze.py".
+parser.add_argument("--version", action="version",
+                    version="flexible_freeze " + __version__,
+                    help="print the version and exit")
 
 args = parser.parse_args()
 

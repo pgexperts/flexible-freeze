@@ -4,6 +4,15 @@ flexible-freeze
 Flexible freeze scripts for managing off-hours vacuuming and freezing of PostgreSQL databases.
 
 
+Installing
+----------
+
+The script needs Python 3.11 or newer (it checks) and psycopg2 2.9 or later, below 3.  Install the driver with
+
+    pip install -r scripts/requirements.txt
+
+which builds psycopg2 from source and so needs `pg_config` (from your PostgreSQL client development package) and a C compiler.  Where that is impractical, `pip install "psycopg2-binary>=2.9,<3"` installs a prebuilt copy of the same module as a convenience.  The psycopg2 documentation advises the source distribution for production use, because the binary package carries its own libpq and libssl, which upgrading the system's libraries does not update.  Install one of the two, not both.  The test suite uses `psycopg2-binary`; see "Running the tests", below.
+
 /scripts/flexible_freeze.py
 ---------------------------
 
@@ -15,14 +24,12 @@ Requires Python 3.11 or later (the script checks).  The test suite and CI run on
 
 Requires PostgreSQL 12 or later: every `VACUUM` is sent with `SKIP_LOCKED`, which older versions do not have.  CI tests PostgreSQL 14 through 18; versions 12 and 13 are supported but not tested.
 
-Requires psycopg2 2.9 or later, below 3 (`scripts/requirements.txt` names `psycopg2-binary`; `requirements-dev.txt` uses the same range).
-
     usage: flexible_freeze.py [-h] [-m RUN_MIN] [-s MINSIZEMB] [-d DBLIST] [-T TABLES_TO_EXCLUDE]
                               [--exclude-table-in-database EXCLUDE_TABLE_IN_DATABASE] [--no-freeze] [--no-analyze] [--no-truncate]
                               [--vacuum] [--pause PAUSE_TIME] [--freezeage FREEZEAGE] [--system-catalogs] [--costdelay COSTDELAY]
                               [--costlimit COSTLIMIT] [-t] [--enforce-time] [--lock-timeout SECONDS] [--no-advisory-lock]
                               [-l LOGFILE] [-v] [--debug] [-U DBUSER] [-H DBHOST] [-p DBPORT] [-w DBPASS] [--table TABLE]
-                              [-c COMMENT]
+                              [-c COMMENT] [--version]
 
     options:
       -h, --help            show this help message and exit
@@ -90,6 +97,7 @@ Requires psycopg2 2.9 or later, below 3 (`scripts/requirements.txt` names `psyco
       -c COMMENT, --comment COMMENT
                             text to append as a comment, /* COMMENT */, to every statement sent to the server, so that monitoring
                             tools can recognise or ignore what this script runs. It may not contain /* or */, a NUL or a line break
+      --version             print the version and exit
 
 Notes:
 
