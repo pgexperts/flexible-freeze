@@ -10,7 +10,9 @@ pytest>=7.0
 # step.  (The harness alone would do with 2.8, the first release with
 # multi-part sql.Identifier.)
 psycopg2-binary>=2.9,<3
-ruff
+# Pinned: ruff's built-in rule defaults change between releases, so the version
+# and the rule set named in ruff.toml are changed together.
+ruff==0.17.0
 # Optional for running the tests: only used to report the script's line
 # coverage (see .coveragerc).  7.13 is the first release that starts
 # measurement in subprocesses by itself, which is how the script is reached.
