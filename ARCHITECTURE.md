@@ -11,7 +11,7 @@ registration and the whole run execute at import. It cannot be imported.
 
 | Component | Responsibility | Entry points |
 |---|---|---|
-| Argument parsing | Options, defaults, the per-database exclusion map, the checks made after parsing (one of them between two options: `--system-catalogs` with `--no-freeze`) | module level, `parser`, `args`, `database_table_map` |
+| Argument parsing | Options, defaults, the per-database exclusion map, the checks made after parsing (one of them between two options: `--system-catalogs` with `--no-freeze`); `--version`, which argparse answers itself before anything connects | module level, `parser`, `args`, `database_table_map`, `__version__` |
 | Output | Progress, verbose and debug printing; failure reports, which go to stderr and to the log file; password masking | `_print`, `verbose_print`, `failure_print`, `debug_print`, `stamped`, `log_file`, `args_for_display` |
 | Connection | The only place a connection is made; sets autocommit and an empty `search_path` | `dbconnect` |
 | Statements (ADR 0017) | The only place a statement is sent; appends the `--comment` text, which `comment_text` has vetted at argument parsing | `execute`, `comment_text` |
@@ -370,6 +370,15 @@ loops break at their next test of `interrupt_signal`, closing the connection
 
 ## Where to change X
 
+- Release a version: change `__version__` in the script (the one place the
+  number is written), add a section to `CHANGELOG.md`, and change the line
+  `--version` is expected to print in `tests/test_arguments.py`. The owner
+  tags; nothing here does.
+- Change the runtime dependency: `scripts/requirements.txt` (`psycopg2`, built
+  from source) and `requirements-dev.txt` (`psycopg2-binary`, what CI
+  installs) name the same range and are kept in step by hand. The dev file
+  must not `-r` the runtime one: the two packages provide the same module.
+  The README's "Installing" section says the same to operators.
 - Add or change an option: the `parser.add_argument` block; mirror it in the
   usage block of `README.md`, which is a pasted copy of `--help` (regenerate it with
   `COLUMNS=130 python scripts/flexible_freeze.py --help` on Python 3.11 or

@@ -1,10 +1,14 @@
 # Development and CI dependencies: the test suite (tests/) and the linter.
 # Runtime dependencies of the script itself are in scripts/requirements.txt.
 pytest>=7.0
-# The same range as the script's own requirement, so that the tests run on a
-# driver the script may be installed with; this is the only file CI installs.
-# (The harness alone would do with 2.8, the first release with multi-part
-# sql.Identifier.)
+# The script's own runtime requirement is psycopg2, declared in
+# scripts/requirements.txt.  This file names the prebuilt psycopg2-binary
+# instead, so that CI and contributors need neither pg_config nor a compiler;
+# the module is the same.  It is deliberately not "-r scripts/requirements.txt":
+# psycopg2 and psycopg2-binary installed together put the same module in
+# place twice, a known source of breakage.  Keep the two version ranges in
+# step.  (The harness alone would do with 2.8, the first release with
+# multi-part sql.Identifier.)
 psycopg2-binary>=2.9,<3
 ruff
 # Optional for running the tests: only used to report the script's line

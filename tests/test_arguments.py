@@ -461,6 +461,22 @@ def test_script_has_no_statement_that_is_only_a_name():
     assert bare_names == []
 
 
+# -- --version ----------------------------------------------------------------
+
+
+def test_version_prints_the_version_and_exits_before_connecting(cluster, run_ff):
+    # The expected line is spelled out on purpose: a version bump is a
+    # deliberate edit here and in CHANGELOG.md, not something to follow along.
+    mark = cluster.log_offset()
+
+    result = run_ff("--version")
+
+    assert result.returncode == 0
+    assert result.stdout == "flexible_freeze 0.7\n"
+    assert result.stderr == ""
+    assert cluster.statements(since=mark) == []
+
+
 # -- help text ----------------------------------------------------------------
 
 
@@ -502,6 +518,9 @@ def test_help_describes_the_options_as_they_behave(run_ff):
     assert "--comment COMMENT text to append as a comment" in text
     assert "/* COMMENT */, to every statement sent to the server" in text
     assert "It may not contain /* or */, a NUL or a line break" in text
+    # --version: listed, with its help
+    assert "[--version]" in text
+    assert "--version print the version and exit" in text
 
 
 def test_help_gives_text_for_every_option_and_names_the_lock_timeout_value(run_ff):

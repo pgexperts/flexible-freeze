@@ -1,1 +1,5 @@
-psycopg2-binary>=2.9,<3
+# The script's runtime dependency, and the only place it is declared.
+# psycopg2 is built from source, which needs pg_config and a C compiler; it is
+# what the psycopg2 project advises for production.  requirements-dev.txt names
+# psycopg2-binary with the same range: keep the two in step.
+psycopg2>=2.9,<3
