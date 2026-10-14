@@ -367,7 +367,7 @@ registration and the whole run execute at import. It cannot be imported.
   the same condition in the freeze, `--no-freeze` and `--table` queries; it
   is a regex because `_` is a `LIKE` wildcard, which hid a user's `pgxtemp`
   schema (issue #94).
-  `--system-catalogs` lifts the first two for the freeze selection, and
+  `--system-catalogs` lifts the two system schemas for the freeze selection, and
   only that (ADR 0012, addendum): the condition on those two schemas becomes `true`
   (`system_schema_filter`) and the rest of the statement is untouched, so
   thresholds, order and exclusions apply to a catalog as to any table.

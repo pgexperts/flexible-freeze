@@ -1133,6 +1133,26 @@ def test_no_freeze_selects_a_table_in_a_schema_that_only_looks_like_a_temp_one(
     assert targets(db.script_vacuums()) == [(schema, "t")]
 
 
+def test_freeze_leaves_other_sessions_temp_tables_alone(db, run_ff):
+    # The freeze selection reads pg_class, which lists every session's
+    # temporary tables; the regex is what keeps them out, and the lookalike
+    # tests below only show that it keeps a user's schema in.
+    db.create_table("t_keep")
+    owner = db.connect()
+    try:
+        with owner.cursor() as cur:
+            cur.execute("CREATE TEMP TABLE ff_temp (id integer)")
+            cur.execute("INSERT INTO ff_temp VALUES (1)")
+        result = run_ff(*FREEZE_ALL, "-d", db.name)
+    finally:
+        owner.close()
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    names = targets(db.script_vacuums())
+    assert ("public", "t_keep") in names
+    assert not any(name == "ff_temp" for _, name in names), names
+
+
 @pytest.mark.parametrize("schema", LOOKALIKE_SCHEMAS)
 def test_freeze_selects_a_table_in_a_schema_that_only_looks_like_a_temp_one(
     db, run_ff, schema
