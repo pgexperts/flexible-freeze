@@ -16,13 +16,13 @@ registration and the whole run execute at import. It cannot be imported.
 | Connection | The only place a connection is made; sets autocommit and an empty `search_path` | `dbconnect` |
 | Statements (ADR 0017) | The only place a statement is sent; appends the `--comment` text, which `comment_text` has vetted at argument parsing | `execute`, `comment_text` |
 | Name matching | Compares a user-supplied table name with a table: in Python for the exclusions, in SQL for `--table` | `table_named_in`, `TABLE_LOOKUP_QUERY` |
-| Database list (ADR 0013) | `-d`, else every connectable non-template database in `pg_database`, read via the `postgres` database | module level, `dblist` |
+| Database list (ADR 0013) | `-d`, else every connectable non-template database in `pg_database`, read via the `postgres` database in a session with the run's `lock_timeout`; a failure to connect or to read the list is reported with `failure_print` and ends the run (exit 1) | module level, `dblist` |
 | Table selection (ADR 0012) | Three queries: freeze mode (by the greater of XID and MultiXact age), `--no-freeze` mode (by dead-tuple fraction), and the `--table` lookup, which replaces either | module level, `tabquery`, `FREEZE_AGE_SQL`, `TABLE_LOOKUP_QUERY` |
 | Vacuum loop | Exclusions, pause, time check, `statement_timeout`, VACUUM, server messages | module level, `for db in dblist` |
 | Lock handling (ADR 0014, 0015) | `SKIP_LOCKED` on every VACUUM; the session's `lock_timeout` (`--lock-timeout`); one advisory lock per database against overlapping runs (`--no-advisory-lock`) | `ADVISORY_LOCK_KEY`, the session settings and `vacuum_options` in the database loop |
 | Run outcome (ADR 0009) | What was and was not done; the only input to the summary and the exit status | `RunOutcome`, `outcome`, the summary block at the end of the file |
-| Interruption (ADR 0011) | SIGINT and SIGTERM: the handler records the signal; the psycopg2 wait callback cancels the running statement and applies `connect_timeout`; the pause ends early; a second signal stops waiting for the server | `signal_handler`, `interrupt_signal`, `interrupt_repeated`, `wait_for_server`, `pause`, `exit_if_interrupted` |
-| Test harness | Throwaway cluster (and a sweep of clusters a killed session left), the single launcher for the script, catalog and statement-log probes, a clock for the script that tests can move and stop, a probe for the files the script left open at exit, a socket that never answers, a SCRAM role for password tests, per-subprocess coverage (`.coveragerc`) | `tests/ffharness.py`, `tests/conftest.py` |
+| Interruption (ADR 0011) | SIGINT, SIGTERM and SIGHUP (the last only if it was not already ignored when the script started): the handler records the signal; the psycopg2 wait callback cancels the running statement and applies `connect_timeout`; the pause ends early; a second signal stops waiting for the server | `signal_handler`, `interrupt_signal`, `interrupt_repeated`, `wait_for_server`, `pause`, `exit_if_interrupted` |
+| Test harness | Throwaway cluster (and a sweep of clusters a killed session left), the single launcher for the script, catalog and statement-log probes, a clock for the script that tests can move and stop, a probe for the files the script left open at exit, a socket that never answers, a start with SIGHUP ignored (`start_ff(ignore_sighup=True)`), a SCRAM role for password tests, per-subprocess coverage (`.coveragerc`) | `tests/ffharness.py`, `tests/conftest.py` |
 
 ## Invariants
 
@@ -89,7 +89,8 @@ registration and the whole run execute at import. It cannot be imported.
 - **Each session sets `lock_timeout`, before the table list is read and
   whatever the value (0 too).** It is what bounds the listing query, whose
   size functions wait behind an `ACCESS EXCLUSIVE` lock on any candidate,
-  and every lock a VACUUM waits for other than its table's. Breaks: moved
+  and every lock a VACUUM waits for other than its table's. The session
+  that reads the database list sets it too, before that query. Breaks: moved
   after the listing, or left out for 0, the listing waits without limit or
   under a database default the operator asked to override.
 - **`ADVISORY_LOCK_KEY` never changes (ADR 0015), and the lock is taken per database,
@@ -97,6 +98,10 @@ registration and the whole run execute at import. It cannot be imported.
   two copies of the script with different keys do not see each other; a
   transaction-level lock is gone at once under autocommit; a lock taken
   outside that `try` can outlive the database's work.
+- **SIGHUP gets the handler only if it is not already ignored when the
+  script starts** (`signal.getsignal` is not `SIG_IGN`), and only where the
+  platform has the signal. Breaks: registered unconditionally, a run
+  started with `nohup` is stopped by the hangup it was protected from.
 - **The signal handler only assigns `interrupt_signal` and
   `interrupt_repeated`.** It can run between any two bytecodes (ADR 0011).
   Breaks: printing from it can re-enter a print in progress, exiting from it skips the summary, and closing the connection
@@ -140,8 +145,16 @@ registration and the whole run execute at import. It cannot be imported.
 - `SKIP_LOCKED` reports a skipped table with a WARNING, but not a skipped
   TOAST table: the server passes over a locked TOAST table without a
   message and the parent still counts as vacuumed.
-- `lock_timeout` is set per database session, with the cost settings. The
-  connection that reads the database list does not have it.
+- `lock_timeout` is set per database session, with the cost settings, and
+  in the session that reads the database list. A lock timeout there ends
+  the run before it has begun (exit 1); in a database's table listing it
+  skips that database.
+- Reading the database list is all or nothing: a failed connection, a
+  failed `SET lock_timeout`, a failed query or a failed fetch is reported
+  with `failure_print` ("Could not list databases: ...") and exits 1. The
+  query and the fetch share one `try`; the message for both says "query".
+  Nothing there is left to an uncaught exception, whose traceback would
+  reach stderr and not the log file.
 - A failure in the session settings, the advisory-lock call or the listing
   query is reported as "couldn't list its tables" and skips the database;
   the message names only the last.
@@ -157,8 +170,10 @@ registration and the whole run execute at import. It cannot be imported.
   It finds ordinary tables and materialized views outside the temporary
   schemas, and its matches still go through the exclusions.
 - Exit status: 0 complete or stopped at the time limit, 1 work missed (or
-  the run could not start), 2 bad arguments, 130 stopped by SIGINT, 143
-  stopped by SIGTERM (128 + the signal number; these outrank 0 and 1). A
+  the run could not start), 2 bad arguments, 129 stopped by SIGHUP, 130
+  stopped by SIGINT, 143 stopped by SIGTERM (128 + the signal number; these
+  outrank 0 and 1). A SIGHUP that the script inherited as ignored (`nohup`)
+  is not handled and stops nothing. A
   stop at the time limit is 0 on purpose, including a vacuum cancelled by
   `--enforce-time`; that case is told from a failure by the error being a
   query cancel, `--enforce-time` being set, and the deadline having passed.
@@ -225,7 +240,8 @@ registration and the whole run execute at import. It cannot be imported.
 - `interrupt_signal` is copied to `outcome.interrupted_by` once, after the
   loops; the summary and the exit status read only the copy. The steps
   before the loops (the database list) have no summary and call
-  `exit_if_interrupted()` instead.
+  `exit_if_interrupted()` instead, first thing in each `except`, so that a
+  cancel the signal caused is not reported as a failure to list.
 - With a wait callback installed libpq does not apply `connect_timeout`;
   `wait_for_server` does, to the attempt as a whole and not per host.
 - The wait callback is process-wide in psycopg2 and changes how every query
@@ -251,7 +267,7 @@ registration and the whole run execute at import. It cannot be imported.
 ## Flow
 
 Parse arguments → build the database list (`-d`, or `pg_database` ordered by
-`age(datfrozenxid)`) → for each database: `dbconnect` → set cost limits,
+`age(datfrozenxid)`, read after `SET lock_timeout`; a failure there exits 1) → for each database: `dbconnect` → set cost limits,
 `client_min_messages` and `lock_timeout` → take the advisory lock, or skip
 the database if another run holds it → run the selection query, or with
 `--table` the lookup of that name → apply exclusions → for each table: pause
@@ -259,10 +275,10 @@ if a vacuum came before → time check → set `statement_timeout` → VACUUM �
 record the result in `outcome` → close the connection, which releases the
 advisory lock → summary and exit status from `outcome`.
 
-On SIGINT or SIGTERM: the handler records the signal → the wait in progress
+On SIGINT, SIGTERM or SIGHUP: the handler records the signal → the wait in progress
 notices it (`wait_for_server` cancels the statement, `pause` returns) → the
 loops break at their next test of `interrupt_signal`, closing the connection
-→ the same summary, led by the interruption → exit 130 or 143.
+→ the same summary, led by the interruption → exit 130, 143 or 129.
 
 ## Where to change X
 

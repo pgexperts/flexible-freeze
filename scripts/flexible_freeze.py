@@ -317,9 +317,11 @@ def dbconnect(dbname, dbuser, dbhost, dbport, dbpass):
 
     return conn
 
-# Stopping on SIGINT or SIGTERM.
+# Stopping on SIGINT, SIGTERM or SIGHUP.  (Which of them the handler is
+# installed for, and when SIGHUP is left alone, is decided where the handler
+# is registered.)
 #
-# interrupt_signal is the first of the two to arrive, or None.  The handler
+# interrupt_signal is the first of them to arrive, or None.  The handler
 # does nothing but record it, because it can run between any two bytecodes of
 # the script: printing from it can re-enter a print that is in progress,
 # exiting from it skips the summary, and closing the connection from it
@@ -660,10 +662,22 @@ halt_time = time.time() + ( args.run_min * 60 )
 # send; left at its default it ends the process at once, and the VACUUM in
 # progress carries on in the server with nobody waiting for it.  The wait
 # callback goes in before the first connection is made: it is what lets
-# either handler run while the driver waits for the server.
+# the handler run while the driver waits for the server.
+#
+# SIGHUP is what a terminal or an ssh session that goes away sends, and it
+# is treated like SIGTERM for the same reason: its default action too ends
+# the process and leaves the VACUUM running.  There are two cases in which
+# it is not touched.  One is a SIGHUP that is already ignored when the
+# script starts.  That is how nohup runs a command, and it is the caller
+# saying that a hangup must not stop this run; installing a handler would
+# quietly undo it.  (Only "ignored" can be inherited: a handler does not
+# survive the exec that started the script, so what is found here is either
+# that or the default.)  The other is a platform that has no such signal.
 psycopg2.extensions.set_wait_callback(wait_for_server)
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
+if hasattr(signal, "SIGHUP") and signal.getsignal(signal.SIGHUP) is not signal.SIG_IGN:
+    signal.signal(signal.SIGHUP, signal_handler)
 
 # start logging to log file, if used
 #
@@ -705,22 +719,38 @@ if args.dblist is None:
     except Exception as ex:
         # A connection attempt given up on a signal is not a failed one.
         exit_if_interrupted()
-        failure_print("Could not list databases: connection to database {d} failed: {e}".format(d=dbname, e=str(ex)))
+        # The driver's message ends in a line break, which would leave a
+        # blank line after the report.
+        failure_print("Could not list databases: connection to database {d} failed: {e}".format(d=dbname, e=str(ex).rstrip()))
         sys.exit(1)
 
-    cur = conn.cursor()
+    # Reading the list fails as a whole, like the connection above: with no
+    # list there is no run.  The fetch is inside the try with the query,
+    # since the rows arrive over the same connection and it can be lost
+    # there as well.  What must not happen is for such a failure to leave
+    # as an uncaught exception: the traceback goes to standard error alone,
+    # and a run started from cron then ends with nothing in its log file to
+    # say why.
+    dblist = []
     try:
+        cur = conn.cursor()
+        # The same limit on lock waits as in the sessions that vacuum, and
+        # sent in every case, 0 included, for the reason given there (see
+        # the session settings in the database loop).  Without it this
+        # query, which runs before anything else has been done, would wait
+        # behind a lock for as long as its holder cared to keep it.
+        execute(cur, "SET lock_timeout = '{0}s'".format(args.lock_timeout))
         execute(cur, """SELECT datname FROM pg_database
             WHERE datallowconn AND NOT datistemplate
             ORDER BY age(datfrozenxid) DESC""")
-    except Exception:
-        # Only the cancellation an interrupt asked for is dealt with here;
-        # any other failure of this query is left as it was.
+        for row in cur:
+            dblist.append(row[0])
+    except Exception as ex:
+        # The cancellation an interrupt asked for arrives here as an
+        # ordinary error, so the interrupt is tested first.
         exit_if_interrupted()
-        raise
-    dblist = []
-    for dbname in cur:
-        dblist.append(dbname[0])
+        failure_print("Could not list databases: query in database {d} failed: {e}".format(d=dbname, e=str(ex).rstrip()))
+        sys.exit(1)
 
     conn.close()
     # Before the test for an empty list: a signal outranks that exit status.
@@ -767,7 +797,9 @@ for db in dblist:
         # as a skipped database or a failed table, and the run would go on.
         if interrupt_signal is not None:
             break
-        failure_print("skipping database {d} (couldn't connect: {e})".format(d=db, e=str(err)))
+        # rstrip: the driver's message ends in a line break, which would
+        # put the closing parenthesis on a line of its own.
+        failure_print("skipping database {d} (couldn't connect: {e})".format(d=db, e=str(err).rstrip()))
         outcome.skipped_databases.append(db)
         continue
 

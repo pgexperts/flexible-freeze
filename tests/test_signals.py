@@ -1,17 +1,21 @@
-# Tests for stopping a run with a signal.  SIGINT (Ctrl-C) and SIGTERM (cron,
-# systemd, kill) must each, wherever in the run they arrive:
+# Tests for stopping a run with a signal.  SIGINT (Ctrl-C), SIGTERM (cron,
+# systemd, kill) and SIGHUP (a terminal or an ssh session that goes away)
+# must each, wherever in the run they arrive:
 #
 #   * cancel the statement in progress on the server, so that no VACUUM is
 #     left running there with nobody waiting for it;
 #   * start nothing further, in this database or a later one;
 #   * print the usual summary, saying that the run was interrupted, and report
 #     the table that was cut short as interrupted, not as failed;
-#   * exit with status 130 (SIGINT) or 143 (SIGTERM), whatever status the run
-#     would otherwise have ended with.
+#   * exit with status 130 (SIGINT), 143 (SIGTERM) or 129 (SIGHUP), whatever
+#     status the run would otherwise have ended with.
 #
 # A second signal stops the wait for a server that does not confirm the
 # cancellation, and the summary then says that the VACUUM may still be
 # running.
+#
+# SIGHUP has one exception: a run that was started with the signal ignored,
+# which is what nohup does, leaves it ignored and is not stopped by it.
 #
 # How a signal is made to arrive at a known point.  Each test waits for a
 # state it can observe before signalling, never for a length of time:
@@ -48,10 +52,22 @@ from ffharness import FREEZE_ALL, SCRIPT_APP, assert_lines_in_order, wait_for
 # silent server or a long pause for far longer than this.
 PROMPT = 15.0
 
-BOTH_SIGNALS = pytest.mark.parametrize(
+# The script inherits the test process's disposition of SIGHUP, and leaves
+# an ignored one ignored.  So under a pytest that was itself started with
+# the signal ignored (nohup pytest) a SIGHUP cannot stop the script, and the
+# cases that send one have nothing to observe.
+SIGHUP_REACHES_THE_SCRIPT = pytest.mark.skipif(
+    signal.getsignal(signal.SIGHUP) is signal.SIG_IGN,
+    reason="SIGHUP is ignored in this process, and so in the script it starts",
+)
+
+EACH_SIGNAL = pytest.mark.parametrize(
     "signum, status",
-    [(signal.SIGINT, 130), (signal.SIGTERM, 143)],
-    ids=["SIGINT", "SIGTERM"],
+    [
+        pytest.param(signal.SIGINT, 130, id="SIGINT"),
+        pytest.param(signal.SIGTERM, 143, id="SIGTERM"),
+        pytest.param(signal.SIGHUP, 129, id="SIGHUP", marks=SIGHUP_REACHES_THE_SCRIPT),
+    ],
 )
 
 # Blocks everything, the listing query's pg_table_size() included.
@@ -167,7 +183,7 @@ def finish(proc, timeout=PROMPT):
 # -- during a VACUUM ----------------------------------------------------------
 
 
-@BOTH_SIGNALS
+@EACH_SIGNAL
 def test_signal_during_a_vacuum_cancels_it_and_ends_the_run(
     make_db, start_ff, tmp_path, signum, status
 ):
@@ -241,7 +257,7 @@ def test_signal_during_a_vacuum_cancels_it_and_ends_the_run(
     assert f"working on database {two.name}" not in lines
 
 
-@BOTH_SIGNALS
+@EACH_SIGNAL
 def test_interrupt_report_without_verbose(db, start_ff, signum, status):
     db.create_table("t_held")
 
@@ -398,6 +414,55 @@ def test_second_signal_gives_up_on_a_server_that_does_not_answer(db, start_ff):
     assert db.frozen_since(before) == set()
 
 
+def test_sighup_ignored_when_the_run_started_stays_ignored(db, start_ff):
+    # nohup starts a command with SIGHUP ignored, so that it outlives the
+    # terminal it was started from.  The script must not undo that by
+    # installing its handler.
+    #
+    # The signal is sent while the first VACUUM is held up, and the pin is
+    # then let go.  A signal that is ignored is discarded as it is sent, and
+    # one that is not is pending from that moment on, so there is nothing to
+    # wait for in between: a run that had taken any notice of it could not
+    # go on to vacuum both tables and exit with status 0.
+    db.create_table("t_held")
+    db.create_table("t_next")
+    before = db.frozenxids()
+
+    with vacuum_held_up(db, "t_held") as pin:
+        proc = start_ff(*FREEZE_ALL, "-d", db.name, ignore_sighup=True)
+        wait_until_blocked(db)
+        proc.send_signal(signal.SIGHUP)
+        pin.rollback()
+        code, stdout, stderr = finish(proc)
+
+    assert code == 0
+    assert stderr == ""
+    assert stdout == "All tables vacuumed.\n"
+    assert db.frozen_since(before) == {("public", "t_held"), ("public", "t_next")}
+
+
+def test_run_started_with_sighup_ignored_still_stops_on_sigterm(db, start_ff):
+    # Leaving SIGHUP alone must not cost the run its other two signals.
+    db.create_table("t_held")
+    before = db.frozenxids()
+
+    with vacuum_held_up(db, "t_held"):
+        proc = start_ff(*FREEZE_ALL, "-d", db.name, ignore_sighup=True)
+        wait_until_blocked(db)
+        proc.send_signal(signal.SIGHUP)
+        proc.send_signal(signal.SIGTERM)
+        code, stdout, stderr = finish(proc)
+        assert_no_backend_left(db.cluster)
+
+    assert code == 143
+    assert stdout == ""
+    assert stderr.splitlines() == [
+        "Vacuuming interrupted by SIGTERM",
+        f"Work remains: VACUUM of public.t_held in database {db.name} was interrupted.",
+    ]
+    assert db.frozen_since(before) == set()
+
+
 # -- between two statements ---------------------------------------------------
 
 
@@ -450,7 +515,7 @@ def test_signal_while_idle_between_statements_stops_the_next_vacuum(
 # -- during the pause between vacuums -----------------------------------------
 
 
-@BOTH_SIGNALS
+@EACH_SIGNAL
 def test_signal_during_the_pause_ends_the_run(db, start_ff, tmp_path, signum, status):
     # With -v the script logs "processing table ..." and then takes the pause
     # owed since the previous vacuum, so that line for the second table says
@@ -492,7 +557,7 @@ def test_signal_during_the_pause_ends_the_run(db, start_ff, tmp_path, signum, st
 # -- during the table-listing query -------------------------------------------
 
 
-@BOTH_SIGNALS
+@EACH_SIGNAL
 def test_signal_during_the_table_listing_ends_the_run(
     make_db, start_ff, signum, status
 ):
@@ -526,7 +591,7 @@ def test_signal_during_the_table_listing_ends_the_run(
 # -- during a connection attempt ----------------------------------------------
 
 
-@BOTH_SIGNALS
+@EACH_SIGNAL
 def test_signal_while_connecting_to_a_database_ends_the_run(
     start_ff, silent_server, signum, status
 ):
@@ -544,7 +609,7 @@ def test_signal_while_connecting_to_a_database_ends_the_run(
     ]
 
 
-@BOTH_SIGNALS
+@EACH_SIGNAL
 def test_signal_while_connecting_for_the_database_list_ends_the_run(
     start_ff, silent_server, signum, status
 ):

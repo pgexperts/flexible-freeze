@@ -5,7 +5,7 @@
 #     option needs, so a table somebody else has locked is passed over and
 #     reported instead of waited for;
 #   * --lock-timeout bounds every other wait for a lock, the table-listing
-#     query's above all;
+#     query's above all, and the wait of the query that lists the databases;
 #   * a run takes an advisory lock in each database while it works there,
 #     and a second run skips a database it finds taken (--no-advisory-lock
 #     turns that off).
@@ -419,6 +419,63 @@ def test_lock_timeout_of_zero_waits_for_as_long_as_it_takes(db, start_ff):
     assert stderr == ""
     assert stdout == "All tables vacuumed.\n"
     assert db.frozen_since(before) == {("public", "t_locked")}
+
+
+@pytest.mark.parametrize(
+    "flags, seconds",
+    [((), 10), (("--lock-timeout", "45"), 45), (("--lock-timeout", "0"), 0)],
+    ids=["default", "given", "zero"],
+)
+def test_lock_timeout_is_set_before_the_database_list_is_read(
+    cluster, db, run_ff, flags, seconds
+):
+    # Without -d the run begins with a session in the postgres database
+    # that reads the list of databases.  It is the first session of the
+    # run, so the statements up to that query are all its own.
+    db.create_table("t1")
+    mark = cluster.log_offset()
+
+    result = run_ff(*FREEZE_ALL, *flags)
+
+    assert result.returncode == 0
+    statements = [
+        record.sql for record in cluster.statements(dbname="postgres", since=mark)
+    ]
+    listing = next(n for n, sql in enumerate(statements) if "FROM pg_database" in sql)
+    # Zero is sent too, as in the sessions that vacuum.
+    assert statements[:listing] == [
+        "SELECT pg_catalog.set_config('search_path', '', false)",
+        f"SET lock_timeout = '{seconds}s'",
+    ]
+
+
+def test_blocked_database_listing_ends_at_the_lock_timeout(cluster, db, run_ff):
+    # The query that lists the databases waits for a lock too: here one on
+    # pg_statistic, which planning it reads (test_signals.py has the account
+    # of why that catalog).  Without a limit of its own that session would
+    # wait for as long as the lock is held, before the run had begun.  When
+    # the limit ends the wait there is no list and so no run, and that is
+    # reported by the script and not by a traceback.
+    db.create_table("t1")
+    before = db.frozenxids()
+
+    with lock_held(
+        cluster.database("postgres"),
+        "LOCK TABLE pg_catalog.pg_statistic IN ACCESS EXCLUSIVE MODE",
+    ):
+        started = time.monotonic()
+        result = run_ff(*FREEZE_ALL, "--lock-timeout", "2", timeout=PROMPT)
+        elapsed = time.monotonic() - started
+
+    assert result.returncode == 1
+    assert elapsed >= 2
+    assert result.stdout == ""
+    assert result.stderr == (
+        "Could not list databases: query in database postgres failed: "
+        "canceling statement due to lock timeout\n"
+    )
+    assert db.script_statements() == []
+    assert db.frozen_since(before) == set()
 
 
 # -- overlapping runs ---------------------------------------------------------
