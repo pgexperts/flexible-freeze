@@ -137,6 +137,9 @@ _PLAIN_PATH = re.compile(r"[A-Za-z0-9_./+-]+")
 _DRIVER_SETUP = re.compile(r"SET datestyle TO 'ISO'", re.IGNORECASE)
 
 _IDENT = r'(?:"(?:[^"]|"")*"|[A-Za-z_][A-Za-z0-9_$]*)'
+# One entry of a parenthesised option list: a name, alone or followed by one
+# unquoted word as its value.
+_VACUUM_OPTION = re.compile(r"(?P<name>[A-Za-z_]+)(?:\s+(?P<value>[A-Za-z0-9_]+))?")
 _VACUUM = re.compile(
     r"^VACUUM\s+"
     r"(?:\((?P<paren>[^)]*)\)\s*|(?P<words>(?:(?:FULL|FREEZE|VERBOSE|ANALYZE)\s+)*))"
@@ -173,7 +176,9 @@ class VacuumStatement(NamedTuple):
     (keyword or parenthesised options, qualified or bare table name)."""
 
     sql: str
-    options: frozenset  # upper-case, e.g. {"FREEZE", "ANALYZE"}
+    # Names in upper case; an option given a value is "NAME value", with the
+    # value in lower case: {"FREEZE", "ANALYZE", "TRUNCATE false"}.
+    options: frozenset
     schema: str
     table: str
 
@@ -189,8 +194,33 @@ def _unquote_identifier(text):
     return text.lower()
 
 
+def _vacuum_option(text):
+    match = _VACUUM_OPTION.fullmatch(text)
+    if not match:
+        raise HarnessError(f"cannot parse VACUUM option: {text!r}")
+    name = match.group("name").upper()
+    value = match.group("value")
+    return name if value is None else f"{name} {value.lower()}"
+
+
 def parse_vacuum(statement):
     """Parse one single-table VACUUM statement into a VacuumStatement.
+
+    This is an approximate reading of the server's grammar, and covers no
+    more than this: one table, with its options either as keywords before
+    the name (FULL, FREEZE, VERBOSE, ANALYZE) or as a parenthesised list in
+    which each entry is an option name, alone or followed by one unquoted
+    word as its value (`TRUNCATE false`, `PARALLEL 2`).  An empty entry, or
+    an empty list, is passed over, although the server refuses both.
+    Anything else is an error: a quoted value, a value of several words, a
+    column list, a second table.
+
+    An entry with a value is reported as "NAME value", the value in lower
+    case as the server reads a boolean word.  The meaning of a value is not
+    worked out: `TRUNCATE`, `TRUNCATE true` and `TRUNCATE on` ask the server
+    for the same thing and are three different entries here, so a test
+    compares with the spelling the script sends.  Nor is a name checked
+    against the options the server has.
 
     The script's own statements always name the schema: its sessions run
     with an empty search_path, so the regclass text it sends verbatim as the
@@ -204,13 +234,14 @@ def parse_vacuum(statement):
     if not match:
         raise HarnessError(f"cannot parse VACUUM statement: {statement!r}")
     if match.group("paren") is not None:
-        options = [part.strip() for part in match.group("paren").split(",")]
+        parts = [part.strip() for part in match.group("paren").split(",")]
+        options = [_vacuum_option(part) for part in parts if part]
     else:
-        options = match.group("words").split()
+        options = [word.upper() for word in match.group("words").split()]
     schema = match.group("schema")
     return VacuumStatement(
         statement,
-        frozenset(option.upper() for option in options if option),
+        frozenset(options),
         _unquote_identifier(schema) if schema else "public",
         _unquote_identifier(match.group("table")),
     )

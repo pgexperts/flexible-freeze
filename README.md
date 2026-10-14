@@ -18,10 +18,10 @@ Requires PostgreSQL 12 or later: every `VACUUM` is sent with `SKIP_LOCKED`, whic
 Requires psycopg2
 
     usage: flexible_freeze.py [-h] [-m RUN_MIN] [-s MINSIZEMB] [-d DBLIST] [-T TABLES_TO_EXCLUDE]
-                              [--exclude-table-in-database EXCLUDE_TABLE_IN_DATABASE] [--no-freeze] [--no-analyze] [--vacuum]
-                              [--pause PAUSE_TIME] [--freezeage FREEZEAGE] [--costdelay COSTDELAY] [--costlimit COSTLIMIT] [-t]
-                              [--enforce-time] [--lock-timeout LOCK_TIMEOUT] [--no-advisory-lock] [-l LOGFILE] [-v] [--debug]
-                              [-U DBUSER] [-H DBHOST] [-p DBPORT] [-w DBPASS] [--table TABLE]
+                              [--exclude-table-in-database EXCLUDE_TABLE_IN_DATABASE] [--no-freeze] [--no-analyze] [--no-truncate]
+                              [--vacuum] [--pause PAUSE_TIME] [--freezeage FREEZEAGE] [--costdelay COSTDELAY]
+                              [--costlimit COSTLIMIT] [-t] [--enforce-time] [--lock-timeout LOCK_TIMEOUT] [--no-advisory-lock]
+                              [-l LOGFILE] [-v] [--debug] [-U DBUSER] [-H DBHOST] [-p DBPORT] [-w DBPASS] [--table TABLE]
 
     options:
       -h, --help            show this help message and exit
@@ -42,6 +42,8 @@ Requires psycopg2
                             of by age: more than 100 dead rows, more than 5% of rows dead, and not vacuumed (manually or by
                             autovacuum) in the last hour. --freezeage is ignored.
       --no-analyze          Do not do an ANALYZE as part of the VACUUM operation
+      --no-truncate         Do not truncate empty pages off the end of each table as part of the VACUUM operation (VACUUM's TRUNCATE
+                            false), which avoids the ACCESS EXCLUSIVE lock that the truncation takes on the table
       --vacuum              Same as --no-freeze (deprecated spelling; use --no-freeze instead)
       --pause PAUSE_TIME    seconds to pause between vacuums. Default is 10.
       --freezeage FREEZEAGE
@@ -86,7 +88,7 @@ The minutes time limit is normally only enforced at the start of vacuuming each 
 If you do not specify `--enforce-time`, `flexible_freeze` will issue a `SET statement_timeout = 0` statement before each operation
 to avoid cancellation by a system- or role-wide `statement_timeout` value.
 
-`flexible_freeze` does not wait for a table that another session has locked.  Each statement is sent as `VACUUM (FREEZE, ANALYZE, SKIP_LOCKED)` (without `FREEZE` or `ANALYZE` according to `--no-freeze` and `--no-analyze`), so a table held by an anti-wraparound autovacuum, a `CREATE INDEX` or anything else that conflicts with `VACUUM` is passed over at once.  The server reports that with a warning, and the table is then treated like any other the server declined to vacuum: its message is printed, the table is listed in the summary as not vacuumed, and the exit status is 1.  The table is selected again on the next run.
+`flexible_freeze` does not wait for a table that another session has locked.  Each statement is sent as `VACUUM (FREEZE, ANALYZE, SKIP_LOCKED)` (without `FREEZE` or `ANALYZE` according to `--no-freeze` and `--no-analyze`, and with `TRUNCATE false` added for `--no-truncate`), so a table held by an anti-wraparound autovacuum, a `CREATE INDEX` or anything else that conflicts with `VACUUM` is passed over at once.  The server reports that with a warning, and the table is then treated like any other the server declined to vacuum: its message is printed, the table is listed in the summary as not vacuumed, and the exit status is 1.  The table is selected again on the next run.
 
 Every other wait for a lock is limited by `--lock-timeout`, ten seconds unless you say otherwise.  That matters most for the query that lists the tables: it asks for the size of each candidate, and so waits behind a pending `ACCESS EXCLUSIVE` lock (an `ALTER TABLE`, a `TRUNCATE`, a `VACUUM FULL`) on any one of them.  A database whose tables cannot be listed in that time is skipped and listed in the summary.  A `VACUUM` that has its table but then has to wait for some other lock for that long is reported as a failed table.  `flexible_freeze` sets `lock_timeout` in every database it works on, whatever the value, so `--lock-timeout 0` means no limit even where the database or the role has a `lock_timeout` of its own.  The timeout measures time spent waiting for a lock, not time spent vacuuming.
 
@@ -107,6 +109,8 @@ Limitations: partitioned tables themselves are never selected, only their partit
 `--minutes`, `--minsizemb`, `--pause`, `--freezeage`, `--costdelay`, `--costlimit` and `--lock-timeout` take whole numbers and may not be negative.  Empty entries in the `-d` list are ignored, so a doubled or trailing comma is harmless, but a `-d` that names no database at all is an error.
 
 You can specify `--no-analyze` to skip the ANALYZE step. 
+
+`--no-truncate` adds `TRUNCATE false` to each `VACUUM`, in either mode.  A vacuum normally ends by cutting off the empty pages at the end of the table and returning them to the operating system, and takes an `ACCESS EXCLUSIVE` lock on the table to do it; with `--no-truncate` it leaves them, and never takes that lock.  The space stays allocated to the table and is used again by later rows.  Without `--no-truncate` the option is not sent at all, so a table whose `vacuum_truncate` storage parameter is off is still not truncated.
 
 Table names given to `-T`, `--exclude-table-in-database` and `--table` can be written three ways: a bare table name (`orders`), which matches a table of that name in every schema; `schema.table` (`sales.orders`), written plain without SQL quoting, which matches only that table; or the name exactly as `flexible_freeze` prints it (for example `public."Orders"`).  Names are case-sensitive.
 

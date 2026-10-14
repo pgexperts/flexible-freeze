@@ -550,6 +550,23 @@ def test_test_files_do_not_bypass_the_harness():
             ("sales", 'Order "Items"'),
         ),
         ('vacuum (freeze) "a.b";', {"FREEZE"}, ("public", "a.b")),
+        # An option with a value: the name in upper case, the value in lower.
+        (
+            "VACUUM (FREEZE, ANALYZE, TRUNCATE false, SKIP_LOCKED) public.t1",
+            {"FREEZE", "ANALYZE", "TRUNCATE false", "SKIP_LOCKED"},
+            ("public", "t1"),
+        ),
+        (
+            "vacuum (truncate  FALSE,parallel 2) t1",
+            {"TRUNCATE false", "PARALLEL 2"},
+            ("public", "t1"),
+        ),
+        # Not the same entry as TRUNCATE false, nor as TRUNCATE true.
+        ("VACUUM (TRUNCATE) t1", {"TRUNCATE"}, ("public", "t1")),
+        ("VACUUM (TRUNCATE true) t1", {"TRUNCATE true"}, ("public", "t1")),
+        # Empty entries are passed over, which the server would not do.
+        ("VACUUM (FREEZE,, ANALYZE,) t1", {"FREEZE", "ANALYZE"}, ("public", "t1")),
+        ("VACUUM () t1", set(), ("public", "t1")),
     ],
 )
 def test_parse_vacuum(statement, options, target):
@@ -564,6 +581,16 @@ def test_parse_vacuum_rejects_what_it_does_not_understand():
         parse_vacuum("VACUUM")
     with pytest.raises(HarnessError):
         parse_vacuum('VACUUM FREEZE "t1", "t2"')
+
+
+@pytest.mark.parametrize(
+    "option",
+    ["TRUNCATE false false", "TRUNCATE 'false'", "TRUNCATE = false", "2"],
+    ids=["two-values", "quoted-value", "equals-sign", "no-name"],
+)
+def test_parse_vacuum_rejects_an_option_outside_its_scope(option):
+    with pytest.raises(HarnessError):
+        parse_vacuum(f"VACUUM (FREEZE, {option}) t1")
 
 
 # -- against the running cluster ---------------------------------------------
